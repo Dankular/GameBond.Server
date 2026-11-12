@@ -41,6 +41,7 @@ type Config struct {
 	PathMTU         bool                        `json:"path_mtu_discovery"`
 	Failover        bool                        `json:"failover_replay"`
 	FlowPinning     bool                        `json:"flow_pinning"`
+	StripeAbove     float64                     `json:"stripe_above_mbps"`
 	CoDel           bool                        `json:"codel"`
 	Protection      string                      `json:"protection"` // ignored: every packet is always duplicated
 	ParityRowsMin   int                         `json:"parity_rows_min"`
@@ -111,6 +112,10 @@ func DecodeConfig(data []byte) (Config, bond.SessionOptions, netip.AddrPort, []b
 	options.QoS = c.QoS
 	options.LossTracking, options.PathMTUDiscovery, options.FailoverReplay = c.LossTracking, c.PathMTU, c.Failover
 	options.FlowPinning, options.CoDel = c.FlowPinning, c.CoDel
+	if c.StripeAbove < 0 || c.StripeAbove > 1000 {
+		return fail(fmt.Errorf("stripe_above_mbps must be 0..1000"))
+	}
+	options.StripeAbove = c.StripeAbove
 	if c.ParityRowsMin < 0 || c.ParityRowsMax < 0 || c.ParityRowsMax > 3 || (c.ParityRowsMax != 0 && c.ParityRowsMin > c.ParityRowsMax) {
 		return fail(fmt.Errorf("parity_rows_min/max must satisfy 0 <= min <= max <= 3"))
 	}
