@@ -146,6 +146,9 @@ func Run(ctx context.Context, c Config, options bond.SessionOptions, address net
 					if err == unix.EINTR {
 						continue
 					}
+					if transientSocketError(err) {
+						break // a passing resource or ICMP condition; the next epoll wake retries
+					}
 					if err != nil {
 						return err
 					}
@@ -195,4 +198,15 @@ func Run(ctx context.Context, c Config, options bond.SessionOptions, address net
 		return err
 	}
 	return nil
+}
+
+// transientSocketError reports receive errors that say nothing about the socket's health
+// (buffer or memory pressure, or an ICMP error surfaced on read) and must not stop the server.
+func transientSocketError(err error) bool {
+	for _, e := range []error{unix.ENOBUFS, unix.ENOMEM, unix.ECONNREFUSED, unix.ECONNRESET, unix.EHOSTUNREACH, unix.ENETUNREACH, unix.EMSGSIZE} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
 }
