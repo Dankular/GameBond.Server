@@ -153,6 +153,7 @@ type Stats struct {
 	PacketsSent, PacketsRecv, Retransmits, SpuriousRetx uint64
 	BytesAcked, BytesDelivered                          uint64
 	Timeouts                                            uint64
+	DroppedData                                         uint64 // data packets discarded without being stored (not acknowledged)
 }
 
 // New returns a connection.
@@ -317,8 +318,10 @@ func (c *Conn) OnPacket(b []byte, now time.Time) error {
 		if len(b) < 10+n {
 			return ErrFrame
 		}
-		c.onData(off, b[10:10+n], flags&flagFin != 0, now)
-		dataPacket = true
+		dataPacket = c.onData(off, b[10:10+n], flags&flagFin != 0, now)
+		if !dataPacket {
+			c.Stats.DroppedData++
+		}
 	}
 	if dataPacket {
 		c.notePN(pn)
@@ -353,19 +356,20 @@ func (c *Conn) notePN(pn uint64) {
 	}
 }
 
-func (c *Conn) onData(off uint64, p []byte, fin bool, now time.Time) {
+// onData stores one data packet. It reports whether the bytes are now held (or
+// were already held): only then may the packet number be acknowledged, because
+// an ACK for data that was discarded makes the sender drop it from its
+// retransmission state and the stream stalls.
+func (c *Conn) onData(off uint64, p []byte, fin bool, now time.Time) bool {
 	end := off + uint64(len(p))
+	if len(p) > 0 && end > c.rcvNxt && off > c.rcvNxt && end > c.rcvNxt+c.recvWindow()+uint64(len(c.readBuf)) {
+		return false // outside the window we advertised
+	}
 	if fin {
 		c.finRecv, c.finAt = true, end
 	}
-	if end <= c.rcvNxt && len(p) > 0 {
-		return // a retransmission of data we already have
-	}
-	if len(p) > 0 && end > c.rcvNxt+c.recvWindow()+uint64(len(c.readBuf)) && off > c.rcvNxt {
-		return // outside the window we advertised
-	}
-	if len(p) == 0 {
-		return
+	if len(p) == 0 || end <= c.rcvNxt {
+		return true // a bare FIN, or a retransmission of data we already have
 	}
 	if off < c.rcvNxt {
 		p = p[c.rcvNxt-off:]
@@ -376,10 +380,21 @@ func (c *Conn) onData(off uint64, p []byte, fin bool, now time.Time) {
 		c.Stats.BytesDelivered += uint64(len(p))
 		c.rcvNxt = end
 		c.drainOOO()
-		return
+		return true
 	}
-	if _, ok := c.oooData[off]; ok || c.oooBytes+len(p) > maxOOOBytes {
-		return
+	if old, ok := c.oooData[off]; ok {
+		if len(old) >= len(p) {
+			return true // already held
+		}
+		if c.oooBytes+len(p)-len(old) > maxOOOBytes {
+			return false
+		}
+		c.oooBytes += len(p) - len(old) // a longer copy of the same start replaces the shorter one
+		c.oooData[off] = append([]byte(nil), p...)
+		return true
+	}
+	if c.oooBytes+len(p) > maxOOOBytes {
+		return false
 	}
 	c.oooData[off] = append([]byte(nil), p...)
 	c.oooBytes += len(p)
@@ -387,6 +402,7 @@ func (c *Conn) onData(off uint64, p []byte, fin bool, now time.Time) {
 	c.ooo = append(c.ooo, span{})
 	copy(c.ooo[i+1:], c.ooo[i:])
 	c.ooo[i] = span{off, off} // lo is the key into oooData; hi is unused
+	return true
 }
 
 func (c *Conn) drainOOO() {

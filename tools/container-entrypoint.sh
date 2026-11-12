@@ -61,6 +61,14 @@ plan() {
         NAT_SOURCES="{ 10.77.0.2, ${LAN_IPS// /, } }"
     fi
 
+    # Tunnel clients get the internet, not the networks behind this container: its bridge, the Docker
+    # host and any private range. Traffic between tunnel addresses (client <-> LAN devices) is still
+    # forwarded. GAMEBOND_ALLOW_PRIVATE_FORWARD=1 turns the filter off.
+    FORWARD_FILTER=
+    if [[ "${GAMEBOND_ALLOW_PRIVATE_FORWARD:-0}" != 1 ]]; then
+        FORWARD_FILTER='add rule ip gamebond forward iifname "gamebond0" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 } drop'
+    fi
+
     NFT_TABLES=$(nft list tables)
     if grep -Fxq 'table ip gamebond' <<< "$NFT_TABLES"; then
         echo 'Container gamebond nft table already exists; refusing overwrite' >&2; exit 1
@@ -93,6 +101,10 @@ launch() {
 add table ip gamebond
 add chain ip gamebond postrouting { type nat hook postrouting priority srcnat; policy accept; }
 add rule ip gamebond postrouting ip saddr $NAT_SOURCES oifname "$WAN" masquerade
+add chain ip gamebond forward { type filter hook forward priority filter; policy accept; }
+add rule ip gamebond forward ct state established,related accept
+add rule ip gamebond forward oifname "gamebond0" accept
+$FORWARD_FILTER
 add chain ip gamebond defrag { type filter hook prerouting priority -150; policy accept; }
 add rule ip gamebond defrag iifname "$WAN" ip protocol udp meta length > 1280 ip frag-off & 0x4000 != 0 ip frag-off set 0
 EOF

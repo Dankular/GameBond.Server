@@ -6,6 +6,11 @@
 #   gamebond-probe            watch forever (the systemd service)
 #   gamebond-probe update     check once and update if a newer build exists
 #   gamebond-probe update SHA update to that commit's image (must already be built)
+#
+# While watching it also acts as a watchdog: when the container is exited, missing or reported
+# unhealthy for WATCHDOG_STRIKES polls in a row it is recreated (at most WATCHDOG_MAX_RESTARTS
+# times per WATCHDOG_WINDOW seconds, never during an update). `touch $STATE/hold` pauses the
+# watchdog, for example while you stop the container on purpose.
 set -u
 REPO=Dankular/GameBond.Server
 WORKFLOW=server-image.yml
@@ -13,7 +18,11 @@ IMAGE_REPO=ghcr.io/dankular/gamebond-server
 RELEASE=/opt/gamebond/releases/native-live
 ENVFILE=$RELEASE/deploy.env
 CONTAINER=gamebond-native-1
-STATE=/var/lib/gamebond-probe
+STATE=${GAMEBOND_PROBE_STATE:-/var/lib/gamebond-probe}
+LOCKFILE=${GAMEBOND_PROBE_LOCK:-/var/lock/gamebond-update}
+WATCHDOG_STRIKES=${GAMEBOND_WATCHDOG_STRIKES:-3}
+WATCHDOG_MAX_RESTARTS=${GAMEBOND_WATCHDOG_MAX_RESTARTS:-3}
+WATCHDOG_WINDOW=${GAMEBOND_WATCHDOG_WINDOW:-600}
 INTERVAL=${GAMEBOND_PROBE_INTERVAL:-10}
 READY_TRIES=300   # x 0.1 s
 mkdir -p "$STATE"
@@ -62,11 +71,20 @@ latest_build() {
   esac
 }
 
+# update_to serialises updates with a lock that is held only while one runs. (fd 9 used to stay
+# open for the life of the watch loop, which kept the lock held after the first update.)
 update_to() {
+  local rc
+  [ "$(current_image)" = "$IMAGE_REPO:$1" ] && return 0
+  exec 9>"$LOCKFILE"
+  flock -w 120 9 || { exec 9>&-; log "another update holds the lock"; return 1; }
+  _update_to "$1"; rc=$?
+  exec 9>&-
+  return $rc
+}
+
+_update_to() {
   local sha=$1 want="$IMAGE_REPO:$1" prev
-  prev=$(current_image)
-  [ "$prev" = "$want" ] && return 0
-  exec 9>/var/lock/gamebond-update; flock -w 120 9 || { log "another update holds the lock"; return 1; }
   prev=$(current_image)
   [ "$prev" = "$want" ] && return 0
   log "updating $prev -> $want"
@@ -97,9 +115,45 @@ check_once() {
   update_to "$sha"
 }
 
+# container_state prints "<status>|<health>" ("missing|" if there is no such container).
+container_state() {
+  docker inspect -f '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$CONTAINER" 2>/dev/null || echo "missing|"
+}
+
+# watchdog_check runs once per poll. A recreate here is the same operation an update performs,
+# so clients see an ordinary restart.
+watchdog_check() {
+  [ -e "$STATE/hold" ] && { echo 0 > "$STATE/strikes"; return 0; }
+  local st status health strikes now recent
+  # Never race an update: skip the check while one holds the lock.
+  ( flock -n 8 ) 8>"$LOCKFILE" || return 0
+  st=$(container_state); status=${st%%|*}; health=${st#*|}
+  case "$status|$health" in
+    "running|healthy"|"running|starting"|"running|") echo 0 > "$STATE/strikes"; rm -f "$STATE/watchdog-gave-up"; return 0 ;;
+  esac
+  strikes=$(( $(cat "$STATE/strikes" 2>/dev/null || echo 0) + 1 ))
+  echo "$strikes" > "$STATE/strikes"
+  log "watchdog: container is $status/${health:-no-health} (strike $strikes of $WATCHDOG_STRIKES)"
+  [ "$strikes" -ge "$WATCHDOG_STRIKES" ] || return 0
+  now=$(date +%s)
+  # Keep only restart times inside the window.
+  recent=$(awk -v n="$now" -v w="$WATCHDOG_WINDOW" '$1 > n - w' "$STATE/restarts" 2>/dev/null)
+  if [ "$(printf '%s\n' "$recent" | grep -c .)" -ge "$WATCHDOG_MAX_RESTARTS" ]; then
+    [ -e "$STATE/watchdog-gave-up" ] || log "watchdog: $WATCHDOG_MAX_RESTARTS restarts in ${WATCHDOG_WINDOW}s did not help; giving up until it recovers (needs a human)"
+    touch "$STATE/watchdog-gave-up"; return 0
+  fi
+  printf '%s\n' "$recent" | grep . > "$STATE/restarts.new"; echo "$now" >> "$STATE/restarts.new"; mv "$STATE/restarts.new" "$STATE/restarts"
+  echo 0 > "$STATE/strikes"
+  log "watchdog: recreating $CONTAINER"
+  recreate
+  if wait_ready; then log "watchdog: container is ready again"; rm -f "$STATE/watchdog-gave-up"; else log "watchdog: container still not ready"; fi
+}
+
+[ "${GAMEBOND_PROBE_SOURCE_ONLY:-0}" = 1 ] && return 0 2>/dev/null
+
 case "${1:-watch}" in
   update) if [ -n "${2:-}" ]; then update_to "$2"; else check_once; fi ;;
   watch)  ETAG=""; log "probe started, polling every ${INTERVAL}s"
-          while true; do check_once; sleep "$INTERVAL"; done ;;
+          while true; do check_once; watchdog_check; sleep "$INTERVAL"; done ;;
   *)      echo "usage: gamebond-probe [watch|update [SHA]]" >&2; exit 2 ;;
 esac
