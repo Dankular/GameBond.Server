@@ -97,6 +97,15 @@ launch() {
     [[ -e /sys/class/net/gamebond0 ]] || { echo 'Timed out waiting for gamebond0' >&2; exit 1; }
     ip address add "10.77.0.1/$TUNNEL_PREFIX" dev gamebond0
     ip link set dev gamebond0 mtu 1280 up
+    # Egress queueing, best effort (the host kernel may lack a module): CAKE gives per-flow
+    # fairness, DSCP tiers (game traffic ahead of bulk) and ECN marking instead of tail
+    # drop. Set GAMEBOND_EGRESS_MBIT to shape to a known uplink; unset leaves it unshaped.
+    cake_rate=unlimited
+    [[ -n "${GAMEBOND_EGRESS_MBIT:-}" ]] && cake_rate="bandwidth ${GAMEBOND_EGRESS_MBIT}mbit"
+    for qdev in "$WAN" gamebond0; do
+        # shellcheck disable=SC2086
+        tc qdisc replace dev "$qdev" root cake $cake_rate diffserv4 flows ecn 2>/dev/null             || tc qdisc replace dev "$qdev" root fq_codel ecn 2>/dev/null             || echo "no egress qdisc for $qdev" >&2
+    done
     nft -f - <<EOF
 add table ip gamebond
 add chain ip gamebond postrouting { type nat hook postrouting priority srcnat; policy accept; }
