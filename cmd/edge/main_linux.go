@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Dankular/GameBond.Server/edge"
 	"github.com/Dankular/GameBond.Core/hwmon"
+	"github.com/Dankular/GameBond.Server/edge"
 	"github.com/Dankular/GameBond.Server/stream"
 )
 
@@ -106,6 +106,16 @@ func run() error {
 			fmt.Fprintf(os.Stdout, "{\"status\":\"admin_portal\",\"bind\":[%q,%d],\"tls\":%t}\n", settings.Host, portal.Port, settings.TLSCert != "")
 		}
 	}
+	if addr := os.Getenv("GAMEBOND_METRICS_ADDR"); addr != "" {
+		metrics := &edge.MetricsHandler{}
+		l, err := edge.ServeMetrics(addr, metrics)
+		if err != nil {
+			return err
+		}
+		defer l.Close()
+		observers = append(observers, metrics.Observe)
+		fmt.Fprintf(os.Stdout, "{\"status\":\"metrics\",\"bind\":%q}\n", l.Addr().String())
+	}
 	if os.Getenv("GAMEBOND_STREAM") != "0" {
 		go serveStreamGateway(ctx)
 	}
@@ -150,5 +160,5 @@ func serveStreamGateway(ctx context.Context) {
 	ep := stream.NewEndpoint(pc, nil, stream.Config{ReorderHint: func() time.Duration { return 25 * time.Millisecond }})
 	go func() { <-ctx.Done(); ep.Close() }()
 	fmt.Fprintln(os.Stdout, `{"status":"stream_gateway","bind":"10.77.0.1:4436"}`)
-	(&stream.Gateway{Ep: ep}).Serve()
+	(&stream.Gateway{Ep: ep, Dial: stream.SafeDial}).Serve()
 }

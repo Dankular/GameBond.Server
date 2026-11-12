@@ -18,11 +18,13 @@ type PacketConn interface {
 }
 
 const (
-	tick        = time.Millisecond
-	recentTTL   = 30 * time.Second
-	idleTimeout = 2 * time.Minute
-	maxStreams  = 192
+	tick       = time.Millisecond
+	recentTTL  = 30 * time.Second
+	maxStreams = 192
 )
+
+// idleTimeout is how long a stream may receive nothing before it is reaped.
+var idleTimeout = 2 * time.Minute
 
 type key struct {
 	id   uint32
@@ -71,7 +73,7 @@ func (e *Endpoint) Close() error {
 
 func (e *Endpoint) newStream(k key, addr net.Addr) *Stream {
 	cfg := e.cfg
-	s := &Stream{ep: e, k: k, addr: addr, notify: make(chan struct{}, 1)}
+	s := &Stream{ep: e, k: k, addr: addr, notify: make(chan struct{}, 1), dead: make(chan struct{})}
 	s.c = New(cfg)
 	e.conns[k] = s
 	return s
@@ -185,6 +187,7 @@ func (e *Endpoint) timerLoop() {
 			for k, s := range e.conns {
 				s.afterEvent(now)
 				if s.reapable(now) {
+					s.fail(ErrClosed) // wake anything still blocked on a stream that is being forgotten
 					delete(e.conns, k)
 					e.recent[k] = now.Add(recentTTL)
 				}
@@ -206,9 +209,14 @@ type Stream struct {
 	addr   net.Addr
 	c      *Conn // guarded by ep.mu
 	notify chan struct{}
+	dead   chan struct{} // closed once the stream has failed or been reaped; wakes every waiter
+	deadMu sync.Once
 	rd, wd time.Time // guarded by ep.mu
 	gone   time.Time
 }
+
+// Dead is closed when the stream has failed, been reset, or been reaped.
+func (s *Stream) Dead() <-chan struct{} { return s.dead }
 
 func (s *Stream) wake() {
 	select {
@@ -245,6 +253,7 @@ func (s *Stream) fail(err error) {
 	if s.c.closedErr == nil {
 		s.c.closedErr = err
 	}
+	s.deadMu.Do(func() { close(s.dead) })
 	s.wake()
 }
 
@@ -263,7 +272,10 @@ func (timeoutErr) Temporary() bool { return true }
 
 func (s *Stream) wait(deadline time.Time) error {
 	if deadline.IsZero() {
-		<-s.notify
+		select {
+		case <-s.notify:
+		case <-s.dead:
+		}
 		return nil
 	}
 	d := time.Until(deadline)
@@ -274,6 +286,8 @@ func (s *Stream) wait(deadline time.Time) error {
 	defer t.Stop()
 	select {
 	case <-s.notify:
+		return nil
+	case <-s.dead:
 		return nil
 	case <-t.C:
 		return timeoutErr{}
