@@ -456,3 +456,49 @@ func TestSuccessfulLoginClearsTheFailureCount(t *testing.T) {
 		}
 	}
 }
+
+// Password verification needs tens of MiB each, so only a couple may run at once; a burst of
+// parallel logins is turned away instead of exhausting the container's memory.
+func TestLoginIsBoundedWhileHashingSlotsAreBusy(t *testing.T) {
+	r := newRig(t)
+	for i := 0; i < maxHashing; i++ {
+		if !r.portal.acquireHash() {
+			t.Fatal("slot should be free")
+		}
+	}
+	rep := r.do("POST", "/api/login", map[string]any{"password": password}, "", "")
+	if rep.code != 503 || rep.header.Get("Retry-After") == "" {
+		t.Fatalf("busy login: %d %s", rep.code, rep.raw)
+	}
+	if got := r.portal.Throttle.RetryAfter("127.0.0.1"); got != 0 {
+		t.Fatalf("a refused attempt must not count as a failed login (wait %v)", got)
+	}
+	r.portal.releaseHash()
+	r.portal.releaseHash()
+	r.login()
+	if len(r.portal.hashing) != 0 {
+		t.Fatal("hashing slot leaked")
+	}
+}
+
+func TestLoginAndPasswordChangeShareTheLimit(t *testing.T) {
+	r := newRig(t)
+	for i := 0; i < maxHashing; i++ {
+		r.portal.acquireHash()
+	}
+	if msg := r.portal.SetPassword(password, "another long password"); !strings.Contains(msg, "busy") {
+		t.Fatalf("SetPassword while busy: %q", msg)
+	}
+}
+
+func TestRestoreConfigPutsPreviousTextBack(t *testing.T) {
+	r := newRig(t)
+	before, _ := r.portal.ReadConfig()
+	if err := writeInPlace(r.config, []byte(`{"trunc`)); err != nil {
+		t.Fatal(err)
+	}
+	r.portal.restoreConfig(before)
+	if after, _ := r.portal.ReadConfig(); after != before {
+		t.Fatalf("not restored: %q", after)
+	}
+}

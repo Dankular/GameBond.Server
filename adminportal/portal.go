@@ -28,6 +28,9 @@ const RestartExitCode = 75
 
 const maxBody = 256 * 1024
 
+// maxHashing is how many password hashes may run at the same time.
+const maxHashing = 2
+
 var contentTypes = map[string]string{".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
 
 var securityHeaders = [][2]string{
@@ -61,6 +64,10 @@ type Portal struct {
 	Sessions *adminauth.Sessions
 	Throttle *adminauth.Throttle
 
+	// hashing bounds concurrent scrypt work: each verification needs about 32 MiB, and the
+	// throttle only counts failures after they finish, so a parallel burst would otherwise
+	// all run at once and exhaust the container's memory.
+	hashing      chan struct{}
 	mu           sync.Mutex // configuration writes and the password hash
 	passwordHash string
 	logMu        sync.Mutex
@@ -77,7 +84,7 @@ func New(o Options) *Portal {
 	if o.RequestRestart == nil {
 		o.RequestRestart = func() {}
 	}
-	return &Portal{o: o, Sessions: adminauth.NewSessions(o.Clock), Throttle: adminauth.NewThrottle(o.Clock), passwordHash: o.Settings.PasswordHash}
+	return &Portal{o: o, hashing: make(chan struct{}, maxHashing), Sessions: adminauth.NewSessions(o.Clock), Throttle: adminauth.NewThrottle(o.Clock), passwordHash: o.Settings.PasswordHash}
 }
 
 // Note appends a timestamped line to the portal's log ring.
@@ -212,14 +219,45 @@ func (p *Portal) ApplyConfig(text string) string {
 		return "OSError: " + err.Error()
 	}
 	if err := writeInPlace(p.o.ConfigPath, []byte(text)); err != nil {
+		p.restoreConfig(previous)
 		return "OSError: " + err.Error()
+	}
+	// The file is rewritten in place, so a short write or a full disk could leave it truncated and
+	// the entrypoint would then refuse to start. Read it back and put the old text back if it differs.
+	if written, err := os.ReadFile(p.o.ConfigPath); err != nil || string(written) != text {
+		p.restoreConfig(previous)
+		return "OSError: configuration was not written correctly; the previous configuration was restored"
 	}
 	p.Note("configuration written; restart required to apply")
 	return ""
 }
 
+// restoreConfig puts earlier configuration text back after a failed save.
+func (p *Portal) restoreConfig(previous string) {
+	if err := writeInPlace(p.o.ConfigPath, []byte(previous)); err != nil {
+		p.Note("restoring the previous configuration failed: " + err.Error())
+		return
+	}
+	p.Note("save failed; previous configuration restored")
+}
+
+func (p *Portal) acquireHash() bool {
+	select {
+	case p.hashing <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Portal) releaseHash() { <-p.hashing }
+
 // SetPassword changes the admin password; the error text is empty on success.
 func (p *Portal) SetPassword(current, fresh string) string {
+	if !p.acquireHash() {
+		return "the server is busy; try again shortly"
+	}
+	defer p.releaseHash()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !adminauth.VerifyPassword(current, p.passwordHash) {
@@ -346,7 +384,9 @@ func (p *Portal) apiGet(w http.ResponseWriter, r *http.Request, path string) {
 	}
 	routes := map[string]func() any{
 		"/api/hardware": func() any {
-			if p.o.Hardware==nil {return map[string]any{"available":false,"errors":[]string{"Hardware monitoring is unavailable"}}}
+			if p.o.Hardware == nil {
+				return map[string]any{"available": false, "errors": []string{"Hardware monitoring is unavailable"}}
+			}
 			return p.o.Hardware()
 		},
 		"/api/status": func() any {
@@ -495,7 +535,13 @@ func (p *Portal) login(w http.ResponseWriter, r *http.Request, b map[string]any)
 	p.mu.Lock()
 	hash := p.passwordHash
 	p.mu.Unlock()
-	if !ok || !adminauth.VerifyPassword(password, hash) {
+	if !p.acquireHash() {
+		p.json(w, 503, map[string]any{"error": "server busy; retry shortly"}, [2]string{"Retry-After", "1"})
+		return
+	}
+	verified := ok && adminauth.VerifyPassword(password, hash)
+	p.releaseHash()
+	if !verified {
 		p.Throttle.Fail(addr)
 		p.Note("failed login from " + addr)
 		p.json(w, 401, map[string]any{"error": "invalid password"})
