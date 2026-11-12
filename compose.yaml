@@ -1,0 +1,74 @@
+name: gamebond
+services:
+  server:
+    image: ${GAMEBOND_IMAGE:-gamebond:0.3.4}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # GB03 authenticates process restarts before accepting a new sender domain.
+    restart: "no"
+    # Separate bridge network namespace. Never use network_mode: host here.
+    networks:
+      - tunnel
+    ports:
+      - "4433:4433/udp"
+      # Admin portal (HTTPS). Only used when the config has an "admin" block listening on 0.0.0.0:8443.
+      # Bind a specific host address (e.g. "127.0.0.1:8443:8443/tcp") to keep it off the public interface.
+      - "${GAMEBOND_ADMIN_PUBLISH:-8443}:8443/tcp"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun:/dev/net/tun:rw"
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    volumes:
+      - type: bind
+        source: ${GAMEBOND_ADMIN_TLS_DIR:-./secrets/admin}
+        target: /run/secrets/admin
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${GAMEBOND_SERVER_CONFIG:-./configs/server.json}
+        target: /run/config/server.json
+        # Writable so the admin portal can save configuration. Written in place; no sibling files are created.
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${GAMEBOND_KEY_FILE:-./secrets/gamebond.key}
+        target: /run/secrets/gamebond.key
+        read_only: true
+        bind:
+          create_host_path: false
+    pids_limit: 64
+    mem_limit: 256m
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # This checks only local readiness, not connectivity from a client or game.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test -e /tmp/gamebond-ready &&
+          test -d /sys/class/net/gamebond0 &&
+          kill -0 "$$(cat /tmp/gamebond.pid)" &&
+          ss -H -u -l -n | grep -q ':4433 '
+      interval: 15s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+networks:
+  tunnel:
+    driver: bridge

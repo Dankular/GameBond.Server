@@ -1,0 +1,12 @@
+[Unit]
+Description=GameBond update probe (GitHub Actions -> clean container update)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/gamebond-probe watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
