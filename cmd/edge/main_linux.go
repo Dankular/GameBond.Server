@@ -17,7 +17,7 @@ import (
 
 	"github.com/Dankular/GameBond.Core/hwmon"
 	"github.com/Dankular/GameBond.Server/edge"
-	"github.com/Dankular/GameBond.Server/stream"
+	"github.com/Dankular/GameBond.Core/stream"
 )
 
 func run() error {
