@@ -2,6 +2,7 @@ package adminportal
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"embed"
 	"encoding/json"
@@ -56,6 +57,17 @@ type Options struct {
 	Clock func() float64
 	// TempDir overrides os.TempDir (tests).
 	TempDir string
+	// Security, when set, serves the firewall, DNS filter and intrusion detection pages.
+	Security SecurityAPI
+}
+
+// SecurityAPI is what the portal needs from the security manager.
+type SecurityAPI interface {
+	Overview(ctx context.Context) any
+	Catalog() any
+	// Apply installs settings live and returns them normalised, ready to be stored in the config file.
+	Apply(ctx context.Context, raw json.RawMessage) (json.RawMessage, error)
+	Do(ctx context.Context, action string, args map[string]any) (any, error)
 }
 
 // Portal is AdminPortal.
@@ -232,6 +244,42 @@ func (p *Portal) ApplyConfig(text string) string {
 	return ""
 }
 
+// persistSecurity stores the security section in the config file, leaving every other key and the file's layout as
+// it was. The error text is empty on success.
+func (p *Portal) persistSecurity(section json.RawMessage) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	previous, err := p.ReadConfig()
+	if err != nil {
+		return "OSError: " + err.Error()
+	}
+	doc, err := parseOrdered(previous)
+	if err != nil || doc.kind != 'o' {
+		return "the configuration file is not a JSON object"
+	}
+	fresh, err := parseOrdered(string(section))
+	if err != nil {
+		return err.Error()
+	}
+	doc.set("security", fresh)
+	var out bytes.Buffer
+	doc.encode(&out, 0)
+	out.WriteByte('\n')
+	text := out.String()
+	if e := p.CheckConfig(text); e != "" {
+		return e
+	}
+	if err := writeInPlace(p.o.ConfigPath, []byte(text)); err != nil {
+		p.restoreConfig(previous)
+		return "OSError: " + err.Error()
+	}
+	if written, err := os.ReadFile(p.o.ConfigPath); err != nil || string(written) != text {
+		p.restoreConfig(previous)
+		return "the file was not written correctly; the previous configuration was restored"
+	}
+	return ""
+}
+
 // restoreConfig puts earlier configuration text back after a failed save.
 func (p *Portal) restoreConfig(previous string) {
 	if err := writeInPlace(p.o.ConfigPath, []byte(previous)); err != nil {
@@ -382,6 +430,14 @@ func (p *Portal) apiGet(w http.ResponseWriter, r *http.Request, path string) {
 		p.json(w, 401, map[string]any{"error": "login required"})
 		return
 	}
+	if p.o.Security != nil && (path == "/api/security" || path == "/api/security/catalog") {
+		if path == "/api/security" {
+			p.json(w, 200, p.o.Security.Overview(r.Context()))
+		} else {
+			p.json(w, 200, p.o.Security.Catalog())
+		}
+		return
+	}
 	routes := map[string]func() any{
 		"/api/hardware": func() any {
 			if p.o.Hardware == nil {
@@ -506,6 +562,42 @@ func (p *Portal) post(w http.ResponseWriter, r *http.Request, path string) {
 		p.json(w, 200, map[string]any{"ok": e == "", "error": msg})
 	case "/api/config":
 		result(p.ApplyConfig(text(b, "text")))
+	case "/api/security":
+		if p.o.Security == nil {
+			p.json(w, 404, map[string]any{"error": "not found"})
+			return
+		}
+		settings, ok := b["settings"]
+		if !ok {
+			p.json(w, 400, map[string]any{"error": "settings required"})
+			return
+		}
+		raw, _ := json.Marshal(settings)
+		// Live first: a refused configuration must never reach the file, and a file that cannot be written
+		// is reported even though the settings are already in force.
+		applied, err := p.o.Security.Apply(r.Context(), raw)
+		if err != nil {
+			result(err.Error())
+			return
+		}
+		if e := p.persistSecurity(applied); e != "" {
+			p.json(w, 500, map[string]any{"ok": false, "applied": true, "error": "applied, but not saved to the configuration file (it will revert at the next restart): " + e})
+			return
+		}
+		p.Note("security settings applied and saved")
+		p.json(w, 200, map[string]any{"ok": true, "error": nil})
+	case "/api/security/action":
+		if p.o.Security == nil {
+			p.json(w, 404, map[string]any{"error": "not found"})
+			return
+		}
+		args, _ := b["args"].(map[string]any)
+		out, err := p.o.Security.Do(r.Context(), text(b, "action"), args)
+		if err != nil {
+			p.json(w, 422, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		p.json(w, 200, map[string]any{"ok": true, "error": nil, "result": out})
 	case "/api/password":
 		result(p.SetPassword(text(b, "current"), text(b, "new")))
 	case "/api/restart":

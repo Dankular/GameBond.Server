@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/Dankular/GameBond.Core/bond"
@@ -37,6 +38,20 @@ func openTun(name string) (int, error) {
 		return -1, fmt.Errorf("unexpected TUN interface")
 	}
 	return fd, nil
+}
+
+// tap, when set, sees every IPv4 packet crossing the TUN: fromDevice is the leg a device sent toward the internet
+// (after it was written to the TUN), false the leg read from the TUN toward a device. It runs on the packet loop, so
+// it must only parse and count.
+var tap atomic.Pointer[func(fromDevice bool, packet []byte)]
+
+// SetTap installs (or, with nil, removes) the packet observer.
+func SetTap(f func(fromDevice bool, packet []byte)) {
+	if f == nil {
+		tap.Store(nil)
+		return
+	}
+	tap.Store(&f)
 }
 
 // Run owns the packet state on one epoll actor. All UDP/TUN I/O is nonblocking;
@@ -107,6 +122,9 @@ func Run(ctx context.Context, c Config, options bond.SessionOptions, address net
 		if n != len(packet) {
 			return io.ErrShortWrite
 		}
+		if t := tap.Load(); t != nil {
+			(*t)(true, packet)
+		}
 		return nil
 	}
 	encoder := json.NewEncoder(output)
@@ -172,6 +190,9 @@ func Run(ctx context.Context, c Config, options bond.SessionOptions, address net
 					}
 					if size == 0 {
 						return io.EOF
+					}
+					if t := tap.Load(); t != nil {
+						(*t)(false, buffer[:size])
 					}
 					engine.TUN(buffer[:size], time.Now())
 				}
