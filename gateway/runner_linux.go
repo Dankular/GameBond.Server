@@ -31,6 +31,12 @@ type Runner interface {
 	Available(tool string) bool
 }
 
+// InputRunner is an optional fixed-tool stdin boundary for providers such as
+// nftables that validate and apply atomic declarative scripts.
+type InputRunner interface {
+	RunInput(ctx context.Context, tool string, input []byte, args ...string) (CommandResult, error)
+}
+
 type execRunner struct {
 	paths   map[string]string
 	timeout time.Duration
@@ -51,16 +57,25 @@ func newExecRunner(paths map[string]string, timeout time.Duration) *execRunner {
 // values can never select an executable or be interpreted by a shell.
 func NewLinuxRunner() (Runner, error) {
 	allowed := map[string][]string{
-		"ip":         {"/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"},
-		"bridge":     {"/usr/sbin/bridge", "/sbin/bridge", "/usr/bin/bridge", "/bin/bridge"},
-		"tc":         {"/usr/sbin/tc", "/sbin/tc", "/usr/bin/tc", "/bin/tc"},
-		"nft":        {"/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/bin/nft"},
-		"ethtool":    {"/usr/sbin/ethtool", "/sbin/ethtool", "/usr/bin/ethtool", "/bin/ethtool"},
-		"conntrack":  {"/usr/sbin/conntrack", "/sbin/conntrack", "/usr/bin/conntrack", "/bin/conntrack"},
-		"keepalived": {"/usr/sbin/keepalived", "/sbin/keepalived", "/usr/bin/keepalived", "/bin/keepalived"},
-		"lldpd":      {"/usr/sbin/lldpd", "/sbin/lldpd", "/usr/bin/lldpd", "/bin/lldpd"},
-		"hostapd":    {"/usr/sbin/hostapd", "/sbin/hostapd", "/usr/bin/hostapd", "/bin/hostapd"},
-		"mstpd":      {"/usr/sbin/mstpd", "/sbin/mstpd", "/usr/bin/mstpd", "/bin/mstpd"},
+		"ip":           {"/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"},
+		"bridge":       {"/usr/sbin/bridge", "/sbin/bridge", "/usr/bin/bridge", "/bin/bridge"},
+		"tc":           {"/usr/sbin/tc", "/sbin/tc", "/usr/bin/tc", "/bin/tc"},
+		"nft":          {"/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/bin/nft"},
+		"ethtool":      {"/usr/sbin/ethtool", "/sbin/ethtool", "/usr/bin/ethtool", "/bin/ethtool"},
+		"conntrack":    {"/usr/sbin/conntrack", "/sbin/conntrack", "/usr/bin/conntrack", "/bin/conntrack"},
+		"lldpd":        {"/usr/sbin/lldpd", "/sbin/lldpd", "/usr/bin/lldpd", "/bin/lldpd"},
+		"hostapd":      {"/usr/sbin/hostapd", "/sbin/hostapd", "/usr/bin/hostapd", "/bin/hostapd"},
+		"mstpd":        {"/usr/sbin/mstpd", "/sbin/mstpd", "/usr/bin/mstpd", "/bin/mstpd"},
+		"kea-dhcp4":    {"/usr/sbin/kea-dhcp4", "/usr/local/sbin/kea-dhcp4", "/usr/bin/kea-dhcp4"},
+		"systemctl":    {"/usr/bin/systemctl", "/bin/systemctl"},
+		"igmpproxy":    {"/usr/sbin/igmpproxy", "/sbin/igmpproxy", "/usr/bin/igmpproxy"},
+		"keepalived":   {"/usr/sbin/keepalived", "/sbin/keepalived", "/usr/bin/keepalived", "/bin/keepalived"},
+		"zebra":        {"/usr/lib/frr/zebra", "/usr/libexec/frr/zebra"},
+		"ospfd":        {"/usr/lib/frr/ospfd", "/usr/libexec/frr/ospfd"},
+		"bgpd":         {"/usr/lib/frr/bgpd", "/usr/libexec/frr/bgpd"},
+		"vtysh":        {"/usr/bin/vtysh", "/usr/sbin/vtysh"},
+		"avahi-daemon": {"/usr/sbin/avahi-daemon", "/usr/bin/avahi-daemon"},
+		"freeradius":   {"/usr/sbin/freeradius", "/usr/sbin/radiusd", "/usr/bin/freeradius", "/usr/bin/radiusd"},
 	}
 	paths := make(map[string]string, len(allowed))
 	for tool, candidates := range allowed {
@@ -78,6 +93,10 @@ func NewLinuxRunner() (Runner, error) {
 func (r *execRunner) Available(tool string) bool { return r.paths[tool] != "" }
 
 func (r *execRunner) Run(ctx context.Context, tool string, args ...string) (CommandResult, error) {
+	return r.RunInput(ctx, tool, nil, args...)
+}
+
+func (r *execRunner) RunInput(ctx context.Context, tool string, input []byte, args ...string) (CommandResult, error) {
 	path, ok := r.paths[tool]
 	if !ok || path == "" {
 		return CommandResult{}, fmt.Errorf("gateway command %q is not allowlisted or unavailable", tool)
@@ -89,11 +108,17 @@ func (r *execRunner) Run(ctx context.Context, tool string, args ...string) (Comm
 	if argBytes > maxCommandArguments {
 		return CommandResult{}, fmt.Errorf("gateway command argument limit exceeded")
 	}
+	if len(input) > maxCommandArguments {
+		return CommandResult{}, fmt.Errorf("gateway command input limit exceeded")
+	}
 
 	cmdCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, path, args...)
 	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C"}
+	if input != nil {
+		cmd.Stdin = bytes.NewReader(input)
+	}
 	var stdout, stderr limitedBuffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()

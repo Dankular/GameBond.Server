@@ -60,10 +60,8 @@ func (s LinuxCapabilities) Snapshot(ctx context.Context, cfg Config) (Capabiliti
 		KernelRelease: strings.TrimSpace(string(kernel)),
 		Tools:         map[string]bool{},
 	}
-	for _, tool := range []string{"ip", "bridge", "conntrack", "nft"} {
-		if _, err := s.Runner.Run(ctx, tool, "-V"); err == nil {
-			out.Tools[tool] = true
-		}
+	for _, tool := range []string{"ip", "bridge", "conntrack", "nft", "tc", "ethtool", "igmpproxy", "keepalived", "kea-dhcp4", "zebra", "ospfd", "bgpd", "vtysh", "avahi-daemon", "freeradius", "systemctl"} {
+		out.Tools[tool] = s.Runner.Available(tool)
 	}
 	for _, nic := range cfg.Interfaces {
 		out.Interfaces = append(out.Interfaces, inspectInterface(sysfs, nic))

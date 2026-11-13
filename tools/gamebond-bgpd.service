@@ -1,0 +1,26 @@
+[Unit]
+Description=GameBond FRRouting BGP daemon
+Requires=gamebond-zebra.service
+After=gamebond-zebra.service
+
+[Service]
+Type=simple
+User=frr
+Group=frr
+ExecStart=/usr/lib/frr/bgpd -N gamebond -A 127.0.0.1
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+ReadWritePaths=/var/run/frr/gamebond
+
+[Install]
+WantedBy=multi-user.target

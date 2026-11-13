@@ -17,15 +17,24 @@ const maxConfigBytes = 1 << 20
 
 // Config is the versioned desired state for the Linux gateway host process.
 type Config struct {
-	Version     int              `json:"version"`
-	SocketPath  string           `json:"socket_path"`
-	SocketGroup string           `json:"socket_group"`
-	Interfaces  []Interface      `json:"interfaces"`
-	WANs        []WAN            `json:"wans"`
-	Bridges     []Bridge         `json:"bridges"`
-	Telemetry   Telemetry        `json:"telemetry"`
-	Features    FeatureSelection `json:"features"`
-	Layer2      *layer2.Config   `json:"layer2,omitempty"`
+	Version        int                  `json:"version"`
+	SocketPath     string               `json:"socket_path"`
+	SocketGroup    string               `json:"socket_group"`
+	Interfaces     []Interface          `json:"interfaces"`
+	WANs           []WAN                `json:"wans"`
+	Bridges        []Bridge             `json:"bridges"`
+	Telemetry      Telemetry            `json:"telemetry"`
+	Features       FeatureSelection     `json:"features"`
+	Layer2         *layer2.Config       `json:"layer2,omitempty"`
+	NAT            NATConfig            `json:"nat"`
+	Routing        RoutingConfig        `json:"routing"`
+	QoS            QoSConfig            `json:"qos"`
+	DHCP           DHCPConfig           `json:"dhcp"`
+	VRRP           VRRPConfig           `json:"vrrp"`
+	IGMPProxy      IGMPProxyConfig      `json:"igmp_proxy"`
+	DynamicRouting DynamicRoutingConfig `json:"dynamic_routing"`
+	MDNS           MDNSConfig           `json:"mdns"`
+	RADIUS         RADIUSConfig         `json:"radius"`
 }
 
 // Interface assigns one Linux interface to one managed network role.
@@ -103,6 +112,48 @@ func (c Config) Validate() error {
 		if err := c.Layer2.Validate(); err != nil {
 			return fmt.Errorf("layer2: %w", err)
 		}
+		bondMembers := make(map[string]bool)
+		for _, bond := range c.Layer2.Bonds {
+			for _, memberID := range bond.Members {
+				for _, layerInterface := range c.Layer2.Interfaces {
+					if layerInterface.ID == memberID {
+						bondMembers[layerInterface.Name] = true
+					}
+				}
+			}
+		}
+		for _, iface := range c.Interfaces {
+			if bondMembers[iface.Name] {
+				return fmt.Errorf("interface %q is a reserved LACP member and cannot also have a gateway role", iface.Name)
+			}
+		}
+	}
+	if err := c.NAT.Validate(c.Interfaces); err != nil {
+		return fmt.Errorf("nat: %w", err)
+	}
+	if err := c.Routing.Validate(c.Interfaces); err != nil {
+		return fmt.Errorf("routing: %w", err)
+	}
+	if err := c.QoS.Validate(c.Interfaces); err != nil {
+		return fmt.Errorf("qos: %w", err)
+	}
+	if err := c.DHCP.Validate(c.Interfaces); err != nil {
+		return fmt.Errorf("dhcp: %w", err)
+	}
+	if err := c.VRRP.Validate(c.Interfaces); err != nil {
+		return fmt.Errorf("vrrp: %w", err)
+	}
+	if err := c.IGMPProxy.Validate(c.Interfaces); err != nil {
+		return fmt.Errorf("igmp_proxy: %w", err)
+	}
+	if err := c.DynamicRouting.Validate(c.Interfaces); err != nil {
+		return fmt.Errorf("dynamic_routing: %w", err)
+	}
+	if err := c.MDNS.Validate(c.Interfaces); err != nil {
+		return fmt.Errorf("mdns: %w", err)
+	}
+	if err := c.RADIUS.Validate(); err != nil {
+		return fmt.Errorf("radius: %w", err)
 	}
 	if !validSocketPath(c.SocketPath) {
 		return errors.New("socket_path must be under /run/gamebond, without parent traversal, and shorter than 100 bytes")
