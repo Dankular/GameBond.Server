@@ -169,6 +169,32 @@ func expect(t *testing.T, what string, got, want bool) {
 	}
 }
 
+const udpResponder = `
+import socket, sys
+# gbfw-udp
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((sys.argv[1], int(sys.argv[2])))
+while True:
+    data, peer = s.recvfrom(512)
+    s.sendto(b"FILTER", peer)
+`
+
+const udpAskScript = `
+import socket, sys
+src, dst = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.0); s.bind((src, 0))
+s.sendto(b"q", (dst, 53))
+try:
+    print(s.recvfrom(512)[0].decode())
+except Exception:
+    print("")
+`
+
+// dnsAsk sends a UDP datagram to dst:53 from a device and returns what answered, or "".
+func dnsAsk(t *testing.T, ns, src, dst string) string {
+	t.Helper()
+	return strings.TrimSpace(in(t, ns, "python3", "-c", udpAskScript, src, dst))
+}
+
 // onS runs the manager against the server namespace's nft.
 type nsRunner struct{}
 
@@ -268,6 +294,35 @@ func TestFirewallBehaviourInRealNamespaces(t *testing.T) {
 		apply(t, m, `{"enabled":true,"block_dot":true}`)
 		expect(t, "D1 -> T:853", connects(t, "D1", d1, "1.1.1.1", 853), false)
 		expect(t, "D1 -> T:443", connects(t, "D1", d1, "1.1.1.1", 443), true)
+	})
+
+	t.Run("forcing DNS sends every device's port 53 questions to the filter", func(t *testing.T) {
+		exec.Command("pkill", "-f", "gbfw-udp").Run()
+		udp := exec.Command("ip", "netns", "exec", nsPrefix+"S", "python3", "-c", udpResponder, "10.77.0.1", "53")
+		if err := udp.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { udp.Process.Kill() })
+		time.Sleep(300 * time.Millisecond)
+		apply(t, m, `{"enabled":true}`)
+		if got := dnsAsk(t, "D1", d1, "1.1.1.1"); got != "" {
+			t.Errorf("without forcing, a question to 1.1.1.1 goes to 1.1.1.1 (no resolver there), got %q", got)
+		}
+		if got := dnsAsk(t, "D1", d1, "10.77.0.1"); got != "FILTER" {
+			t.Errorf("a question to the server's own address reaches the filter, got %q", got)
+		}
+		apply(t, m, `{"enabled":true,"force_dns":true}`)
+		if got := dnsAsk(t, "D1", d1, "1.1.1.1"); got != "FILTER" {
+			t.Errorf("forced: a question to 1.1.1.1 must be answered by the filter, got %q", got)
+		}
+		if got := dnsAsk(t, "D2", d2, "9.9.9.9"); got != "FILTER" {
+			t.Errorf("forced: a question to any other resolver too, got %q", got)
+		}
+		expect(t, "forcing DNS does not touch other traffic", connects(t, "D1", d1, "1.1.1.1", 80), true)
+		apply(t, m, `{"enabled":true}`)
+		if got := dnsAsk(t, "D1", d1, "1.1.1.1"); got != "" {
+			t.Errorf("switching it off restores the normal path, got %q", got)
+		}
 	})
 
 	t.Run("a strict inbound default stops new connections from the internet", func(t *testing.T) {
