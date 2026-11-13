@@ -1,0 +1,14 @@
+name: gamebond
+services:
+  server:
+    environment:
+      GAMEBOND_GATEWAY_SOCKET: /run/gamebond-gateway/control.sock
+    group_add:
+      - "${GAMEBOND_GATEWAY_GID:?set GAMEBOND_GATEWAY_GID to the host gateway socket group ID}"
+    volumes:
+      - type: bind
+        source: ${GAMEBOND_GATEWAY_SOCKET_DIR:-/run/gamebond}
+        target: /run/gamebond-gateway
+        read_only: true
+        bind:
+          create_host_path: false

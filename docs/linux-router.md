@@ -107,6 +107,23 @@ The API listens only on the configured Unix socket, default permissions `root:ro
 TCP listener or generic shell/command endpoint. Socket path or group changes require a
 service restart.
 
+To let the authenticated admin portal reach this API, create the same socket group in
+the container with the host group ID and start Compose with the optional overlay:
+
+```sh
+GAMEBOND_GATEWAY_GID=<host-socket-group-id> \
+GAMEBOND_GATEWAY_SOCKET_DIR=/run/gamebond \
+docker compose -f compose.yaml -f compose.gateway.yaml up -d
+```
+
+The overlay mounts only the socket directory read-only and adds its group. It does not
+enable host networking or add host `NET_ADMIN` to the edge container. The portal
+forwards only status, config validation, and config apply requests after its existing
+authentication and CSRF checks. The daemon independently validates every request. The
+socket still grants its allowlisted host-management API, so only trusted administrators
+should belong to its group. If the overlay or socket is absent, the tunnel and portal
+continue to run and gateway status reports unavailable.
+
 This initial service implements configuration validation, WAN quality/outage reporting,
 conntrack flow snapshots, Linux bridge FDB occupancy/learned-entry limits, and the base
 Linux Layer 2 bridge/VLAN topology provider. Other Layer 2 providers and DHCP, NAT, policy

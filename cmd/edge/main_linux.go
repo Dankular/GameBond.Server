@@ -95,6 +95,7 @@ func run() error {
 				mu.Unlock()
 			})
 			portal := adminportal.New(adminportal.Options{Settings: settings, Security: securityAPI{sec}, ConfigPath: *configPath, Hardware: resources.Snapshot,
+				GatewaySocketPath: os.Getenv("GAMEBOND_GATEWAY_SOCKET"),
 				Snapshot: func() any {
 					mu.Lock()
 					defer mu.Unlock()

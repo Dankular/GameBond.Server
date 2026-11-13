@@ -59,6 +59,8 @@ type Options struct {
 	TempDir string
 	// Security, when set, serves the firewall, DNS filter and intrusion detection pages.
 	Security SecurityAPI
+	// GatewaySocketPath is optional; when configured, only the gateway's allowlisted Unix API is used.
+	GatewaySocketPath string
 }
 
 // SecurityAPI is what the portal needs from the security manager.
@@ -82,6 +84,7 @@ type Portal struct {
 	hashing      chan struct{}
 	mu           sync.Mutex // configuration writes and the password hash
 	passwordHash string
+	gateway      *GatewayClient
 	logMu        sync.Mutex
 	log          []string
 	server       *http.Server
@@ -96,7 +99,11 @@ func New(o Options) *Portal {
 	if o.RequestRestart == nil {
 		o.RequestRestart = func() {}
 	}
-	return &Portal{o: o, hashing: make(chan struct{}, maxHashing), Sessions: adminauth.NewSessions(o.Clock), Throttle: adminauth.NewThrottle(o.Clock), passwordHash: o.Settings.PasswordHash}
+	p := &Portal{o: o, hashing: make(chan struct{}, maxHashing), Sessions: adminauth.NewSessions(o.Clock), Throttle: adminauth.NewThrottle(o.Clock), passwordHash: o.Settings.PasswordHash}
+	if o.GatewaySocketPath != "" {
+		p.gateway, _ = NewGatewayClient(o.GatewaySocketPath)
+	}
+	return p
 }
 
 // Note appends a timestamped line to the portal's log ring.
@@ -438,6 +445,19 @@ func (p *Portal) apiGet(w http.ResponseWriter, r *http.Request, path string) {
 		}
 		return
 	}
+	if path == "/api/gateway/status" {
+		if p.gateway == nil {
+			p.json(w, 200, map[string]any{"available": false})
+			return
+		}
+		out, err := p.gateway.Request(r.Context(), http.MethodGet, "/v1/status", nil)
+		if err != nil {
+			p.json(w, 200, map[string]any{"available": false, "error": err.Error()})
+			return
+		}
+		p.send(w, 200, out, "application/json; charset=utf-8")
+		return
+	}
 	routes := map[string]func() any{
 		"/api/hardware": func() any {
 			if p.o.Hardware == nil {
@@ -598,6 +618,31 @@ func (p *Portal) post(w http.ResponseWriter, r *http.Request, path string) {
 			return
 		}
 		p.json(w, 200, map[string]any{"ok": true, "error": nil, "result": out})
+	case "/api/gateway/validate", "/api/gateway/config":
+		if p.gateway == nil {
+			p.json(w, 503, map[string]any{"ok": false, "error": "gateway daemon is not configured"})
+			return
+		}
+		config, ok := b["config"]
+		if !ok {
+			p.json(w, 400, map[string]any{"ok": false, "error": "config required"})
+			return
+		}
+		raw, err := json.Marshal(config)
+		if err != nil {
+			p.json(w, 400, map[string]any{"ok": false, "error": "invalid config"})
+			return
+		}
+		method, endpoint := http.MethodPost, "/v1/config/validate"
+		if path == "/api/gateway/config" {
+			method, endpoint = http.MethodPut, "/v1/config"
+		}
+		out, err := p.gateway.Request(r.Context(), method, endpoint, raw)
+		if err != nil {
+			p.json(w, 422, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		p.send(w, 200, out, "application/json; charset=utf-8")
 	case "/api/password":
 		result(p.SetPassword(text(b, "current"), text(b, "new")))
 	case "/api/restart":
