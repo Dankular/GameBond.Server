@@ -8,7 +8,7 @@ RUN GOFLAGS=-buildvcs=false CGO_ENABLED=0 GOOS=linux go build -ldflags "-X githu
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 nftables tini jq \
+    && apt-get install -y --no-install-recommends iproute2 nftables conntrack tini jq \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/gamebond-native-edge /usr/local/bin/gamebond-native-edge
 COPY tools/container-entrypoint.sh /usr/local/bin/container-entrypoint
