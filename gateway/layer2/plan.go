@@ -141,6 +141,9 @@ func BuildTopologyPlan(previous, desired Config, host Capabilities) (Plan, error
 				Rollback: Command{Tool: "ip", Args: []string{"link", "del", "dev", bridge.Name}}})
 		}
 		mtu := bridgeMTU(bridge, networkByID)
+		if mtu > 1500 && exists && (liveBridge.MaxMTU == 0 || mtu > liveBridge.MaxMTU) {
+			return Plan{}, fmt.Errorf("bridge %q requested MTU %d exceeds or has unknown maximum MTU %d", bridge.ID, mtu, liveBridge.MaxMTU)
+		}
 		if !exists || (liveBridge.MTU != 0 && liveBridge.MTU != mtu) {
 			previousMTU := liveBridge.MTU
 			if previousMTU == 0 {
@@ -172,6 +175,9 @@ func BuildTopologyPlan(previous, desired Config, host Capabilities) (Plan, error
 			livePort, exists := interfaces[physical.Name]
 			if !exists {
 				return Plan{}, fmt.Errorf("managed interface %q does not exist on the host", physical.Name)
+			}
+			if mtu > 1500 && (livePort.MaxMTU == 0 || mtu > livePort.MaxMTU) {
+				return Plan{}, fmt.Errorf("interface %q requested MTU %d exceeds or has unknown maximum MTU %d", physical.ID, mtu, livePort.MaxMTU)
 			}
 			if livePort.Master != "" && livePort.Master != bridge.Name && managedPorts[physical.Name] != livePort.Master {
 				return Plan{}, fmt.Errorf("interface %q is attached to unmanaged master %q", physical.Name, livePort.Master)

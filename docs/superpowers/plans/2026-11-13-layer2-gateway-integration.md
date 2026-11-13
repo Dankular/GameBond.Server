@@ -102,11 +102,11 @@ The existing gateway foundation plan is a prerequisite and owns the `gateway` da
 
 ### Task 4: Add Jumbo Frames
 
-**Files:** `gateway/layer2/config.go`, `gateway/layer2/plan.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
+**Files:** `gateway/layer2/capabilities_linux.go`, `gateway/layer2/plan.go`, and their focused tests.
 
-- [ ] Validate requested MTU against every interface in the affected L2 path and the provider's reported maximum.
-- [ ] Apply MTU changes in dependency order and roll back if any member or bridge rejects the size.
-- [ ] Verify effective MTU on the bridge, VLAN, bond, and physical members.
+- [x] Validate requested MTU against every physical interface in the affected bridge path and reject jumbo MTUs if the host maximum is missing or too small; check the bridge maximum when it already exists.
+- [x] Apply MTU changes in dependency order and roll back if any member or bridge rejects the size.
+- [x] Verify effective MTU on the bridge and physical members through the transaction's post-apply topology check. Bond path verification remains part of the later LACP integration.
 
 ### Task 5: Add Port Isolation
 

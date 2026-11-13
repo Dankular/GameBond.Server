@@ -2,7 +2,10 @@
 
 package layer2
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestEvaluateCapabilitiesReportsMissingTools(t *testing.T) {
 	c := EvaluateCapabilities(Detection{KernelRelease: "6.12.0", Tools: map[string]bool{"ip": true}})
@@ -43,4 +46,30 @@ func TestEvaluateCapabilitiesMarksProfilesUnsupportedUntilIntegrated(t *testing.
 			t.Errorf("profile %s must stay unsupported before integration, got %#v", profile.name, got)
 		}
 	}
+}
+
+type capabilityRunner struct{}
+
+func (capabilityRunner) Available(tool string) bool { return tool == "ip" || tool == "bridge" }
+func (capabilityRunner) Run(_ context.Context, tool string, _ ...string) ([]byte, error) {
+	if tool == "ip" {
+		return []byte(`[{"ifname":"enp2s0","mtu":1500,"max_mtu":9000,"flags":["UP"]}]`), nil
+	}
+	return []byte(`[]`), nil
+}
+
+func TestSnapshotCapabilitiesReportsInterfaceMaximumMTU(t *testing.T) {
+	caps, err := SnapshotCapabilities(context.Background(), capabilityRunner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, iface := range caps.Interfaces {
+		if iface.Name == "enp2s0" {
+			if iface.MaxMTU != 9000 {
+				t.Fatalf("max_mtu = %d, want 9000", iface.MaxMTU)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected interface in snapshot, got %d interfaces", len(caps.Interfaces))
 }

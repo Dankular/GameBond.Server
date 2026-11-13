@@ -69,6 +69,77 @@ func TestBuildTopologyPlanRejectsUnmanagedPortMaster(t *testing.T) {
 	}
 }
 
+func TestBuildTopologyPlanRejectsJumboMTUWhenHostMaximumIsUnknown(t *testing.T) {
+	cfg, err := DecodeConfig([]byte(validConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Overrides = nil
+	for i := range cfg.Networks {
+		cfg.Networks[i].MTU = 9000
+	}
+	host := Capabilities{Features: map[string]FeatureCapability{FeatureBridgeVLAN: {State: CapabilityConditional}},
+		Interfaces: []HostInterface{{Name: "enp2s0", MTU: 1500}, {Name: "enp3s0", MTU: 1500}}}
+	if _, err := BuildTopologyPlan(Config{}, cfg, host); err == nil || !strings.Contains(err.Error(), "maximum MTU") {
+		t.Fatalf("jumbo MTU with unknown interface maximum must be rejected, got %v", err)
+	}
+}
+
+func TestBuildTopologyPlanAppliesJumboMTUWithinEveryPortMaximum(t *testing.T) {
+	cfg, err := DecodeConfig([]byte(validConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Overrides = nil
+	for i := range cfg.Networks {
+		cfg.Networks[i].MTU = 9000
+	}
+	host := Capabilities{Features: map[string]FeatureCapability{FeatureBridgeVLAN: {State: CapabilityConditional}},
+		Interfaces: []HostInterface{{Name: "enp2s0", MTU: 1500, MaxMTU: 9000}, {Name: "enp3s0", MTU: 1500, MaxMTU: 9000}}}
+	plan, err := BuildTopologyPlan(Config{}, cfg, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenBridgeMTU, seenPortMTUs := false, 0
+	for _, change := range plan.Changes {
+		if change.Apply.Tool != "ip" || len(change.Apply.Args) < 6 {
+			continue
+		}
+		args := strings.Join(change.Apply.Args, " ")
+		if strings.Contains(args, "mtu 9000") && strings.Contains(args, "br-main") {
+			seenBridgeMTU = true
+		}
+		if strings.Contains(args, "mtu 9000") && (strings.Contains(args, "enp2s0") || strings.Contains(args, "enp3s0")) {
+			seenPortMTUs++
+		}
+	}
+	if !seenBridgeMTU || seenPortMTUs != 2 {
+		t.Fatalf("jumbo MTU must be applied to bridge and both ports; bridge=%t ports=%d", seenBridgeMTU, seenPortMTUs)
+	}
+}
+
+func TestBuildTopologyPlanRejectsExistingBridgeWithUnknownMaximumMTU(t *testing.T) {
+	previous, err := DecodeConfig([]byte(validConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous.Overrides = nil
+	desired := previous
+	desired.Networks = append([]Network(nil), previous.Networks...)
+	for i := range desired.Networks {
+		desired.Networks[i].MTU = 9000
+	}
+	host := Capabilities{Features: map[string]FeatureCapability{FeatureBridgeVLAN: {State: CapabilityConditional}},
+		Interfaces: []HostInterface{
+			{Name: "br-main", Kind: "bridge", MTU: 1500},
+			{Name: "enp2s0", Master: "br-main", MTU: 1500, MaxMTU: 9000},
+			{Name: "enp3s0", Master: "br-main", MTU: 1500, MaxMTU: 9000},
+		}}
+	if _, err := BuildTopologyPlan(previous, desired, host); err == nil || !strings.Contains(err.Error(), "maximum MTU") {
+		t.Fatalf("jumbo MTU with unknown bridge maximum must be rejected, got %v", err)
+	}
+}
+
 type planRunner struct {
 	calls    []string
 	failAt   map[int]bool

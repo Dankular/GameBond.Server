@@ -59,6 +59,7 @@ type HostInterface struct {
 	Kind          string `json:"kind,omitempty"`
 	Master        string `json:"master,omitempty"`
 	MTU           int    `json:"mtu"`
+	MaxMTU        int    `json:"max_mtu,omitempty"`
 	OperState     string `json:"oper_state,omitempty"`
 	AdminUp       bool   `json:"admin_up"`
 	VLANFiltering bool   `json:"vlan_filtering,omitempty"`
@@ -193,6 +194,7 @@ func SnapshotCapabilities(ctx context.Context, runner HostRunner) (Capabilities,
 	var links []struct {
 		Name      string   `json:"ifname"`
 		MTU       int      `json:"mtu"`
+		MaxMTU    int      `json:"max_mtu"`
 		OperState string   `json:"operstate"`
 		Master    string   `json:"master"`
 		Flags     []string `json:"flags"`
@@ -215,7 +217,7 @@ func SnapshotCapabilities(ctx context.Context, runner HostRunner) (Capabilities,
 				break
 			}
 		}
-		c.Interfaces = append(c.Interfaces, HostInterface{Name: link.Name, Kind: link.LinkInfo.Kind, Master: link.Master, MTU: link.MTU, OperState: link.OperState, AdminUp: adminUp, VLANFiltering: link.LinkInfo.InfoData.VLANFiltering})
+		c.Interfaces = append(c.Interfaces, HostInterface{Name: link.Name, Kind: link.LinkInfo.Kind, Master: link.Master, MTU: link.MTU, MaxMTU: link.MaxMTU, OperState: link.OperState, AdminUp: adminUp, VLANFiltering: link.LinkInfo.InfoData.VLANFiltering})
 	}
 	if runner.Available("bridge") {
 		vlanResult, err := runner.Run(ctx, "bridge", "-json", "vlan", "show")
