@@ -149,11 +149,28 @@ watchdog_check() {
   if wait_ready; then log "watchdog: container is ready again"; rm -f "$STATE/watchdog-gave-up"; else log "watchdog: container still not ready"; fi
 }
 
+# sync_forward keeps the reverse-proxy forwarding (tools/host-forward.sh, installed beside the release)
+# pointed at the running container. Its rules are not persistent and the container address can change
+# on every recreate, so the check runs each poll; it only acts when the rules are missing or stale.
+FORWARD=${GAMEBOND_HOST_FORWARD:-/opt/gamebond/host-forward.sh}
+sync_forward() {
+  [ -x "$FORWARD" ] || return 0
+  [ "$(container_state)" = "running|healthy" ] || return 0
+  local ip
+  ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CONTAINER" 2>/dev/null)
+  [ -n "$ip" ] || return 0
+  if nft list table ip gamebond_exit 2>/dev/null | grep -q "dnat to $ip\$"      && iptables -S DOCKER-USER 2>/dev/null | grep -q -- "-d $ip/32 .*gamebond-reverse-forward"; then
+    return 0
+  fi
+  if "$FORWARD" apply "$CONTAINER" >/dev/null 2>&1; then log "reverse forwarding applied for $CONTAINER ($ip)"
+  else log "reverse forwarding could not be applied for $CONTAINER ($ip)"; fi
+}
+
 [ "${GAMEBOND_PROBE_SOURCE_ONLY:-0}" = 1 ] && return 0 2>/dev/null
 
 case "${1:-watch}" in
   update) if [ -n "${2:-}" ]; then update_to "$2"; else check_once; fi ;;
   watch)  ETAG=""; log "probe started, polling every ${INTERVAL}s"
-          while true; do check_once; watchdog_check; sleep "$INTERVAL"; done ;;
+          while true; do check_once; watchdog_check; sync_forward; sleep "$INTERVAL"; done ;;
   *)      echo "usage: gamebond-probe [watch|update [SHA]]" >&2; exit 2 ;;
 esac
