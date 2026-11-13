@@ -69,6 +69,12 @@ plan() {
         FORWARD_FILTER='add rule ip gamebond forward iifname "gamebond0" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 } drop'
     fi
 
+    # Reverse proxy: public TCP and UDP ports reaching this container are forwarded to the tunnel client
+    # (10.77.0.2), except the container's own services. The client answers only on ports where a program
+    # is listening and resets the rest, so every port is open but only the ones in use respond. Traffic
+    # arrives here only for ports the Docker host forwards in (see tools/host-forward.sh).
+    # GAMEBOND_REVERSE_FORWARD=0 turns it off; GAMEBOND_REVERSE_DENY_TCP / _UDP are comma-separated
+    # ports never forwarded (defaults: the admin portal and the tunnel port).
     NFT_TABLES=$(nft list tables)
     if grep -Fxq 'table ip gamebond' <<< "$NFT_TABLES"; then
         echo 'Container gamebond nft table already exists; refusing overwrite' >&2; exit 1
@@ -106,6 +112,18 @@ launch() {
         # shellcheck disable=SC2086
         tc qdisc replace dev "$qdev" root cake $cake_rate diffserv4 flows ecn 2>/dev/null             || tc qdisc replace dev "$qdev" root fq_codel ecn 2>/dev/null             || echo "no egress qdisc for $qdev" >&2
     done
+    REVERSE_RULES=
+    if [[ "${GAMEBOND_REVERSE_FORWARD:-1}" != 0 ]]; then
+        rev_tcp=${GAMEBOND_REVERSE_DENY_TCP:-8443}
+        rev_udp=${GAMEBOND_REVERSE_DENY_UDP:-4433}
+        if [[ "$rev_tcp" =~ ^[0-9]+(,[0-9]+)*$ && "$rev_udp" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+            REVERSE_RULES="add chain ip gamebond reverse { type nat hook prerouting priority dstnat; policy accept; }
+add rule ip gamebond reverse iifname \"$WAN\" fib daddr type local tcp dport != { $rev_tcp } dnat to 10.77.0.2
+add rule ip gamebond reverse iifname \"$WAN\" fib daddr type local udp dport != { $rev_udp } dnat to 10.77.0.2"
+        else
+            echo 'GAMEBOND_REVERSE_DENY_TCP/UDP must be comma-separated port numbers; reverse forwarding off' >&2
+        fi
+    fi
     nft -f - <<EOF
 add table ip gamebond
 add chain ip gamebond postrouting { type nat hook postrouting priority srcnat; policy accept; }
@@ -118,6 +136,12 @@ add chain ip gamebond defrag { type filter hook prerouting priority -150; policy
 add rule ip gamebond defrag iifname "$WAN" ip protocol udp meta length > 1280 ip frag-off & 0x4000 != 0 ip frag-off set 0
 EOF
     nat_added=1
+    # Best effort: a problem here must never keep the exit itself from coming up.
+    if [[ -n "$REVERSE_RULES" ]]; then
+        nft -f - <<RULES || echo 'reverse port forwarding not installed (nft rejected the rules)' >&2
+$REVERSE_RULES
+RULES
+    fi
     kill -0 "$child"
     touch /tmp/gamebond-ready
     echo 'GameBond container locally ready; client reachability has not been measured'

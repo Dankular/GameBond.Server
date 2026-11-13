@@ -4,6 +4,7 @@ The GameBond edge server: the `cmd/edge` binary, its container image, and the up
 
 - Image: built by GitHub Actions on every push to `main` and published as
   `ghcr.io/dankular/gamebond-server:<commit>` (the commit is also what the server reports to clients).
+- `tools/host-forward.sh`: run on the Docker host (not in the container) to forward every public port the host does not use into the container; the container then forwards them to the tunnel client, which answers only where a program is listening (reverse proxy). `GAMEBOND_REVERSE_FORWARD=0` disables the container side; `GAMEBOND_REVERSE_DENY_TCP` / `_UDP` list ports never forwarded (defaults 8443 and 4433).
 - `tools/server-probe.sh` + `tools/gamebond-probe.service`: run on the VPS; watch this repo's
   `server-image` workflow and, on a new successful build, pull the image, recreate the container,
   wait for readiness and roll back if it does not come up.
