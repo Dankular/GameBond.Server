@@ -12,6 +12,16 @@
 # is recreated: its bridge address can change. Run as root on the Docker host.
 set -euo pipefail
 TABLE=gamebond_exit
+TAG=gamebond-reverse-forward
+
+# Remove every DOCKER-USER rule this script added (the container address may have changed).
+drop_user_rule() {
+    command -v iptables >/dev/null 2>&1 || return 0
+    local n
+    while n=$(iptables -L DOCKER-USER --line-numbers -n 2>/dev/null | awk -v t="$TAG" '$0 ~ t {print $1; exit}'); [[ -n "$n" ]]; do
+        iptables -D DOCKER-USER "$n"
+    done
+}
 cmd=${1:-show}
 
 wan=$(ip -4 route show default | awk 'NR==1{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')
@@ -44,6 +54,7 @@ show)
     ;;
 remove)
     nft delete table ip $TABLE 2>/dev/null || true
+    drop_user_rule
     echo 'removed'
     ;;
 apply)
@@ -60,9 +71,12 @@ add table ip $TABLE
 add chain ip $TABLE pre { type nat hook prerouting priority dstnat - 10; policy accept; }
 add rule ip $TABLE pre iifname "$wan" ip daddr { $pub } tcp dport != { $tcp_set } dnat to $cip
 add rule ip $TABLE pre iifname "$wan" ip daddr { $pub } udp dport != { $udp_set } dnat to $cip
-add chain ip $TABLE fwd { type filter hook forward priority filter - 10; policy accept; }
-add rule ip $TABLE fwd ip daddr $cip ct state new accept
 RULES
+    # Docker drops new connections from outside to container ports it does not publish (its DOCKER
+    # chain), and an accept in another nft table cannot override that. DOCKER-USER runs first, so
+    # accept the forwarded traffic there; the rule is tagged so it can be found and removed.
+    drop_user_rule
+    iptables -I DOCKER-USER 1 -d "$cip" -m comment --comment "$TAG" -j ACCEPT
     echo "forwarding every other port on $pub to $container ($cip)"
     echo "excluded tcp: $tcp_set"
     echo "excluded udp: $udp_set"
