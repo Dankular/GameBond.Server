@@ -164,6 +164,32 @@ func cloneConfig(cfg Config) Config {
 		copy.WANs[i].ProbeTargets = append([]string(nil), cfg.WANs[i].ProbeTargets...)
 	}
 	copy.Bridges = append([]Bridge(nil), cfg.Bridges...)
+	copy.NAT.Rules = append([]NATRule(nil), cfg.NAT.Rules...)
+	copy.Routing.Policies = append([]RoutePolicy(nil), cfg.Routing.Policies...)
+	copy.QoS.Interfaces = append([]QoSInterface(nil), cfg.QoS.Interfaces...)
+	for i := range copy.QoS.Interfaces {
+		copy.QoS.Interfaces[i].Classes = append([]QoSClass(nil), cfg.QoS.Interfaces[i].Classes...)
+	}
+	copy.DHCP.Subnets = append([]DHCPSubnet(nil), cfg.DHCP.Subnets...)
+	for i := range copy.DHCP.Subnets {
+		copy.DHCP.Subnets[i].DNS = append([]string(nil), cfg.DHCP.Subnets[i].DNS...)
+		copy.DHCP.Subnets[i].Reservations = append([]DHCPReservation(nil), cfg.DHCP.Subnets[i].Reservations...)
+		copy.DHCP.Subnets[i].Options = append([]DHCPOption(nil), cfg.DHCP.Subnets[i].Options...)
+	}
+	copy.VRRP.Peers = append([]string(nil), cfg.VRRP.Peers...)
+	copy.VRRP.VirtualAddresses = append([]string(nil), cfg.VRRP.VirtualAddresses...)
+	copy.IGMPProxy.DownstreamInterfaceIDs = append([]string(nil), cfg.IGMPProxy.DownstreamInterfaceIDs...)
+	copy.IGMPProxy.AllowedSources = append([]string(nil), cfg.IGMPProxy.AllowedSources...)
+	copy.DynamicRouting.OSPF.Interfaces = append([]OSPFInterface(nil), cfg.DynamicRouting.OSPF.Interfaces...)
+	copy.MDNS.InterfaceIDs = append([]string(nil), cfg.MDNS.InterfaceIDs...)
+	copy.MDNS.ReflectFilters = append([]string(nil), cfg.MDNS.ReflectFilters...)
+	copy.RADIUS.Clients = append([]RADIUSClient(nil), cfg.RADIUS.Clients...)
+	copy.RADIUS.Users = append([]RADIUSUser(nil), cfg.RADIUS.Users...)
+	copy.DynamicRouting.BGP.Neighbors = append([]BGPNeighbor(nil), cfg.DynamicRouting.BGP.Neighbors...)
+	for i := range copy.DynamicRouting.BGP.Neighbors {
+		copy.DynamicRouting.BGP.Neighbors[i].Import = append([]string(nil), cfg.DynamicRouting.BGP.Neighbors[i].Import...)
+		copy.DynamicRouting.BGP.Neighbors[i].Export = append([]string(nil), cfg.DynamicRouting.BGP.Neighbors[i].Export...)
+	}
 	if cfg.Layer2 != nil {
 		layer2Copy := *cfg.Layer2
 		layer2Copy.Interfaces = append([]layer2.Interface(nil), cfg.Layer2.Interfaces...)
@@ -175,7 +201,20 @@ func cloneConfig(cfg Config) Config {
 			}
 		}
 		layer2Copy.Networks = append([]layer2.Network(nil), cfg.Layer2.Networks...)
+		layer2Copy.Bonds = append([]layer2.Bond(nil), cfg.Layer2.Bonds...)
+		for i := range layer2Copy.Bonds {
+			layer2Copy.Bonds[i].Members = append([]string(nil), cfg.Layer2.Bonds[i].Members...)
+		}
 		layer2Copy.Overrides = append([]layer2.DeviceOverride(nil), cfg.Layer2.Overrides...)
+		layer2Copy.MACBlocks = append([]layer2.MACBlock(nil), cfg.Layer2.MACBlocks...)
+		layer2Copy.MACACL = append([]layer2.MACACLRule(nil), cfg.Layer2.MACACL...)
+		layer2Copy.IPACL = append([]layer2.IPACLRule(nil), cfg.Layer2.IPACL...)
+		layer2Copy.EgressRates = append([]layer2.EgressRateLimit(nil), cfg.Layer2.EgressRates...)
+		layer2Copy.FlowControl = append([]layer2.FlowControlPolicy(nil), cfg.Layer2.FlowControl...)
+		layer2Copy.MACPortRestrictions = append([]layer2.MACPortRestriction(nil), cfg.Layer2.MACPortRestrictions...)
+		for i := range layer2Copy.MACPortRestrictions {
+			layer2Copy.MACPortRestrictions[i].AllowedMACs = append([]string(nil), cfg.Layer2.MACPortRestrictions[i].AllowedMACs...)
+		}
 		copy.Layer2 = &layer2Copy
 	}
 	return copy

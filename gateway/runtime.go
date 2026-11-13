@@ -11,12 +11,21 @@ import (
 
 // RuntimeSnapshot combines operational views for the local API.
 type RuntimeSnapshot struct {
-	Capabilities Capabilities         `json:"capabilities"`
-	Quality      QualitySnapshot      `json:"quality"`
-	Flows        *FlowSnapshot        `json:"flows,omitempty"`
-	Bridges      []BridgeSnapshot     `json:"bridges"`
-	Layer2       *layer2.Capabilities `json:"layer2,omitempty"`
-	Layer2Error  string               `json:"layer2_error,omitempty"`
+	Capabilities   Capabilities           `json:"capabilities"`
+	Quality        QualitySnapshot        `json:"quality"`
+	Flows          *FlowSnapshot          `json:"flows,omitempty"`
+	Bridges        []BridgeSnapshot       `json:"bridges"`
+	Layer2         *layer2.Capabilities   `json:"layer2,omitempty"`
+	Layer2Error    string                 `json:"layer2_error,omitempty"`
+	NAT            NATSnapshot            `json:"nat"`
+	Routing        RoutingSnapshot        `json:"routing"`
+	QoS            QoSSnapshot            `json:"qos"`
+	DHCP           DHCPSnapshot           `json:"dhcp"`
+	VRRP           VRRPSnapshot           `json:"vrrp"`
+	IGMPProxy      IGMPProxySnapshot      `json:"igmp_proxy"`
+	DynamicRouting DynamicRoutingSnapshot `json:"dynamic_routing"`
+	MDNS           MDNSSnapshot           `json:"mdns"`
+	RADIUS         RADIUSSnapshot         `json:"radius"`
 }
 
 // Runtime owns the background telemetry providers for the current desired config.
@@ -115,8 +124,17 @@ func (r *Runtime) Snapshot(ctx context.Context) RuntimeSnapshot {
 		caps = Capabilities{Tools: map[string]bool{}, Error: err.Error()}
 	}
 	out := RuntimeSnapshot{Capabilities: caps, Bridges: (BridgeInventory{Runner: r.runner}).Snapshot(ctx, cfg)}
+	out.NAT = snapshotNAT(ctx, r.runner, cfg.NAT.Enabled)
+	out.Routing = snapshotRouting(ctx, r.runner, cfg)
+	out.QoS = snapshotQoS(ctx, r.runner, cfg)
+	out.DHCP = snapshotDHCP(ctx, r.runner, cfg.DHCP.Enabled)
+	out.VRRP = snapshotVRRP(ctx, r.runner, cfg)
+	out.IGMPProxy = snapshotIGMP(ctx, r.runner, cfg.IGMPProxy.Enabled)
+	out.DynamicRouting = snapshotDynamicRouting(ctx, r.runner, cfg.DynamicRouting)
+	out.MDNS = snapshotMDNS(ctx, r.runner, cfg.MDNS.Enabled)
+	out.RADIUS = snapshotRADIUS(ctx, r.runner, cfg.RADIUS)
 	if cfg.Layer2 != nil {
-		if l2Caps, err := layer2.SnapshotCapabilities(ctx, layer2RunnerAdapter{runner: r.runner}); err == nil {
+		if l2Caps, err := layer2.SnapshotCapabilities(ctx, *cfg.Layer2, layer2RunnerAdapter{runner: r.runner}); err == nil {
 			out.Layer2 = &l2Caps
 		} else {
 			out.Layer2Error = err.Error()

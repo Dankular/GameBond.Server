@@ -156,7 +156,7 @@ func (s *APIServer) handler() http.Handler {
 		}
 		response := map[string]any{"valid": true, "capabilities": caps}
 		if cfg.Layer2 != nil {
-			l2Caps, err := layer2.SnapshotCapabilities(r.Context(), layer2RunnerAdapter{runner: s.Runner})
+			l2Caps, err := layer2.SnapshotCapabilities(r.Context(), *cfg.Layer2, layer2RunnerAdapter{runner: s.Runner})
 			if err != nil {
 				writeError(w, http.StatusServiceUnavailable, err)
 				return
@@ -166,6 +166,10 @@ func (s *APIServer) handler() http.Handler {
 				return
 			}
 			response["layer2_capabilities"] = l2Caps
+		}
+		if _, err := (LinuxApplier{Runner: s.Runner}).Prepare(r.Context(), s.Manager.Current(), cfg); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
 		}
 		writeJSON(w, http.StatusOK, response)
 	})

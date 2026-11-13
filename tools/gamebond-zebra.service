@@ -1,0 +1,28 @@
+[Unit]
+Description=GameBond FRRouting zebra
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=frr
+Group=frr
+RuntimeDirectory=frr/gamebond
+RuntimeDirectoryMode=0750
+ExecStart=/usr/lib/frr/zebra -N gamebond -A 127.0.0.1
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+ReadWritePaths=/etc/frr/gamebond /var/run/frr/gamebond
+
+[Install]
+WantedBy=multi-user.target

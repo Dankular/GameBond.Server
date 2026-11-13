@@ -1,0 +1,28 @@
+[Unit]
+Description=GameBond IGMP multicast proxy
+After=network-online.target
+Wants=network-online.target
+Conflicts=igmpproxy.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/sbin/igmpproxy -n /etc/gamebond/igmpproxy.conf
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+ReadOnlyPaths=/etc/gamebond/igmpproxy.conf
+
+[Install]
+WantedBy=multi-user.target

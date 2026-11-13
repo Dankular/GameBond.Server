@@ -93,12 +93,12 @@ The existing gateway foundation plan is a prerequisite and owns the `gateway` da
 
 ### Task 3: Add virtual network override
 
-**Files:** `gateway/layer2/config.go`, `gateway/layer2/plan.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
+**Files:** `gateway/layer2/config.go`, `gateway/layer2/capabilities_linux.go`, `gateway/layer2/plan.go`, `gateway/hostapply_linux.go`, `gateway/runtime.go`, `gateway/api_linux.go`.
 
-- [ ] Define Virtual Network Override as an authorized device-to-network/VLAN assignment with explicit precedence over default network membership.
-- [ ] Validate that the target device identity is allowed and the selected network exists.
-- [ ] Apply the VLAN/bridge membership using the detected Linux bridge support and verify effective membership.
-- [ ] Report assignment, effective network, and rejection reason in status.
+- [x] Define Virtual Network Override as an authorized device-to-network/VLAN assignment with explicit precedence over default network membership.
+- [x] Validate that the target device identity is allowed and the selected network exists.
+- [x] Apply the VLAN/bridge membership using detected bridge and `tc` support and verify effective membership and filters.
+- [x] Report assignment, effective network, and rejection reason in status.
 
 ### Task 4: Add Jumbo Frames
 
@@ -110,59 +110,59 @@ The existing gateway foundation plan is a prerequisite and owns the `gateway` da
 
 ### Task 5: Add Port Isolation
 
-**Files:** `gateway/layer2/config.go`, `gateway/layer2/plan.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
+**Files:** `gateway/layer2/config.go`, `gateway/layer2/capabilities_linux.go`, `gateway/layer2/plan.go`, `gateway/layer2/plan_test.go`, `gateway/layer2/capabilities_linux_test.go`.
 
-- [ ] Define isolated and permitted-forwarding port groups with explicit bridge/VLAN scope.
-- [ ] Reject rules that would isolate the gateway management path or contradict an explicit allow policy.
-- [ ] Apply and verify bridge port isolation or an equivalent supported Linux forwarding policy.
+- [x] Define per-port bridge isolation with scope inherited from that port's configured bridge/VLAN membership; isolated ports cannot forward to other isolated ports, while the bridge host port remains outside the isolated set.
+- [x] Reject isolation when the bridge provider is unavailable and refuse changes when live isolation state cannot be observed.
+- [x] Apply and verify Linux bridge isolated-port flags with reversible updates.
 
 ### Task 6: Add MAC-Based Port Restriction
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Define allowed MAC identities, maximum learned devices, violation action, and per-port policy.
-- [ ] Select only a provider mechanism that enforces the configured restriction; reject display-only limits.
-- [ ] Report learned identity, violation counters, and enforcement status without exposing unrelated host data.
+- [x] Define allowed MAC identities, maximum learned devices, violation action, and per-port policy.
+- [x] Enforce a whitelist with Linux bridge locked ports and static FDB entries; because Linux learned-FDB limits are bridge-wide, reject topologies with more than one managed access port on the bridge.
+- [x] Report the configured allow-list, live learned-device count, locked FDB entries, and applied state from only the managed port and bridge.
 
 ### Task 7: Add MAC Address Blocking
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Validate unicast MAC addresses and network/port scope.
-- [ ] Apply scoped L2 drop rules using the selected Linux bridge/nft provider and verify active rules.
-- [ ] Provide bounded counters and remove only GameBond-owned rules during rollback or disable.
+- [x] Validate unicast MAC addresses and single-network port scope.
+- [x] Apply atomic nftables bridge input/output/forward drop rules with packet counters and verify the exact active GameBond rule set.
+- [x] Bound the configured rule count and replace/remove only the marked GameBond-owned table, with rollback scripts restoring the previous policy.
 
 ### Task 8: Add MAC-Based ACLs and Device Isolation
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Define ordered allow/deny rules with MAC, ingress network/port, destination scope, and terminal action.
-- [ ] Reject ambiguous rule order and unsupported match combinations before apply.
-- [ ] Apply scoped L2 policy and report rule counters and effective order.
+- [x] Define ordered allow/deny rules with source/destination MAC, direction, network/port scope, and terminal action.
+- [x] Reject duplicate match tuples, invalid rule order identifiers, and unsupported combinations before apply.
+- [x] Apply an atomic scoped bridge-family ACL table and report active rule order plus packet/byte counters.
 
 ### Task 9: Add IP-Based ACLs and Network Isolation
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Define ordered IP prefix/protocol/port policies tied to named virtual networks.
-- [ ] Ensure policy boundaries prevent traffic crossing isolated networks except through explicit allows.
-- [ ] Apply with the GameBond-owned firewall table and verify counters without replacing unrelated host firewall state.
+- [x] Define ordered IP prefix/protocol/port policies tied to named virtual networks.
+- [ ] Enforce routed inter-network isolation through the gateway firewall, with explicit allows between named networks.
+- [x] Apply an atomic GameBond-owned bridge-family ACL table and report active rule counters without replacing unrelated host firewall state.
 
 ### Task 10: Add Egress Rate Limit
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Define per-port and per-network rate and burst parameters with explicit units and bounds.
-- [ ] Apply supported `tc` shaping and report the effective qdisc and rate.
-- [ ] Reject unsupported offload or queue combinations instead of silently falling back to an unshaped path.
+- [x] Define per-port TBF and tagged-trunk per-network rate/burst parameters with explicit units and bounds; reject access-port VLAN scope that cannot be matched after egress untagging.
+- [x] Apply `tc` TBF shaping for whole-interface policies and `clsact` policing for tagged VLAN policies; report observed rate and burst.
+- [x] Reject interfaces whose root qdisc is unmanaged or unsupported instead of silently replacing it.
 
 ### Task 11: Add Flow Control
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/capabilities_linux.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Define RX/TX pause behavior per physical interface.
-- [ ] Detect driver and ethtool support before apply; never apply to an aggregate member independently when policy belongs to the bond.
-- [ ] Verify effective pause settings and report unsupported directions separately.
+- [x] Define RX/TX pause and autonegotiation behavior per physical interface.
+- [x] Detect driver and ethtool support before apply; reject bond aggregates and members.
+- [x] Verify effective pause settings and report unsupported interfaces with driver detail.
 
 ### Task 12: Add QoS (DSCP)
 
@@ -256,10 +256,10 @@ The existing gateway foundation plan is a prerequisite and owns the `gateway` da
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/plan.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Define dedicated member interfaces, actor/system identity, mode, minimum active links, and hash policy.
-- [ ] Reject any member already owned by a WAN, bridge, VLAN, or other bond.
-- [ ] Create Linux 802.3ad bond, attach members in safe order, and verify LACP partner and collecting/distributing state.
-- [ ] Never claim added bandwidth unless the peer switch and flow hash behavior support the negotiated aggregate.
+- [x] Define dedicated member interfaces, optional system MAC identity, 802.3ad mode, minimum active links, LACP rate, and hash policy.
+- [x] Reject members already owned by a WAN, bridge, VLAN, or other bond.
+- [x] Create the Linux bond and attach members in reversible order; verify peer system identity and collecting/distributing state before committing.
+- [x] Report active member state without claiming a fixed bandwidth increase or single-flow throughput.
 
 ### Task 24: Add Redundancy
 
@@ -273,9 +273,9 @@ The existing gateway foundation plan is a prerequisite and owns the `gateway` da
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/capabilities_linux.go`, provider-specific adapter and status files.
 
-- [ ] Define MC-LAG only for an explicitly supported peer/vendor control protocol or documented Linux peer implementation.
-- [ ] Detect peer identity, consistency, and split-brain state before allowing apply.
-- [ ] If no compatible provider exists, expose MC-LAG as unsupported and reject configuration; do not emulate it with a single-node bond.
+- [x] No peer/vendor control protocol is configured, so MC-LAG is not presented as a supported mode.
+- [x] No MC-LAG apply path is allowed without a provider capable of peer identity, consistency, and split-brain checks.
+- [x] Report MC-LAG unsupported and reject the strict-config `mc_lag` field; do not emulate it with a single-node bond.
 
 ### Task 26: Add Shadow Mode (VRRP) Gateway Failover
 
