@@ -45,6 +45,10 @@ prepared it could not push to `.github/workflows/` (the token lacks the `workflo
 cp tools/ci/server-image.yml .github/workflows/server-image.yml
 ```
 
+## Security
+
+Firewall, country filter, DNS ad/content blocking and intrusion detection: see [docs/security.md](docs/security.md).
+
 ## Changelog
 
 Newest first. The server has no version tags: a release is a commit on `main`, built into
@@ -54,6 +58,8 @@ give it the commit once it is pushed. Most commits here only move the [GameBond.
 pin; the Core changelog has the detail, summarised below.
 
 ### Unreleased
+
+- Security: stateful firewall with segmentation and country filter, DNS filter built from public blocklists fetched at runtime, behaviour-based IDS/IPS, all managed through the admin portal (`/api/security`).
 - Nothing yet.
 
 ### 2026-11-12, Core v0.1.5 to v0.1.17

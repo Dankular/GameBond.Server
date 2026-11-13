@@ -91,3 +91,26 @@ func TestLanTunnelIPsAreValidatedAndPassedToTheSession(t *testing.T) {
 		}
 	}
 }
+
+func TestSecurityBlockIsValidatedAtLoad(t *testing.T) {
+	for name, c := range map[string]struct {
+		security any
+		ok       bool
+	}{
+		"absent ok":       {nil, true},
+		"valid":           {map[string]any{"ids": map[string]any{"mode": "detect"}, "dns_filter": map[string]any{"enabled": true, "categories": []string{"ads"}}}, true},
+		"unknown section": {map[string]any{"antivirus": map[string]any{}}, false},
+		"bad mode":        {map[string]any{"ids": map[string]any{"mode": "loud"}}, false},
+		"force dns alone": {map[string]any{"firewall": map[string]any{"force_dns": true}}, false},
+	} {
+		input := configFixture()
+		if c.security != nil {
+			input["security"] = c.security
+		}
+		data, _ := json.Marshal(input)
+		_, _, _, _, err := DecodeConfig(data)
+		if (err == nil) != c.ok {
+			t.Fatal(name, "ok =", c.ok, "err =", err)
+		}
+	}
+}

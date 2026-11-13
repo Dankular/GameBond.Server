@@ -13,6 +13,7 @@ import (
 
 	"github.com/Dankular/GameBond.Core/bond"
 	"github.com/Dankular/GameBond.Server/adminportal"
+	"github.com/Dankular/GameBond.Server/security"
 )
 
 type Config struct {
@@ -34,6 +35,7 @@ type Config struct {
 	Queues          map[string]bond.QueuePolicy `json:"queues"`
 	QoS             bond.QoSSettings            `json:"adaptive_qos"`
 	Admin           json.RawMessage             `json:"admin"`
+	Security        json.RawMessage             `json:"security"`
 	LossTracking    bool                        `json:"loss_tracking"`
 	DelayControl    bool                        `json:"delay_control"`
 	DelayAssertive  bool                        `json:"delay_assertive"`
@@ -80,6 +82,11 @@ func DecodeConfig(data []byte) (Config, bond.SessionOptions, netip.AddrPort, []b
 	if len(c.Admin) > 0 && string(bytes.TrimSpace(c.Admin)) != "null" {
 		if _, err := adminportal.ParseSettings(c.Admin); err != nil {
 			return fail(err)
+		}
+	}
+	if len(c.Security) > 0 && string(bytes.TrimSpace(c.Security)) != "null" {
+		if _, err := security.Parse(c.Security); err != nil {
+			return fail(fmt.Errorf("security: %w", err))
 		}
 	}
 	session, err := hex.DecodeString(c.Session)
