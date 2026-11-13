@@ -19,6 +19,8 @@ services:
       - ALL
     cap_add:
       - NET_ADMIN
+      # The DNS filter answers on 10.77.0.1:53; ALL capabilities are dropped above, so binding port 53 needs this.
+      - NET_BIND_SERVICE
     devices:
       - "/dev/net/tun:/dev/net/tun:rw"
     sysctls:
@@ -48,8 +50,11 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - type: volume
+        source: inspection-ca
+        target: /var/lib/gamebond-inspection
     pids_limit: 64
-    mem_limit: 256m
+    mem_limit: 1g
     stop_grace_period: 10s
     logging:
       driver: json-file
@@ -72,3 +77,5 @@ services:
 networks:
   tunnel:
     driver: bridge
+volumes:
+  inspection-ca:

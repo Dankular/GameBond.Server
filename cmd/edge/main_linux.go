@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/Dankular/GameBond.Server/adminportal"
@@ -16,8 +17,9 @@ import (
 	"time"
 
 	"github.com/Dankular/GameBond.Core/hwmon"
-	"github.com/Dankular/GameBond.Server/edge"
 	"github.com/Dankular/GameBond.Core/stream"
+	"github.com/Dankular/GameBond.Server/edge"
+	"github.com/Dankular/GameBond.Server/security"
 )
 
 func run() error {
@@ -60,6 +62,15 @@ func run() error {
 	defer stop()
 	var observers []func(map[string]any)
 	var restart atomic.Bool
+	// Firewall, DNS filter and intrusion detection. The manager always exists so a section saved from the portal
+	// takes effect at once; with no "security" key everything stays off.
+	sec := security.New(security.Options{GeoDir: "/tmp/gamebond-geo", Tunnel: c.TunName, InspectionDir: "/var/lib/gamebond-inspection"})
+	if err := sec.Apply(ctx, c.Security); err != nil {
+		fmt.Fprintf(os.Stderr, "security settings were not applied: %v\n", err)
+	}
+	go sec.Run(ctx)
+	edge.SetTap(sec.Tap)
+	defer edge.SetTap(nil)
 	if len(c.Admin) > 0 && string(c.Admin) != "null" {
 		settings, err := adminportal.ParseSettings(c.Admin)
 		if err != nil {
@@ -83,7 +94,8 @@ func run() error {
 				latest = stats
 				mu.Unlock()
 			})
-			portal := adminportal.New(adminportal.Options{Settings: settings, ConfigPath: *configPath, Hardware: resources.Snapshot,
+			portal := adminportal.New(adminportal.Options{Settings: settings, Security: securityAPI{sec}, ConfigPath: *configPath, Hardware: resources.Snapshot,
+				GatewaySocketPath: os.Getenv("GAMEBOND_GATEWAY_SOCKET"),
 				Snapshot: func() any {
 					mu.Lock()
 					defer mu.Unlock()
@@ -125,6 +137,21 @@ func run() error {
 		return restartRequested{}
 	}
 	return err
+}
+
+// securityAPI adapts the manager to the portal, returning the normalised settings that go into the config file.
+type securityAPI struct{ m *security.Manager }
+
+func (a securityAPI) Overview(ctx context.Context) any { return a.m.Overview(ctx) }
+func (a securityAPI) Catalog() any                     { return a.m.Catalog() }
+func (a securityAPI) Apply(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	if err := a.m.Apply(ctx, raw); err != nil {
+		return nil, err
+	}
+	return a.m.Settings().JSON(), nil
+}
+func (a securityAPI) Do(ctx context.Context, action string, args map[string]any) (any, error) {
+	return a.m.Do(ctx, action, args)
 }
 
 // restartRequested ends the process with the admin portal's restart status.

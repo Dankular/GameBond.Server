@@ -1,8 +1,11 @@
 "use strict";
 const NAV = [
-  ["Status", [["overview", "Overview"], ["uplinks", "Uplinks"], ["queues", "QoS & Queues"], ["bandwidth", "Realtime Graphs"], ["firewall", "Firewall (NAT)"], ["log", "System Log"]]],
-  ["Network", [["interfaces", "Interfaces"], ["devices", "Connected Devices"], ["routes", "Routing"]]],
-  ["System", [["config", "Configuration"], ["admin", "Administration"], ["restart", "Restart Service"]]],
+  ["Home", "home", [["overview", "Overview"], ["uplinks", "Uplinks"]]],
+  ["Devices", "devices", [["devices", "Connected Devices"]]],
+  ["Network", "network", [["interfaces", "Interfaces"], ["routes", "Routing"], ["queues", "QoS & Queues"]]],
+  ["Security", "security", [["firewall", "Firewall (NAT)"]]],
+  ["Insights", "insights", [["bandwidth", "Realtime Graphs"], ["log", "System Log"]]],
+  ["Settings", "settings", [["config", "Configuration"], ["admin", "Administration"], ["restart", "Restart Service"]]],
 ];
 let csrf = null, timer = null, routeVersion = 0;
 const $ = (id) => document.getElementById(id);
@@ -28,15 +31,15 @@ const err = (e) => h("p", { class: "bad" }, "Unavailable: " + (e.error || e));
 function renderNav(current) {
   const nav = $("nav"); nav.replaceChildren();
   if (!csrf) return;
-  for (const [title, items] of NAV) nav.append(h("div", { class: "item" }, h("button", { class: "top", type: "button" }, title + " ▾"),
-    h("div", { class: "menu" }, items.map(([id, label]) => h("a", { href: "#/" + title.toLowerCase() + "/" + id, class: current === id ? "on" : "" }, label)))));
+  for (const [title, slug, items] of NAV) nav.append(h("div", { class: "item" }, h("button", { class: "top", type: "button" }, title + " ▾"),
+    h("div", { class: "menu" }, items.map(([id, label]) => h("a", { href: "#/" + slug + "/" + id, class: current === id ? "on" : "" }, label)))));
   nav.append(h("a", { class: "top", href: "#/logout" }, "Logout"));
 }
 
 async function login() {
   const view = $("view"); view.replaceChildren();
   const pw = h("input", { type: "password", autocomplete: "current-password" }), msg = h("p", { class: "bad" });
-  const go = async () => { const r = await api("login", { password: pw.value }); if (r.ok) { csrf = r.data.csrf; location.hash = "#/status/overview"; route(); } else msg.textContent = r.data.error || "Login failed"; };
+  const go = async () => { const r = await api("login", { password: pw.value }); if (r.ok) { csrf = r.data.csrf; location.hash = "#/home/overview"; route(); } else msg.textContent = r.data.error || "Login failed"; };
   pw.addEventListener("keydown", (e) => e.key === "Enter" && go());
   view.append(h("h2", {}, "Authorization Required"), h("p", {}, "Please enter the administrator password."), h("div", { class: "row" }, h("label", {}, "Password"), pw), h("div", { class: "row" }, h("button", { class: "primary", onclick: go }, "Login")), msg);
   pw.focus();
