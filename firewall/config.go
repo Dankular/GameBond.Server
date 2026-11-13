@@ -54,6 +54,7 @@ type Config struct {
 	Zones        []Zone       `json:"zones"`
 	Rules        []Rule       `json:"rules"`
 	Countries    Countries    `json:"countries"`
+	InspectTLS   bool         `json:"-"`
 }
 
 // Segmentation controls traffic between devices on the tunnel network.
@@ -86,6 +87,8 @@ type Rule struct {
 	Proto     string   `json:"proto"` // any, tcp, udp or icmp
 	Ports     []string `json:"ports"` // destination ports: "443" or "8000-8100"; tcp and udp only
 	Comment   string   `json:"comment"`
+	Regions   []string `json:"regions,omitempty"`
+	Apps      []string `json:"apps,omitempty"`
 }
 
 // Countries blocks or allows traffic by country of the remote address.
@@ -101,6 +104,14 @@ var (
 	countryPattern = regexp.MustCompile(`^[A-Z]{2}$`)
 	commentPattern = regexp.MustCompile(`^[A-Za-z0-9 ._,:()/+-]*$`)
 )
+
+var appPorts = map[string]struct {
+	proto string
+	ports string
+}{
+	"dns": {"udp", "53"}, "http": {"tcp", "80, 8080"}, "tls": {"tcp", "443, 8443"},
+	"quic": {"udp", "443"}, "ssh": {"tcp", "22"}, "mail": {"tcp", "25, 465, 587"},
+}
 
 // Parse decodes and validates a firewall configuration. Unknown fields are refused so a typo cannot silently
 // leave a protection switched off.
@@ -251,6 +262,7 @@ func (c Config) Validate() error {
 	if len(c.Rules) > MaxRules {
 		return fmt.Errorf("firewall: at most %d rules", MaxRules)
 	}
+	regionCount := map[string]bool{}
 	ids := map[string]bool{}
 	for i, r := range c.Rules {
 		at := fmt.Sprintf("firewall: rule %d", i+1)
@@ -263,6 +275,36 @@ func (c Config) Validate() error {
 		ids[r.ID] = true
 		if r.Action != "allow" && r.Action != "deny" {
 			return fmt.Errorf("%s: action must be allow or deny", at)
+		}
+		if len(r.Regions) > 16 {
+			return fmt.Errorf("%s: at most 16 regions", at)
+		}
+		seenRegions := map[string]bool{}
+		for _, cc := range r.Regions {
+			if !countryPattern.MatchString(cc) || seenRegions[cc] {
+				return fmt.Errorf("%s: regions must be unique two-letter country codes in capitals", at)
+			}
+			seenRegions[cc] = true
+			regionCount[cc] = true
+		}
+		if len(r.Regions) > 0 && r.Direction == "between" {
+			return fmt.Errorf("%s: regions apply only to inbound or outbound traffic", at)
+		}
+		if len(r.Apps) > 8 {
+			return fmt.Errorf("%s: at most 8 applications", at)
+		}
+		seenApps := map[string]bool{}
+		for _, app := range r.Apps {
+			if seenApps[app] {
+				return fmt.Errorf("%s: application %q is listed more than once", at, app)
+			}
+			seenApps[app] = true
+			if _, ok := appPorts[app]; !ok {
+				return fmt.Errorf("%s: unsupported application %q", at, app)
+			}
+		}
+		if len(r.Apps) > 0 && (r.Proto != "any" || len(r.Ports) > 0) {
+			return fmt.Errorf("%s: choose application or protocol/ports matching, not both", at)
 		}
 		switch r.Direction {
 		case "outbound", "inbound", "between":
@@ -295,6 +337,9 @@ func (c Config) Validate() error {
 		if len(r.Comment) > maxComment || !commentPattern.MatchString(r.Comment) {
 			return fmt.Errorf("%s: the comment may use letters, digits, spaces and . , : ( ) / + - up to %d characters", at, maxComment)
 		}
+	}
+	if len(regionCount) > MaxCountries {
+		return fmt.Errorf("firewall: at most %d distinct rule regions", MaxCountries)
 	}
 	switch c.Countries.Mode {
 	case "off", "block", "allow":

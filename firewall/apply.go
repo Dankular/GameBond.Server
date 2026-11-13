@@ -45,6 +45,8 @@ type Manager struct {
 	Tunnel string
 	// Geo returns the prefixes for the selected countries (nil when the lists are not loaded).
 	Geo func(codes []string) []netip.Prefix
+	// GeoByCode returns one country's prefixes for rule-level region sets.
+	GeoByCode func(code string) []netip.Prefix
 
 	mu       sync.Mutex
 	cfg      Config
@@ -73,7 +75,29 @@ func (m *Manager) applyLocked(ctx context.Context, c Config) error {
 	if c.Enabled && c.Countries.Mode != "off" && m.Geo != nil {
 		geo = m.Geo(c.Countries.Codes)
 	}
-	in := Inputs{Tunnel: m.Tunnel, Geo: geo, Blocked: m.activeBlocks()}
+	regions := map[string][]netip.Prefix{}
+	if c.Enabled && m.GeoByCode != nil {
+		for _, r := range c.Rules {
+			for _, code := range r.Regions {
+				if _, ok := regions[code]; !ok {
+					regions[code] = m.GeoByCode(code)
+				}
+			}
+		}
+	}
+	if c.Enabled {
+		for _, r := range c.Rules {
+			if !r.Enabled {
+				continue
+			}
+			for _, code := range r.Regions {
+				if len(regions[code]) == 0 {
+					return fmt.Errorf("firewall: region data for %s is not loaded; the previous rules remain active", code)
+				}
+			}
+		}
+	}
+	in := Inputs{Tunnel: m.Tunnel, Geo: geo, Regions: regions, Blocked: m.activeBlocks()}
 	script, warnings, err := Render(c, in)
 	if err != nil {
 		return err

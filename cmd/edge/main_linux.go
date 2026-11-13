@@ -64,7 +64,7 @@ func run() error {
 	var restart atomic.Bool
 	// Firewall, DNS filter and intrusion detection. The manager always exists so a section saved from the portal
 	// takes effect at once; with no "security" key everything stays off.
-	sec := security.New(security.Options{GeoDir: "/tmp/gamebond-geo", Tunnel: c.TunName})
+	sec := security.New(security.Options{GeoDir: "/tmp/gamebond-geo", Tunnel: c.TunName, InspectionDir: "/var/lib/gamebond-inspection"})
 	if err := sec.Apply(ctx, c.Security); err != nil {
 		fmt.Fprintf(os.Stderr, "security settings were not applied: %v\n", err)
 	}

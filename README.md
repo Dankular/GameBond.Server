@@ -59,7 +59,7 @@ pin; the Core changelog has the detail, summarised below.
 
 ### Unreleased
 
-- Security: stateful firewall with segmentation and country filter, DNS filter built from public blocklists fetched at runtime, behaviour-based IDS/IPS, all managed through the admin portal (`/api/security`).
+- Security: stateful firewall with segmentation, region and common-service rules; DNS domain/ad/content filtering; bounded flow identification; behaviour-based IDS/IPS; optional TCP/TLS HTTP/1.1 inspection with URL path rules and a configurable concurrent-session cap. TLS inspection is off by default and requires installing the server's exported CA on each device. Managed through the admin portal (`/api/security`).
 - Nothing yet.
 
 ### 2026-11-12, Core v0.1.5 to v0.1.17

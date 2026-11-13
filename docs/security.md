@@ -17,7 +17,10 @@ nftables refuses, changes nothing (all of it applies or none of it does).
   "dns_filter": { "enabled": true, "categories": ["ads", "trackers", "malware"], "enable_lists": [], "disable_lists": [],
                   "custom_lists": [], "block": [], "allow": [], "exempt": [], "block_mode": "nxdomain",
                   "upstreams": ["1.1.1.1:53", "9.9.9.9:53"], "refresh_hours": 12 },
-  "ids":        { "mode": "detect", "sensitivity": "medium", "block_minutes": 10, "never_block": [], "detectors": {} }
+  "ids":        { "mode": "detect", "sensitivity": "medium", "block_minutes": 10, "never_block": [], "detectors": {} },
+  "traffic":    { "enabled": true, "rules": [{ "id": "deny-social-path", "enabled": true, "action": "deny",
+                  "domains": ["social.example"], "paths": ["/restricted/"], "zones": ["gaming"] }] },
+  "inspection": { "enabled": false, "max_sessions": 64, "exhaustion_action": "deny" }
 }
 ```
 
@@ -37,7 +40,46 @@ default deny, segmentation one way, country block and allow-only, prevention blo
 lifting, DoT, inbound default deny, forced DNS reaching a listener on 10.77.0.1:53, and removal when switched off.
 
 Limits: 200 rules, 32 zones. Zone members must be 10.77.0.2 to 10.77.0.254 (10.77.0.2 is the client PC).
+Rules can also match country-code regions (up to 16 per rule and 40 distinct codes overall) and the built-in
+service labels `dns`, `http`, `tls`, `quic`, `ssh`, and `mail`. Service labels are port groups enforced directly by
+nftables; they identify common services, not a specific vendor application. Region data must load before a rule
+using it can replace the active firewall policy. Domain suffix and URL path rules are in the `traffic` section.
 DNS over HTTPS cannot be blocked by port and is not.
+
+## Domain rules and traffic identification (`traffic/`)
+
+Domain rules are checked by the filtering DNS server before it contacts an upstream. `deny` answers NXDOMAIN,
+`allow` bypasses DNS block lists for that domain, and `log` leaves the DNS result unchanged. Domain patterns are
+exact names or suffixes; `*.example.com` includes the base domain and its subdomains. Rules can optionally name firewall
+zones; a rule then applies only to devices in one of those zones. Leave `zones` empty to apply it to all devices. This requires devices to use
+the GameBond resolver (or `firewall.force_dns`). DNS over HTTPS and DNS over TLS can bypass this policy unless the
+firewall blocks DoT or the device's own DNS settings are controlled.
+
+The traffic summary keeps a bounded set of recent IPv4 flows. It reads visible TLS SNI and cleartext HTTP Host
+metadata when those fields fit in one packet, associates recent DNS answers with destinations, and labels common
+services from ports. DNS/IP association is low confidence because CDNs and shared hosting reuse addresses. It does
+not retain packet payloads, reassemble streams, identify vendor applications, inspect QUIC, or decrypt traffic unless
+TLS inspection is explicitly enabled. Unknown traffic stays `unknown`.
+
+## TLS inspection and URL paths (`inspection/`)
+
+Inspection is off by default. When enabled, the firewall redirects tunnel-device TCP/443 flows to the local
+inspection proxy. It intercepts HTTP/1.1 over TLS, creates a per-host leaf certificate signed by the local GameBond
+inspection CA, checks URL path-prefix rules, and opens a separate TLS connection whose upstream certificate is
+verified using the system roots. The CA private key is held in the persistent Docker volume `inspection-ca` with
+restricted file permissions. The portal action `export_inspection_ca` returns only the public CA certificate and
+SHA-256 fingerprint; install the certificate as a trusted root on every managed device before enabling inspection.
+The server cannot install trust on devices for you.
+
+`max_sessions` is the hard cap on active intercepted TCP/TLS sessions (1 to 512; default 64). At capacity,
+`exhaustion_action` is `deny` or a raw TCP `bypass` before TLS termination. Once interception has started, handshake,
+certificate, or upstream errors close the connection; they never fall back to a raw relay. The proxy currently
+supports TCP/TLS carrying HTTP/1.1. QUIC/UDP 443, HTTP/2-only clients, WebSocket upgrades, certificate-pinned apps,
+mutual TLS, IP-literal SNI, and hidden/absent SNI are not inspectable and may fail. TLS interception is a sensitive
+operation: the trusted CA can impersonate any site to devices that trust it. Back up the Docker volume securely;
+replacing the CA requires exporting and installing the new certificate on every device.
+The Compose service has a 1 GiB memory limit. Raising `max_sessions` above its default of 64 increases per-session
+TLS and HTTP buffering; increase it only for the expected number of concurrent intercepted connections.
 
 ## Country filter (`geoip/`)
 

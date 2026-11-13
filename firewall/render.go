@@ -16,7 +16,8 @@ type Inputs struct {
 	Tunnel  string         // the TUN interface, gamebond0
 	Gateway string         // the server's tunnel address, 10.77.0.1
 	Geo     []netip.Prefix // addresses of the selected countries (empty: not loaded)
-	Blocked []Block        // active intrusion prevention blocks, kept across a re-render
+	Regions map[string][]netip.Prefix
+	Blocked []Block // active intrusion prevention blocks, kept across a re-render
 }
 
 // Block is an address blocked until Remaining runs out.
@@ -93,6 +94,32 @@ func Render(c Config, in Inputs) (script string, warnings []string, err error) {
 		sort.Strings(members)
 		fmt.Fprintf(&b, "\tset zone_%s {\n\t\ttype ipv4_addr\n\t\telements = { %s }\n\t}\n", z.Name, strings.Join(members, ", "))
 	}
+	regionCodes := map[string]bool{}
+	for _, r := range c.Rules {
+		if !r.Enabled {
+			continue
+		}
+		for _, code := range r.Regions {
+			if regionCodes[code] {
+				continue
+			}
+			regionCodes[code] = true
+			prefixes := in.Regions[code]
+			if len(prefixes) == 0 {
+				warnings = append(warnings, "region "+code+" is not loaded; rules that depend on it cannot match")
+			}
+			els := make([]string, len(prefixes))
+			for i, p := range prefixes {
+				els[i] = p.String()
+			}
+			sort.Strings(els)
+			fmt.Fprintf(&b, "\tset region_%s {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\tauto-merge\n", code)
+			if len(els) > 0 {
+				fmt.Fprintf(&b, "\t\telements = { %s }\n", strings.Join(els, ", "))
+			}
+			b.WriteString("\t}\n")
+		}
+	}
 
 	// Input: the server's own services.
 	b.WriteString("\tchain input {\n\t\ttype filter hook input priority -10; policy accept;\n")
@@ -102,6 +129,9 @@ func Render(c Config, in Inputs) (script string, warnings []string, err error) {
 	b.WriteString("\t\tiifname \"lo\" accept\n")
 	if c.ServerProtected() {
 		fmt.Fprintf(&b, "\t\tiifname \"%s\" udp dport 4436 accept\n", tun)
+		if c.InspectTLS {
+			fmt.Fprintf(&b, "\t\tiifname \"%s\" ct status dnat tcp dport %d accept\n", tun, 9445)
+		}
 		fmt.Fprintf(&b, "\t\tiifname \"%s\" ip daddr %s udp dport 53 accept\n", tun, gw)
 		fmt.Fprintf(&b, "\t\tiifname \"%s\" ip daddr %s tcp dport 53 accept\n", tun, gw)
 		fmt.Fprintf(&b, "\t\tiifname \"%s\" icmp type echo-request accept\n", tun)
@@ -175,6 +205,11 @@ func Render(c Config, in Inputs) (script string, warnings []string, err error) {
 		fmt.Fprintf(&b, "\t\tiifname \"%s\" ip daddr != %s tcp dport 53 counter redirect to :53 comment \"dns\"\n", tun, gw)
 		b.WriteString("\t}\n")
 	}
+	if c.InspectTLS {
+		fmt.Fprintf(&b, "\tchain tls_redirect {\n\t\ttype nat hook prerouting priority -100; policy accept;\n")
+		fmt.Fprintf(&b, "\t\tiifname \"%s\" ip daddr != 10.77.0.0/24 tcp dport 443 counter redirect to :9445 comment \"tls_inspect\"\n", tun)
+		b.WriteString("\t}\n")
+	}
 	b.WriteString("}\n")
 	return b.String(), warnings, nil
 }
@@ -206,6 +241,49 @@ func (r Rule) match(tun string) (string, error) {
 	}
 	if d := ep("daddr", r.Dest); d != "" {
 		parts = append(parts, d)
+	}
+	if len(r.Regions) > 0 {
+		field := "daddr"
+		if r.Direction == "inbound" {
+			field = "saddr"
+		}
+		regions := make([]string, 0, len(r.Regions))
+		for _, code := range r.Regions {
+			regions = append(regions, fmt.Sprintf("ip %s @region_%s", field, code))
+		}
+		parts = append(parts, "("+strings.Join(regions, " or ")+")")
+	}
+	if len(r.Apps) > 0 {
+		byProto := map[string]map[string]bool{}
+		for _, app := range r.Apps {
+			v := appPorts[app]
+			protos := []string{v.proto}
+			if app == "dns" {
+				protos = []string{"tcp", "udp"}
+			}
+			for _, proto := range protos {
+				if byProto[proto] == nil {
+					byProto[proto] = map[string]bool{}
+				}
+				for _, port := range strings.Split(v.ports, ", ") {
+					byProto[proto][port] = true
+				}
+			}
+		}
+		appMatches := make([]string, 0, len(byProto))
+		for _, proto := range []string{"tcp", "udp"} {
+			ports := byProto[proto]
+			if len(ports) == 0 {
+				continue
+			}
+			list := make([]string, 0, len(ports))
+			for port := range ports {
+				list = append(list, port)
+			}
+			sort.Strings(list)
+			appMatches = append(appMatches, fmt.Sprintf("meta l4proto %s %s dport { %s }", proto, proto, strings.Join(list, ", ")))
+		}
+		parts = append(parts, "("+strings.Join(appMatches, " or ")+")")
 	}
 	switch r.Proto {
 	case "icmp":

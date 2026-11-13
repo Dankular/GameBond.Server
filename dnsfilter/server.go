@@ -21,12 +21,16 @@ type Query struct {
 	Time    time.Time
 	Client  netip.Addr
 	Name    string
+	Answers []netip.Addr
 	Type    uint16
 	Blocked bool
 	List    string
 	Cached  bool
 	RCode   int // dnsmessage.RCode of the answer
 }
+
+type DomainPolicy func(client netip.Addr, name string) (ruleID string, action string, matched bool)
+type domainPolicyHolder struct{ fn DomainPolicy }
 
 const (
 	cacheMax     = 4096
@@ -50,6 +54,7 @@ type cacheEntry struct {
 type Server struct {
 	F        *Filter
 	Observer func(Query)
+	policy   atomic.Pointer[domainPolicyHolder]
 
 	dial func(ctx context.Context, network, addr string) (net.Conn, error) // tests replace it
 	now  func() time.Time
@@ -62,6 +67,15 @@ type Server struct {
 	byClient map[string]*clientCount
 
 	queries, blocked, cached, upstreamErrors atomic.Uint64
+}
+
+// SetPolicy atomically replaces the optional domain policy callback.
+func (s *Server) SetPolicy(fn DomainPolicy) {
+	if fn == nil {
+		s.policy.Store(nil)
+		return
+	}
+	s.policy.Store(&domainPolicyHolder{fn: fn})
 }
 
 type clientCount struct{ Queries, Blocked uint64 }
@@ -92,7 +106,24 @@ func (s *Server) Handle(ctx context.Context, client netip.Addr, req []byte, tcp 
 	name := strings.ToLower(strings.TrimSuffix(q.Name.String(), "."))
 	s.queries.Add(1)
 	ev := Query{Time: s.now(), Client: client, Name: name, Type: uint16(q.Type)}
-	if h.OpCode == 0 && q.Class == dnsmessage.ClassINET && s.F != nil && s.F.Config().Enabled && !s.F.ClientExempt(client) {
+	policyAction := ""
+	policyID := ""
+	if h.OpCode == 0 && q.Class == dnsmessage.ClassINET {
+		if policy := s.policy.Load(); policy != nil {
+			policyID, policyAction, _ = policy.fn(client, name)
+		}
+	}
+	if policyAction == "allow" || policyAction == "log" {
+		ev.List = "traffic:" + policyID
+	}
+	if policyAction == "deny" {
+		s.blocked.Add(1)
+		ev.Blocked, ev.List, ev.RCode = true, "traffic:"+policyID, int(dnsmessage.RCodeNameError)
+		resp := s.blockedResponse(h, q, "nxdomain")
+		s.record(ev, Decision{Blocked: true, Matched: name, List: ev.List})
+		return resp
+	}
+	if policyAction != "allow" && h.OpCode == 0 && q.Class == dnsmessage.ClassINET && s.F != nil && s.F.Config().Enabled && !s.F.ClientExempt(client) {
 		if d := s.F.Match(name); d.Blocked {
 			s.blocked.Add(1)
 			resp := s.blockedResponse(h, q, s.F.Config().BlockMode)
@@ -108,6 +139,7 @@ func (s *Server) Handle(ctx context.Context, client netip.Addr, req []byte, tcp 
 		s.mu.Unlock()
 		binary.BigEndian.PutUint16(resp, h.ID)
 		s.cached.Add(1)
+		ev.Answers = answerAddresses(resp)
 		ev.Cached, ev.RCode = true, int(rcodeOf(resp))
 		s.record(ev, Decision{})
 		return resp
@@ -121,9 +153,27 @@ func (s *Server) Handle(ctx context.Context, client netip.Addr, req []byte, tcp 
 		return servFail(h, q)
 	}
 	ev.RCode = int(rcodeOf(resp))
+	ev.Answers = answerAddresses(resp)
 	s.store(key, resp)
 	s.record(ev, Decision{})
 	return resp
+}
+
+func answerAddresses(resp []byte) []netip.Addr {
+	var msg dnsmessage.Message
+	if msg.Unpack(resp) != nil {
+		return nil
+	}
+	addrs := make([]netip.Addr, 0, len(msg.Answers))
+	for _, rr := range msg.Answers {
+		switch body := rr.Body.(type) {
+		case *dnsmessage.AResource:
+			addrs = append(addrs, netip.AddrFrom4(body.A))
+		case *dnsmessage.AAAAResource:
+			addrs = append(addrs, netip.AddrFrom16(body.AAAA))
+		}
+	}
+	return addrs
 }
 
 func rcodeOf(resp []byte) dnsmessage.RCode {
