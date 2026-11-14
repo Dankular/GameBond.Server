@@ -147,7 +147,7 @@ peer_blocks() {
   tok=$(cat "$STATE_TOKEN_FILE" 2>/dev/null); now=$(date +%s)
   for peer in $PEERS; do
     body=$(curl -sS -m 8 -f -H "Authorization: token $tok" "$GITEA_URL/api/v1/repos/$STATE_REPO/raw/$peer.json" 2>/dev/null) || continue
-    f=$(printf '%s' "$body" | jq -r '[.state // "-", (.rank // 1), .image // "-", .rejected // "-", (.at // 0)] | @tsv' 2>/dev/null) || continue
+    f=$(printf '%s' "$body" | jq -r '[.state, (.rank // 1), .image, .rejected, (.at // 0)] | map(if . == null or . == "" then "-" else . end) | @tsv' 2>/dev/null) || continue
     IFS=$'	' read -r state rank image rejected at <<<"$f"
     case "$state" in
       updating|rolling_back) [ $((now - at)) -le 600 ] && why="$peer is $state" ;;

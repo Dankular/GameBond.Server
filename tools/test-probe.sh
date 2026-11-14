@@ -123,11 +123,12 @@ GITEA_URL=
 # Peer gating: a peer that is updating blocks; a lower-ranked ready peer on an older image goes
 # first; unreachable, stale, or already-updated peers do not block; the wait is bounded.
 peer() { # state rank image rejected age
+  local rej=$4; [ "$rej" = - ] && rej=""   # a node that has rejected nothing publishes an empty string
   cat > "$T/bin/curl" <<CURL
 #!/bin/bash
 out=""
 while [ \$# -gt 0 ]; do case "\$1" in -o) out=\$2; shift ;; esac; shift; done
-printf '{"node":"p","rank":$2,"state":"$1","image":"$3","rejected":"$4","at":%s}' "\$(( \$(date +%s) - $5 ))"
+printf '{"node":"p","rank":$2,"state":"$1","image":"$3","rejected":"$rej","at":%s}' "\$(( \$(date +%s) - $5 ))"
 CURL
   chmod +x "$T/bin/curl"
 }
