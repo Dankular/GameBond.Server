@@ -181,6 +181,10 @@ func (g *Gateway) pumpOut(ctx context.Context) {
 		for len(frame) < 60 {
 			frame = append(frame, 0)
 		}
+		// EXPERIMENT: ARP replies go to the broadcast address, to learn whether unicast frames reach the devices.
+		if frame[12] == 0x08 && frame[13] == 0x06 && frame[21] == 2 {
+			copy(frame[0:6], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+		}
 		view.Release()
 		pkt.DecRef()
 		g.framesOut.Add(1)
