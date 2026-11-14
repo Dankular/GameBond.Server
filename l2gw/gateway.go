@@ -174,6 +174,11 @@ func (g *Gateway) pumpOut(ctx context.Context) {
 		}
 		view := pkt.ToView()
 		frame := append([]byte(nil), view.AsSlice()...)
+		// The wire minimum is 60 bytes before the FCS. Real NICs pad; a raw writer on the other side
+		// of the bond does not, and the receiving device drops the runt (an ARP reply is 42 bytes).
+		for len(frame) < 60 {
+			frame = append(frame, 0)
+		}
 		view.Release()
 		pkt.DecRef()
 		g.framesOut.Add(1)
