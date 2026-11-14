@@ -304,25 +304,41 @@ func (d *dhcpServer) reply(m dhcpMessage, typ byte, ip netip.Addr, lease time.Du
 	return b
 }
 
-// startDHCP binds UDP port 67 on the stack and serves until ctx ends.
+// startDHCP binds UDP port 67 on the stack and serves until ctx ends. Two endpoints share the port:
+// a wildcard one that receives the clients' broadcasts, and one bound to the gateway address that
+// every reply leaves from. Replies from the wildcard socket take whatever source address the stack
+// picks, and once forwarded flows have created temporary spoofed addresses on the NIC that is no
+// longer the gateway; devices then ignore the offer.
 func (g *Gateway) startDHCP(ctx context.Context) error {
-	var wq waiter.Queue
-	ep, err := g.stack.NewEndpoint(udp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
+	open := func(addr tcpip.Address) (*gonet.UDPConn, error) {
+		var wq waiter.Queue
+		ep, err := g.stack.NewEndpoint(udp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
+		if err != nil {
+			return nil, errors.New("l2gw: dhcp endpoint: " + err.String())
+		}
+		ep.SocketOptions().SetBroadcast(true)
+		ep.SocketOptions().SetReuseAddress(true)
+		if err := ep.Bind(tcpip.FullAddress{NIC: nicID, Addr: addr, Port: 67}); err != nil {
+			ep.Close()
+			return nil, errors.New("l2gw: dhcp bind: " + err.String())
+		}
+		return gonet.NewUDPConn(&wq, ep), nil
+	}
+	recv, err := open(tcpip.Address{})
 	if err != nil {
-		return errors.New("l2gw: dhcp endpoint: " + err.String())
+		return err
 	}
-	ep.SocketOptions().SetBroadcast(true)
-	if err := ep.Bind(tcpip.FullAddress{Port: 67}); err != nil {
-		return errors.New("l2gw: dhcp bind: " + err.String())
+	send, err := open(tcpip.AddrFrom4(g.cfg.Address.Addr().As4()))
+	if err != nil {
+		recv.Close()
+		return err
 	}
-	conn := gonet.NewUDPConn(&wq, ep)
-	g.done.Add(1)
-	go func() {
+	bcast := &net.UDPAddr{IP: net.IPv4bcast.To4(), Port: 68}
+	serve := func(conn *gonet.UDPConn) {
 		defer g.done.Done()
 		defer conn.Close()
 		go func() { <-ctx.Done(); conn.Close() }()
 		buf := make([]byte, 2048)
-		bcast := &net.UDPAddr{IP: net.IPv4bcast.To4(), Port: 68}
 		for {
 			n, _, rerr := conn.ReadFrom(buf)
 			if rerr != nil {
@@ -335,10 +351,13 @@ func (g *Gateway) startDHCP(ctx context.Context) error {
 			if reply := g.dhcp.handle(m, time.Now()); reply != nil {
 				// Always broadcast: the client may not have an address yet, and a broadcast
 				// reply is accepted by clients that do.
-				conn.WriteTo(reply, bcast)
+				send.WriteTo(reply, bcast)
 			}
 		}
-	}()
+	}
+	g.done.Add(2)
+	go serve(recv)
+	go serve(send)
 	return nil
 }
 
