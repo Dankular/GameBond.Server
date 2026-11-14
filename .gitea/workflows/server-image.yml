@@ -1,0 +1,26 @@
+name: server-image
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: build and push to the Gitea registry
+        env:
+          REG_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          HOST=gitea.app.khosa.co
+          IMAGE=$HOST/dan/gamebond-server
+          SHA=${{ gitea.sha }}
+          W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+          git init -q "$W/src" && cd "$W/src"
+          git fetch -q --depth 1 "https://dan:${REG_TOKEN}@${HOST}/${{ gitea.repository }}.git" "$SHA"
+          git checkout -q FETCH_HEAD
+          echo "$REG_TOKEN" | docker login "$HOST" -u dan --password-stdin
+          nice -n 15 docker build --memory 1g --build-arg GIT_COMMIT="$SHA" -t "$IMAGE:$SHA" .
+          docker push "$IMAGE:$SHA"
+          docker image rm "$IMAGE:$SHA" >/dev/null 2>&1 || true
+          docker image prune -f >/dev/null 2>&1 || true
