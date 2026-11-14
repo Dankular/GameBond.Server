@@ -98,4 +98,23 @@ first=$(latest_build); second=$(latest_build)
 check "first poll returns the build" "$first" 0123456789012345678901234567890123456789
 check "second poll is conditional and finds nothing new" "$second" ""
 check "second poll sent If-None-Match" "$(sed -n 2p "$FAKE/curl-sent" | cut -c1-13)" "If-None-Match"
+
+# Gitea source: newest successful run of main for this workflow; no ETag, no rate limit.
+cat > "$T/bin/curl" <<'CURL'
+#!/bin/bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift ;; esac; shift; done
+cat > "$out" <<'JSON'
+{"workflow_runs":[
+ {"status":"success","head_branch":"main","workflow_id":"server-image.yml","head_sha":"aaaa000000000000000000000000000000000001","created_at":"2026-11-14T10:00:00Z"},
+ {"status":"failure","head_branch":"main","workflow_id":"server-image.yml","head_sha":"bbbb000000000000000000000000000000000002","created_at":"2026-11-14T12:00:00Z"},
+ {"status":"success","head_branch":"dev","workflow_id":"server-image.yml","head_sha":"cccc000000000000000000000000000000000003","created_at":"2026-11-14T13:00:00Z"},
+ {"status":"success","head_branch":"main","workflow_id":"server-image.yml","head_sha":"dddd000000000000000000000000000000000004","created_at":"2026-11-14T11:00:00Z"}]}
+JSON
+printf '200'
+CURL
+chmod +x "$T/bin/curl"
+GITEA_URL=https://gitea.example
+check "gitea source picks the newest successful main build" "$(latest_build)" dddd000000000000000000000000000000000004
+GITEA_URL=
 exit $fail

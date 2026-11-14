@@ -14,7 +14,13 @@
 set -u
 REPO=Dankular/GameBond.Server
 WORKFLOW=server-image.yml
-IMAGE_REPO=ghcr.io/dankular/gamebond-server
+IMAGE_REPO=${GAMEBOND_IMAGE_REPO:-ghcr.io/dankular/gamebond-server}
+# Set GAMEBOND_GITEA_URL to follow builds on a Gitea server instead of GitHub (no API rate limit):
+# GAMEBOND_GITEA_REPO=owner/name, GAMEBOND_GITEA_TOKEN_FILE=file holding a read token, and
+# GAMEBOND_IMAGE_REPO=<registry host>/<owner>/gamebond-server. The exit must be logged in to that registry.
+GITEA_URL=${GAMEBOND_GITEA_URL:-}
+GITEA_REPO=${GAMEBOND_GITEA_REPO:-dan/GameBond.Server}
+GITEA_TOKEN_FILE=${GAMEBOND_GITEA_TOKEN_FILE:-/etc/gamebond/gitea.token}
 RELEASE=/opt/gamebond/releases/native-live
 ENVFILE=$RELEASE/deploy.env
 CONTAINER=gamebond-native-1
@@ -61,6 +67,7 @@ set_image() {
 # set here would be lost after every call and every poll would count against the limit
 # (360 an hour against 60 unauthenticated).
 latest_build() {
+  [ -n "$GITEA_URL" ] && { gitea_latest_build; return; }
   local ETAG
   ETAG=$(cat "$STATE/etag" 2>/dev/null)
   local url="https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW/runs?branch=main&status=success&per_page=1"
@@ -75,6 +82,16 @@ latest_build() {
     403|429) log "github api rate limited ($code); retrying later"; sleep 60; return 1 ;;
     *)   log "github api returned $code"; return 1 ;;
   esac
+}
+
+# Gitea has no rate limit to protect, so there is no ETag: list recent runs and take the newest
+# successful build of main.
+gitea_latest_build() {
+  local tok code
+  tok=$(cat "$GITEA_TOKEN_FILE" 2>/dev/null)
+  code=$(curl -sS -m 15 -o "$STATE/body" -w '%{http_code}' -H "Authorization: token $tok"     "$GITEA_URL/api/v1/repos/$GITEA_REPO/actions/tasks?limit=30") || return 1
+  [ "$code" = 200 ] || { log "gitea api returned $code"; return 1; }
+  jq -r --arg wf "$WORKFLOW" '[.workflow_runs[]? | select(.status=="success" and .head_branch=="main" and .workflow_id==$wf)] | sort_by(.created_at) | last | .head_sha // empty' "$STATE/body"
 }
 
 # update_to serialises updates with a lock that is held only while one runs. (fd 9 used to stay
