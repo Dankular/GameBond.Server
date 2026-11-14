@@ -333,3 +333,31 @@ func TestPrivateDestinationsAreBlockedAndDrainRefusesNewFlows(t *testing.T) {
 		t.Fatal("existing flow broken by drain", err)
 	}
 }
+
+// A device probes its new address with an ARP request; only the gateway's own address may answer,
+// or the device sees a duplicate and declines the lease.
+func TestARPAnswersOnlyForTheGateway(t *testing.T) {
+	g, out := newTestGateway(t, nil)
+	arpReq := func(target [4]byte) []byte {
+		f := append([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, deviceMAC...)
+		f = append(f, 0x08, 0x06, 0, 1, 8, 0, 6, 4, 0, 1)
+		f = append(f, deviceMAC...)
+		f = append(f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+		return append(f, target[:]...)
+	}
+	g.Inbound(arpReq([4]byte{10, 78, 0, 100}))
+	select {
+	case f := <-out:
+		t.Fatalf("the gateway answered an ARP probe for another address: % x", f[:42])
+	case <-time.After(300 * time.Millisecond):
+	}
+	g.Inbound(arpReq([4]byte{10, 78, 0, 1}))
+	select {
+	case f := <-out:
+		if len(f) < 42 || f[21] != 2 {
+			t.Fatalf("not an ARP reply: % x", f)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no ARP reply for the gateway address")
+	}
+}

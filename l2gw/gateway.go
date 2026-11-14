@@ -187,9 +187,23 @@ func (g *Gateway) Inbound(frame []byte) {
 		return
 	}
 	g.framesIn.Add(1)
+	if g.foreignARPRequest(frame) {
+		return
+	}
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(frame)})
 	g.link.InjectInbound(0, pkt)
 	pkt.DecRef()
+}
+
+// foreignARPRequest reports an ARP request for an address other than the gateway's. A promiscuous
+// stack would answer it, and then every device's duplicate-address probe after DHCP finds a
+// "conflict", declines its lease and starts over, so only the gateway's own address may answer.
+func (g *Gateway) foreignARPRequest(f []byte) bool {
+	if len(f) < 42 || f[12] != 0x08 || f[13] != 0x06 || f[20] != 0 || f[21] != 1 {
+		return false
+	}
+	gw := g.cfg.Address.Addr().As4()
+	return !(f[38] == gw[0] && f[39] == gw[1] && f[40] == gw[2] && f[41] == gw[3])
 }
 
 // ActiveFlows is the number of TCP and UDP flows alive now: an exit may update when it is zero.
