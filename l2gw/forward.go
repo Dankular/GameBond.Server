@@ -66,9 +66,8 @@ func (g *Gateway) installForwarders() {
 			g.blocked.Add(1)
 			return
 		}
-		g.udpFlows.Add(1)
 		g.udpTotal.Add(1)
-		go func() { defer release(); g.udpFlow(r, dst) }()
+		go g.udpFlow(r, dst, release)
 	})
 	g.stack.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 }
@@ -120,64 +119,5 @@ func relay(dst, src net.Conn, idle time.Duration) {
 		if err != nil {
 			return
 		}
-	}
-}
-
-// udpFlow relays one device<->destination datagram flow until it has been quiet for IdleUDP.
-func (g *Gateway) udpFlow(r *udp.ForwarderRequest, dst netip.AddrPort) {
-	defer g.udpFlows.Add(-1)
-	out, err := g.cfg.Dial("udp", dst.String(), g.cfg.DialTimeout)
-	if err != nil {
-		g.dialFailed.Add(1)
-		return
-	}
-	defer out.Close()
-	var wq waiter.Queue
-	ep, terr := r.CreateEndpoint(&wq)
-	if terr != nil {
-		return
-	}
-	in := gonet.NewUDPConn(&wq, ep)
-	defer in.Close()
-	var mu sync.Mutex
-	last := time.Now()
-	touch := func() { mu.Lock(); last = time.Now(); mu.Unlock() }
-	quiet := func() bool { mu.Lock(); defer mu.Unlock(); return time.Since(last) >= g.cfg.IdleUDP }
-	done := make(chan struct{})
-	go func() { // internet -> device
-		defer close(done)
-		buf := make([]byte, 64*1024)
-		for {
-			out.SetReadDeadline(time.Now().Add(time.Second))
-			n, err := out.Read(buf)
-			if err == nil {
-				touch()
-				in.Write(buf[:n])
-				continue
-			}
-			if ne, ok := err.(net.Error); ok && ne.Timeout() && !quiet() {
-				continue
-			}
-			return
-		}
-	}()
-	buf := make([]byte, 64*1024) // device -> internet
-	for {
-		in.SetReadDeadline(time.Now().Add(time.Second))
-		n, err := in.Read(buf)
-		if err == nil {
-			touch()
-			out.Write(buf[:n])
-			continue
-		}
-		if ne, ok := err.(net.Error); ok && ne.Timeout() && !quiet() {
-			select {
-			case <-done:
-				return
-			default:
-				continue
-			}
-		}
-		return
 	}
 }

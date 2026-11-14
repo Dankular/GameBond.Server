@@ -61,6 +61,11 @@ type Config struct {
 	IdleUDP     time.Duration // default 60 s
 	// Dial opens the outbound socket for a flow; nil uses the operating system. Tests replace it.
 	Dial func(network, address string, timeout time.Duration) (net.Conn, error)
+	// Listen opens the public UDP socket of a device mapping; nil uses the operating system.
+	Listen func() (net.PacketConn, error)
+	// RestrictedUDP drops datagrams from addresses the device has not sent to first. Off by default:
+	// full-cone mapping is what gives consoles NAT type 2 and lets PSN sign-in succeed.
+	RestrictedUDP bool
 }
 
 // Stats are the counters shown in the panel.
@@ -92,6 +97,8 @@ type Gateway struct {
 	policy              atomic.Pointer[compiledPolicy]
 	devs                devices
 	nbMu                sync.Mutex
+	udpMu               sync.Mutex
+	udpMaps             map[netip.AddrPort]*udpMapping
 	neighbours          map[netip.Addr][6]byte
 }
 

@@ -261,7 +261,8 @@ func fakeInternet(t *testing.T) func(string, string, time.Duration) (net.Conn, e
 var internet = tcpip.FullAddress{Addr: tcpip.AddrFrom4([4]byte{203, 0, 113, 9}), Port: 7}
 
 func TestDeviceTCPAndUDPThroughGateway(t *testing.T) {
-	g, out := newTestGateway(t, func(c *Config) { c.Dial = fakeInternet(t) })
+	listen, _ := fakeUDPInternet(t)
+	g, out := newTestGateway(t, func(c *Config) { c.Dial = fakeInternet(t); c.Listen = listen })
 	dev := newDevice(t, g, out, "10.78.0.50")
 
 	// TCP: 100 KB echoes back intact through the gateway.
@@ -415,5 +416,133 @@ func TestPolicyIsLiveAndPerDevice(t *testing.T) {
 	}
 	if err := g.SetPolicy(Policy{Devices: []DevicePolicy{{MAC: net.HardwareAddr{1, 2, 3, 4, 5, 6}}}}); err == nil {
 		t.Fatal("a multicast MAC rule was accepted")
+	}
+}
+
+// natPC stands in for the internet: it maps the documentation addresses a device talks to onto two
+// local sockets, an echo server and a second socket that answers from a different address and port.
+type natPC struct {
+	net.PacketConn
+	toReal   map[string]net.Addr // fake destination -> local socket
+	fromReal map[string]net.Addr // local socket -> fake source
+}
+
+func (n *natPC) WriteTo(b []byte, a net.Addr) (int, error) {
+	if r, ok := n.toReal[a.String()]; ok {
+		return n.PacketConn.WriteTo(b, r)
+	}
+	return len(b), nil
+}
+
+func (n *natPC) ReadFrom(b []byte) (int, net.Addr, error) {
+	k, a, err := n.PacketConn.ReadFrom(b)
+	if err != nil {
+		return k, a, err
+	}
+	if f, ok := n.fromReal[a.String()]; ok {
+		a = f
+	}
+	return k, a, err
+}
+
+// fakeUDPInternet returns a Listen hook and the second socket, "other", which a test uses to send to a
+// mapping's public port from an address the device never contacted.
+func fakeUDPInternet(t *testing.T) (func() (net.PacketConn, error), *net.UDPConn) {
+	t.Helper()
+	echo, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { echo.Close(); other.Close() })
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, a, err := echo.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			echo.WriteTo(buf[:n], a)
+		}
+	}()
+	fakeEcho, _ := net.ResolveUDPAddr("udp4", "203.0.113.9:7")
+	fakeOther, _ := net.ResolveUDPAddr("udp4", "198.51.100.7:4000")
+	return func() (net.PacketConn, error) {
+		pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			return nil, err
+		}
+		return &natPC{PacketConn: pc,
+			toReal:   map[string]net.Addr{fakeEcho.String(): echo.LocalAddr()},
+			fromReal: map[string]net.Addr{echo.LocalAddr().String(): fakeEcho, other.LocalAddr().String(): fakeOther}}, nil
+	}, other
+}
+
+func TestUDPMappingIsFullCone(t *testing.T) {
+	listen, other := fakeUDPInternet(t)
+	g, out := newTestGateway(t, func(c *Config) { c.Listen = listen })
+	dev := newDevice(t, g, out, "10.78.0.50")
+
+	// The device opens a port by sending to one server (the echo) and gets its answer.
+	local := tcpip.FullAddress{Addr: tcpip.AddrFrom4([4]byte{10, 78, 0, 50}), Port: 40000}
+	uc, err := gonet.DialUDP(dev.s, &local, nil, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer uc.Close()
+	to := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 9), Port: 7}
+	if _, err := uc.WriteTo([]byte("hello"), to); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	uc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, from, err := uc.ReadFrom(buf)
+	if err != nil || string(buf[:n]) != "hello" || from.(*net.UDPAddr) == nil {
+		t.Fatalf("echo through the mapping: %q %v", buf[:n], err)
+	}
+
+	// A server the device never contacted, at another address and port, sends to the public port.
+	maps := g.UDPMappings()
+	if len(maps) != 1 || maps[0].Device != "10.78.0.50:40000" {
+		t.Fatalf("mappings: %+v", maps)
+	}
+	pub, err := net.ResolveUDPAddr("udp4", maps[0].Public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.WriteToUDP([]byte("cone"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: pub.Port}); err != nil {
+		t.Fatal(err)
+	}
+	uc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, from, err = uc.ReadFrom(buf)
+	if err != nil || string(buf[:n]) != "cone" {
+		t.Fatalf("full-cone delivery failed: %q %v (%+v)", buf[:n], err, g.Stats())
+	}
+	if ua := from.(*net.UDPAddr); ua.IP.String() != "198.51.100.7" || ua.Port != 4000 {
+		t.Fatalf("the device must see the real source, got %v", from)
+	}
+
+	// With the restriction on, the same datagram is dropped.
+	listen2, other2 := fakeUDPInternet(t)
+	g2, out2 := newTestGateway(t, func(c *Config) { c.Listen = listen2; c.RestrictedUDP = true })
+	dev2 := newDevice(t, g2, out2, "10.78.0.51")
+	uc2, err := gonet.DialUDP(dev2.s, &tcpip.FullAddress{Addr: tcpip.AddrFrom4([4]byte{10, 78, 0, 51}), Port: 40001}, nil, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer uc2.Close()
+	uc2.WriteTo([]byte("hello"), to)
+	uc2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, _, err := uc2.ReadFrom(buf); err != nil {
+		t.Fatal(err)
+	}
+	pub2, _ := net.ResolveUDPAddr("udp4", g2.UDPMappings()[0].Public)
+	other2.WriteToUDP([]byte("cone"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: pub2.Port})
+	uc2.SetReadDeadline(time.Now().Add(700 * time.Millisecond))
+	if n, _, err := uc2.ReadFrom(buf); err == nil {
+		t.Fatalf("restricted mapping delivered %q", buf[:n])
 	}
 }

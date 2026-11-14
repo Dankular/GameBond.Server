@@ -319,7 +319,7 @@ func (e *l2Edge) Stats(now time.Time) map[string]any {
 			"blocked": g.Blocked, "dial_failed": g.DialFailed, "leases": g.Leases,
 			"dhcp_discover": g.DHCPDiscover, "dhcp_request": g.DHCPRequest, "dhcp_ack": g.DHCPAck, "dhcp_nak": g.DHCPNak,
 			"frames_in": g.FramesIn, "frames_out": g.FramesOut,
-			"policy_version": e.gw.PolicyVersion(), "draining": e.gw.Draining(), "devices": e.gw.DeviceStats(),
+			"policy_version": e.gw.PolicyVersion(), "draining": e.gw.Draining(), "devices": e.gw.DeviceStats(), "udp_mappings": e.gw.UDPMappings(),
 		}, "active_flows": e.gw.ActiveFlows()}
 	}
 	st2 := map[string]any{
