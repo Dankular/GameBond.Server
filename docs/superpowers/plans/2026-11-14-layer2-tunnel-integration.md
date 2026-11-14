@@ -1,76 +1,88 @@
-# Layer 2 and tunnel transport integration
+# Layer 2 on the bonding transport
 
-**Goal:** make the managed Layer 2 gateway subsystem useful to the bonded tunnel: (1) apply L2 policy to the tunnel interface, (2) carry Ethernet frames over the bond, (3) tie redundancy to the transport's own health signals.
+**Goal:** the Layer 2 capabilities live in the bonding transport itself, so they improve what GameBond sells (bonded, redundant, loss-hardened links) instead of only configuring a Linux gateway beside it. The Linux gateway daemon becomes an optional edge adapter for the same policy.
 
-**Status:** plan, nothing implemented. Supersedes the "does not change the tunnel transport" boundary in `specs/2026-11-13-layer2-subsystem-design.md` for the items below only; every phase stays opt-in and defaults to today's behaviour.
+**Status:** plan, nothing implemented. Replaces the first version of this document, which put L2 policy on the exit's `gamebond0` and Ethernet carriage last. That was the wrong shape: it treated the transport as a pipe. Here the transport is the switch fabric.
 
-## Facts the design rests on (checked 2026-11-14)
+## Rule: nothing ships unused
 
-- The exit's tunnel device is `IFF_TUN | IFF_NO_PI` (`edge/runtime_linux.go`): layer 3. No Ethernet frames, broadcast or unknown-unicast exist on it today.
-- The Windows client's LAN gateway (`native-edge/lan/gateway.go`) terminates Ethernet at the client (ARP, DHCP) and forwards IP into the tunnel. L2 does not cross the tunnel.
-- `gamebond0` lives in the container's network namespace. `gatewayd` is a host service and must not give the container host-network authority, so it reaches `gamebond0` only by entering that namespace (fixed-argv `nsenter`/`ip netns`), never by widening container capabilities.
-- Both exits (primary 138.199.201.16 and backup 195.154.119.136) carry live traffic, and the primary also hosts ~25 other containers on 2 vCPU / 3.8 GB. Anything that mutates their networking needs read-only discovery first, a rollback, and the usual rollout order (backup probe stopped, one exit at a time).
-- Duplication, SACK, repair and exit failover already provide PRP-like redundancy at the transport; the L2 provider adds VRRP, bonding and STP, which must not become competing controllers.
+- One source of policy. The existing `gateway/layer2` desired-state schema (validation, capability gating, plan/apply, status) is the only configuration model. The transport consumes it; there is no parallel `bond/l2` config. If a field has no effect on the live path it is rejected as unsupported, never accepted silently.
+- Every phase is a vertical slice that is enabled on the backup exit and one real client device, moves real traffic, and shows counters in the panel before it counts as done. Library-only phases and simulator-only features do not count.
+- A feature is removed from the roadmap, not parked, if it has no path to the live transport.
 
-## Phase 0 - read-only discovery (no behaviour change)
+## Principle
 
-- Run `gatewayd` in discovery mode on the backup exit only; report capabilities for the container netns (`tc`, `nft`, bridge, bonding, `mstpd`, `keepalived`).
-- Status shows `gamebond0` counters, MTU, qdisc and DSCP marks as seen from the host.
-- Exit criterion: capability report matches reality; nothing was written.
+The bond is a virtual switch: its "ports" are the client LAN adapters and the exit, and its "trunk" is the set of bonded paths. L2 features are implemented where the packets already are, in `GameBond.Core/bond` (shared by client and server), reusing duplication, SACK, repair, reorder, BFD and the failover logic.
 
-## Phase 1 - L2 policy on the tunnel interface (Server only)
+## What already exists (checked 2026-11-14)
 
-What is honest on a layer 3 TUN:
+- Client `native-edge/iec62439`: PRP redundancy control trailer (RCT), HSR tag, duplicate discard keyed by source MAC and sequence, supervision frames, node table with per-LAN status. Works on Ethernet frames, not wired into the Core transport.
+- Client `native-edge/lan`: raw Ethernet access to LAN adapters; it terminates Ethernet (ARP, DHCP) and sends IP into the tunnel.
+- Core `bond`: IPv4-only packet model (`ParseIPv4`, flow classification), per-path budget, BFD, FRER-style first-wins accounting, adaptive duplication, FEC, loss repair, failover.
+- Server: exit tunnel is `IFF_TUN` (layer 3).
+- Server `gateway/layer2`: Linux provider/plan/apply for bridge, VLAN, bond, ACL, QoS, storm control, LLDP-MED, VRRP, with capability-gated status. Host service, kept out of the tunnel container by design.
 
-| Control | On gamebond0 (TUN) | Notes |
+## Mapping: which L2 feature becomes what in the transport
+
+| L2 feature | In the transport | Notes |
 |---|---|---|
-| DSCP / QoS classes | yes | Share one root qdisc with the adaptive QoS (`qos_bridge.go`); never rewrite the DSCP the tunnel uses to pick priority copies. |
-| Egress rate limit, policing | yes | Per client tunnel IP via `tc`/`nft` in the container netns. |
-| IP ACLs, network isolation | yes | Per tunnel client IP, GameBond-owned nft table only. |
-| MAC ACLs, port security, DHCP snooping, storm control, loop protection, STP, LLDP-MED | no | No L2 on a TUN. These become meaningful only after Phase 2 and are reported "unsupported" until then, never silently accepted. |
+| LACP / link aggregation | Already the bond: per-flow striping, path health by BFD. Add a LACP-style status view (members, collecting/distributing, partner = exit) and flow-hash policy (per-flow pinning exists as `FlowsPinned`). | No LACP protocol needed: both ends are ours. |
+| Redundancy (PRP/HSR) | Ethernet-frame PRP: RCT or HSR tag on frames, duplicate discard at the receiver across paths. Reuse `iec62439` and Core's number/first-wins merge so there is one dedup, not two. | Delivers the standing IEC 62439-3 goal on real frames. |
+| Loop protection / STP-like | A transport-edge loop guard: duplicate-source-MAC across ports, frame TTL/loop counter on the tunnel port, hold-down that shuts only the offending port. | The bond itself is loop-free by construction (one trunk); loops come from client LANs. |
+| Storm control, multicast/broadcast limits | Token buckets per port and class (unknown-unicast, multicast, broadcast) at the tunnel edge, counters in panel. | Needs Ethernet frames, hence Phase 1. |
+| VLANs / Virtual Network Override | 802.1Q tag carried end to end; per-port VLAN membership and tag mapping in the transport's port table. | |
+| QoS / DSCP, egress rate limit | Map 802.1p/DSCP to the existing priority/bulk classes and per-path budget; per-port rate limit. | Share the adaptive QoS, never a second one. |
+| MAC limits, port security, MAC blocking/ACLs, port isolation | Port table in the switch core (FDB with per-port MAC cap, static entries, deny list, isolation groups). | |
+| IGMP/MLD snooping, querier | Snooping table in the switch core so multicast is replicated only to member ports and sent on all paths as priority copies. | |
+| DHCP snooping, 802.1X | Edge-adapter responsibility (client LAN side and exit bridge); transport carries EAPOL and DHCP and marks trusted ports. | Backend-dependent. |
+| LLDP / LLDP-MED | LLDP frames terminated at the port; the supervision frame doubles as the peer-discovery TLV between client and exit. | |
+| Port mirroring | Mirror a port's frames to a local monitor port. | |
+| MC-LAG | Not applicable as two peers: dual exits are failover, not an aggregate. Report unsupported. | |
+| STP/RSTP, VRRP | Edge adapter (Linux bridge, keepalived) with the transport's path/exit health as input. | One owner per decision. |
 
-- Apply through the existing plan/apply/rollback lifecycle; one new provider target `tunnel` in `gateway/layer2`.
-- Tests: namespace + veth harness for tc/nft application and rollback; fake-provider vectors for validation.
+## Phases
 
-## Phase 2 - Ethernet frames over the bond (largest change)
+### Phase 1 - first live slice: Ethernet carriage with FDB, loop guard and storm control
 
-Core (`GameBond.Core`):
-- New payload kind for Ethernet frames, authenticated and numbered like IP packets so duplication, SACK, repair and reorder apply unchanged. Flow identity for classification comes from the inner frame (VLAN id, inner IP 5-tuple when present, otherwise MAC pair).
-- Broadcast, multicast and ARP/ND are priority-copied; unknown-unicast flooding is rate-limited at the tunnel edge (storm control on the tunnel port: separate token buckets for unknown-unicast, multicast, broadcast).
-- MTU: 1500-byte frames do not fit the 1280 tunnel MTU. Decide between fragmentation, MSS clamping or raising the tunnel MTU; do not pass oversize frames silently (report and count them like `oversize_dropped`).
-- Loop protection: duplicate-MAC and frame-looping detection on the tunnel port, with a hold-down that shuts only the tunnel port, never the exit's management interface.
+The switch core (Ethernet II / 802.1Q parsing, FDB with aging, per-port MAC cap, forwarding decision, loop guard, storm buckets) is built here together with the wire carriage and the panel, driven by `gateway/layer2` config, with a simulator harness as its test. Live target: one opt-in LAN device on the backup exit.
 
-Server:
-- A TAP device in the container namespace (new `IFF_TAP` path beside the existing TUN) joined to a gatewayd-managed Linux bridge by a veth into the host namespace. VLAN filtering, port isolation, MAC limits, 802.1X and DHCP snooping then apply on the bridge port using the existing providers.
-- Off by default; a distinct config section, so the TUN path is unchanged.
+- Panel (Loss and Aggregation sections): frames carried per port, FDB size, flooded vs known-unicast, storm drops, loop-guard holds, oversize counts.
+- Done when a real device passes ARP, DHCP and traffic through the bond with one path cut, and the counters move.
 
-Client:
-- Pass-through bridging mode per LAN device (today the gateway terminates Ethernet). MAC learning table, split horizon, per-client MAC limit, 802.1Q tag mapping.
-- Must not change the Windows client's routing of normal traffic; opt-in per device.
+- New authenticated payload kind (`KindEthernet`) numbered and handled like IP packets, so duplication, SACK, repair and reorder apply unchanged. Classification uses inner VLAN/PCP and the IP 5-tuple when present, MAC pair otherwise.
+- Control frames (ARP, ND, DHCP, EAPOL, LLDP, IGMP, BPDU) are priority copies on every path.
+- MTU: choose fragmentation, MSS clamp or a larger tunnel MTU; oversize frames are counted, never silent.
+- Server: TAP device beside the existing TUN (opt-in config section), joined to the switch core and, for Linux features, to a bridge via veth.
+- Client: pass-through bridging per LAN device (today it terminates Ethernet), opt-in per device; normal traffic routing unchanged.
+- Tests: codec vectors, simulator with two lossy links (ARP/DHCP survive 5% loss, order preserved per flow, duplicate suppression), namespace test for TAP + bridge, soak on the backup exit first.
 
-Tests: Core codec and classification vectors, a simulator test that carries frames over two lossy links and checks loss/ordering of ARP/DHCP, namespace tests for the TAP/bridge path, and a live soak on the backup exit only before the primary.
+Wire details for Phase 1:
 
-## Phase 3 - redundancy tied to the transport
+### Phase 1 wire and ports
 
-- Define one owner per failover decision and record it in status:
-  - Exit failover (client switches between 138.* and 195.*): owned by the transport (`native-edge/client/failover.go`).
-  - Gateway VIP failover (VRRP shadow mode): owned by keepalived, with tracked health taken from the transport (exit healthy, bond paths up) so a VRRP node never claims the VIP while its tunnel is down. The existing spec lists "tracked health policy" as not implemented; this phase implements it.
-  - STP/loop protection: owned by the bridge, scoped to bridge ports; never blocks the tunnel port based on a topology change it did not cause.
-- Expose the transport's path state (BFD, suspect/down, exit failover events) to `gatewayd` over its Unix socket as read-only input.
-- MC-LAG stays unsupported: two independent exits are not a verified MC-LAG peer pair. Say so in status; do not emulate it.
-- Failover event history joins the existing outage journal so one timeline shows link, exit and VRRP transitions.
-- Do not drill live failover on the production exits; use namespaces and the simulator, and a guarded test window agreed with the operator.
+- Use RCT or HSR tags on carried Ethernet frames and merge with Core's first-wins accounting. Supervision frames feed the node table and the panel's per-node LAN A/B status.
+- Gate: IEC 62439-3 conformance vectors for RCT/HSR encode, decode and discard.
 
-## Order and gates
+### Phase 2 - PRP/HSR on carried frames
 
-1. Phase 0 on the backup exit, read-only.
-2. Phase 1 on the backup exit, then the primary after a clean soak.
-3. Phase 3 signals (read-only export) next, since they are cheap and unblock honest status.
-4. Phase 2 last: it needs the Core frame kind, a design review of MTU and loop handling, and its own soak.
+- Use RCT or HSR tags on carried Ethernet frames and merge with Core's first-wins accounting. Supervision frames feed the node table and the panel's per-node LAN A/B status.
+- Gate: IEC 62439-3 conformance vectors for RCT/HSR encode, decode and discard, plus the live check above.
 
-Every phase ships separately, tests green, `GOOS=linux go build ./...`, rollout in the standard order, and a clean panel from the operator before the next phase.
+### Phase 3 - policy features in the switch core
 
-## Open questions for the operator
+In this order, each a live slice with its own tests and panel counters: VLAN membership and mapping, MAC cap and blocking, port isolation, storm control and multicast limits, QoS map and per-port rate limit, loop guard, IGMP snooping, LLDP termination, port mirroring.
 
-- Is the first use of Phase 2 a specific device (PS5, a camera, a switch) so the MTU and VLAN choices can be driven by a real case?
-- Should the backup exit stay the test bed until a phase is proven, accepting that failover then also tests the new code?
+### Phase 4 - Linux gateway as edge adapter
+
+- `gatewayd` consumes the same policy and applies the parts that need the host (bridge VLAN filtering on the exit, STP, VRRP via keepalived, 802.1X, DHCP snooping).
+- Transport health (path state, exit failover, BFD) is exported to `gatewayd` read-only and is the tracked-health input for VRRP. One owner per failover decision, recorded in status; no competing controllers. Failover events join the outage journal.
+
+## Gates for every phase
+
+Tests green, `GOOS=linux go build ./...`, rollout in the standard order (stop backup probe, push Server, wait primary, start backup probe, wait backup, deploy client), soak on the backup exit first, and a clean panel from the operator before the next phase. No live failover drills on the production exits.
+
+## Open decisions
+
+1. First real device for Phase 1 (PS5, camera, switch) to drive MTU and VLAN choices.
+2. Whether the TAP port joins the switch core only, or also a Linux bridge from day one.
+3. PRP trailer versus HSR tag as the default for carried frames (PRP fits two independent paths; HSR fits a ring).
