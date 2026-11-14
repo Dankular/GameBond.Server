@@ -2,6 +2,8 @@ github.com/Dankular/GameBond.Core v0.1.29 h1:ZC2IHo7DUPgMxowWJ77hbcayzXfgZ3qK+Sa
 github.com/Dankular/GameBond.Core v0.1.29/go.mod h1:r5Z9FqwRuaKd2HqHYzgYQyuaBkKbyIuW+AaybWX9L4w=
 github.com/Dankular/GameBond.Core v0.1.30 h1:vV+vGszX5YL6fUPoAS4eeip2auGIeAtc72eoTx1sxgI=
 github.com/Dankular/GameBond.Core v0.1.30/go.mod h1:r5Z9FqwRuaKd2HqHYzgYQyuaBkKbyIuW+AaybWX9L4w=
+github.com/Dankular/GameBond.Core v0.1.31 h1:wcxuH7o2XfTZyQs1uNTRh/CQi4SpD0xXNU+UC1GUrzY=
+github.com/Dankular/GameBond.Core v0.1.31/go.mod h1:r5Z9FqwRuaKd2HqHYzgYQyuaBkKbyIuW+AaybWX9L4w=
 github.com/ebitengine/purego v0.11.2 h1:WWiTx8rD8zYdOwSj8O/NiNbsOvSAgJMTlyV1XlbUSeU=
 github.com/ebitengine/purego v0.11.2/go.mod h1:DCHPP08djqhNSoTfImcnHYQRZmd0qhakvrozqaEYhGQ=
 github.com/go-ole/go-ole v1.2.6 h1:/Fpf6oFPoeFik9ty7siob0G6Ke8QvQEuVcuChpwXzpY=
