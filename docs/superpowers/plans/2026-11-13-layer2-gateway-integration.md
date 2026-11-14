@@ -321,4 +321,4 @@ For each separate profile (28 Play, 29 Dante, 30 Q-SYS, 31 NDI, 32 SDVoE, 33 Shu
 - [x] Update the admin portal documentation, install guide, capability matrix, and `FEATURES.md` to distinguish available, unsupported, and implemented capabilities.
 - [x] Review diffs and stage only Layer 2 integration files; preserve unrelated Client working tree changes and local file-mode noise.
 - [x] Commit the Client Layer 2 roadmap change separately and the integrated Server subsystem as a descriptive, reviewable commit.
-- [ ] Push the requested commits only after confirming the intended branch and the commits already ahead of each remote.
+- [x] Fetch all remotes, rebase the Client commits onto the latest GitHub `main`, then push the Layer 2 Server and Client commits to their respective `main` branches. Verify both remote refs match the pushed commits.
