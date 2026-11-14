@@ -86,8 +86,10 @@ while [ $# -gt 0 ]; do
 done
 echo "$sent" >> "$FAKE/curl-sent"
 if [ -n "$sent" ]; then printf '304'; exit 0; fi
-printf 'HTTP/2 200
-ETag: W/"abc"
+printf 'HTTP/2 200
+
+ETag: W/"abc"
+
 ' > "$hdr"
 echo '{"workflow_runs":[{"head_sha": "0123456789012345678901234567890123456789"}]}' > "$out"
 printf '200'
@@ -117,4 +119,46 @@ chmod +x "$T/bin/curl"
 GITEA_URL=https://gitea.example
 check "gitea source picks the newest successful main build" "$(latest_build)" dddd000000000000000000000000000000000004
 GITEA_URL=
+
+# Peer gating: a peer that is updating blocks; a lower-ranked ready peer on an older image goes
+# first; unreachable, stale, or already-updated peers do not block; the wait is bounded.
+peer() { # state rank image rejected age
+  cat > "$T/bin/curl" <<CURL
+#!/bin/bash
+out=""
+while [ \$# -gt 0 ]; do case "\$1" in -o) out=\$2; shift ;; esac; shift; done
+printf '{"node":"p","rank":$2,"state":"$1","image":"$3","rejected":"$4","at":%s}' "\$(( \$(date +%s) - $5 ))"
+CURL
+  chmod +x "$T/bin/curl"
+}
+PEERS=http://peer:8099; NODE_RANK=1; IMAGE_REPO=img; rm -f "$T/state/peer-wait"
+SHA=eeee000000000000000000000000000000000005
+peer updating 0 img:old - 5
+peer_blocks $SHA; check "updating peer blocks" "$?" 0
+peer rolling_back 0 img:old - 5
+peer_blocks $SHA; check "rolling-back peer blocks" "$?" 0
+peer starting 0 img:old - 5
+peer_blocks $SHA; check "starting peer blocks" "$?" 0
+peer ready 0 img:old - 5
+peer_blocks $SHA; check "lower-ranked peer on the old image goes first" "$?" 0
+peer ready 0 img:$SHA - 5
+peer_blocks $SHA; check "peer already on the target does not block" "$?" 1
+peer ready 0 img:old $SHA 5
+peer_blocks $SHA; check "peer that rejected the target does not block" "$?" 1
+peer ready 2 img:old - 5
+peer_blocks $SHA; check "higher-ranked peer does not block a ready node" "$?" 1
+peer updating 0 img:old - 900
+peer_blocks $SHA; check "stale updating peer does not block" "$?" 1
+printf '#!/bin/bash
+exit 7
+' > "$T/bin/curl"
+peer_blocks $SHA; check "unreachable peer does not block" "$?" 1
+peer updating 0 img:old - 5; rm -f "$T/state/peer-wait"
+peer_blocks $SHA; echo $(( $(date +%s) - 700 )) > "$T/state/peer-wait"
+peer_blocks $SHA; check "wait is bounded by PEER_MAX_WAIT" "$?" 1
+PEERS=
+reset; echo "running|healthy" > "$FAKE/state"; publish_status
+check "published state is ready" "$(jq -r .state "$T/state/status.json")" ready
+echo "exited|" > "$FAKE/state"; publish_status
+check "published state is unhealthy" "$(jq -r .state "$T/state/status.json")" unhealthy
 exit $fail
