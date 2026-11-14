@@ -30,7 +30,7 @@ The bond is a virtual switch: its "ports" are the client LAN adapters and the ex
 | Redundancy (PRP/HSR) | Ethernet-frame PRP: RCT or HSR tag on frames, duplicate discard at the receiver across paths. Reuse `iec62439` and Core's number/first-wins merge so there is one dedup, not two. | Delivers the standing IEC 62439-3 goal on real frames. |
 | Loop protection / STP-like | A transport-edge loop guard: duplicate-source-MAC across ports, frame TTL/loop counter on the tunnel port, hold-down that shuts only the offending port. | The bond itself is loop-free by construction (one trunk); loops come from client LANs. |
 | Storm control, multicast/broadcast limits | Token buckets per port and class (unknown-unicast, multicast, broadcast) at the tunnel edge, counters in panel. | Needs Ethernet frames, hence Phase 1. |
-| VLANs / Virtual Network Override | 802.1Q tag carried end to end; per-port VLAN membership and tag mapping in the transport's port table. | |
+| VLANs / Virtual Network Override | Out of scope: single flat VLAN (decision 1). Tags pass through unmodified and are counted. | |
 | QoS / DSCP, egress rate limit | Map 802.1p/DSCP to the existing priority/bulk classes and per-path budget; per-port rate limit. | Share the adaptive QoS, never a second one. |
 | MAC limits, port security, MAC blocking/ACLs, port isolation | Port table in the switch core (FDB with per-port MAC cap, static entries, deny list, isolation groups). | |
 | IGMP/MLD snooping, querier | Snooping table in the switch core so multicast is replicated only to member ports and sent on all paths as priority copies. | |
@@ -60,17 +60,17 @@ Wire details for Phase 1:
 
 ### Phase 1 wire and ports
 
-- Use RCT or HSR tags on carried Ethernet frames and merge with Core's first-wins accounting. Supervision frames feed the node table and the panel's per-node LAN A/B status.
-- Gate: IEC 62439-3 conformance vectors for RCT/HSR encode, decode and discard.
+- Use the RCT trailer on carried Ethernet frames and merge with Core's first-wins accounting. Supervision frames feed the node table and the panel's per-node LAN A/B status.
+- Gate: IEC 62439-3 conformance vectors for RCT encode, decode and discard.
 
-### Phase 2 - PRP/HSR on carried frames
+### Phase 2 - PRP on carried frames
 
-- Use RCT or HSR tags on carried Ethernet frames and merge with Core's first-wins accounting. Supervision frames feed the node table and the panel's per-node LAN A/B status.
-- Gate: IEC 62439-3 conformance vectors for RCT/HSR encode, decode and discard, plus the live check above.
+- Use the RCT trailer on carried Ethernet frames and merge with Core's first-wins accounting. Supervision frames feed the node table and the panel's per-node LAN A/B status.
+- Gate: IEC 62439-3 conformance vectors for RCT encode, decode and discard, plus the live check above.
 
 ### Phase 3 - policy features in the switch core
 
-In this order, each a live slice with its own tests and panel counters: VLAN membership and mapping, MAC cap and blocking, port isolation, storm control and multicast limits, QoS map and per-port rate limit, loop guard, IGMP snooping, LLDP termination, port mirroring.
+In this order, each a live slice with its own tests and panel counters: MAC cap and blocking, port isolation, storm control and multicast limits, QoS map and per-port rate limit, loop guard, IGMP snooping, LLDP termination, port mirroring.
 
 ### Phase 4 - Linux gateway as edge adapter
 
@@ -81,8 +81,10 @@ In this order, each a live slice with its own tests and panel counters: VLAN mem
 
 Tests green, `GOOS=linux go build ./...`, rollout in the standard order (stop backup probe, push Server, wait primary, start backup probe, wait backup, deploy client), soak on the backup exit first, and a clean panel from the operator before the next phase. No live failover drills on the production exits.
 
-## Open decisions
+## Decisions (operator, 2026-11-14)
 
-1. First real device for Phase 1 (PS5, camera, switch) to drive MTU and VLAN choices.
-2. Whether the TAP port joins the switch core only, or also a Linux bridge from day one.
-3. PRP trailer versus HSR tag as the default for carried frames (PRP fits two independent paths; HSR fits a ring).
+1. **One flat VLAN, as today.** All devices stay on the same untagged network they are on now. No VLAN membership or tag mapping is built: 802.1Q frames, if any appear, are passed through unmodified and counted, and the VLAN/Virtual Network Override items leave this roadmap.
+2. **Bridge from day one.** The exit's carried-frame port (TAP) joins a Linux bridge (gatewayd-managed, veth into the host) together with the existing LAN side, so devices behind the client and the exit LAN share one broadcast domain. The transport's switch core does MAC learning, MAC cap, loop guard and storm control at the tunnel port; the bridge does the rest.
+3. **PRP, not HSR.** Carried frames use the PRP redundancy control trailer (RCT) with LAN A/B mapped to the two bonded paths, duplicate discard at the receiver merged with Core's first-wins accounting. HSR ring tags are out of scope.
+
+Still open: the first real device for Phase 1 (PS5, camera, switch) to drive the MTU choice.
