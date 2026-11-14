@@ -194,6 +194,9 @@ func Run(ctx context.Context, c Config, options bond.SessionOptions, address net
 					if err = engine.UDP(buffer[:size], netip.AddrPortFrom(netip.AddrFrom4(peer.Addr), uint16(peer.Port)), time.Now(), write); err != nil {
 						return err
 					}
+				} else if l2 != nil && l2.gw != nil && fd == l2.fd {
+					l2.drainGateway(engine, time.Now())
+					break
 				} else if l2 != nil && fd == l2.fd {
 					size, err := unix.Read(l2.fd, buffer)
 					if err == unix.EAGAIN {

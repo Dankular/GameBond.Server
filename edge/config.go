@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -63,6 +65,103 @@ type L2Config struct {
 	BroadcastPPS      float64 `json:"broadcast_pps"`
 	MulticastPPS      float64 `json:"multicast_pps"`
 	UnknownUnicastPPS float64 `json:"unknown_unicast_pps"`
+	// Bridge makes the container the gateway of the carried segment: the entrypoint joins the TAP
+	// to a bridge with this address, serves DHCP on it and NATs it to the internet. Without it
+	// the TAP is left for the host to wire.
+	Bridge *L2Bridge `json:"bridge"`
+}
+
+// L2Bridge is the addressing of the bridged segment. Each exit has its own config, so give the
+// exits disjoint DHCP ranges (and the same Address): devices then keep their gateway across a failover.
+type L2Bridge struct {
+	Address   string   `json:"address"`    // gateway address with prefix, default 10.78.0.1/24
+	DHCPStart string   `json:"dhcp_start"` // first leased address
+	DHCPEnd   string   `json:"dhcp_end"`   // last leased address
+	Lease     string   `json:"lease"`      // lease time such as 12h, default 12h
+	DNS       []string `json:"dns"`        // resolvers handed out, default 1.1.1.1 and 9.9.9.9
+	Hosts     []L2Host `json:"hosts"`      // fixed leases by MAC
+}
+
+// L2Host pins an address to a MAC.
+type L2Host struct {
+	MAC  string `json:"mac"`
+	IP   string `json:"ip"`
+	Name string `json:"name"`
+}
+
+var (
+	leaseRE    = regexp.MustCompile(`^[0-9]{1,4}[smh]$`)
+	hostNameRE = regexp.MustCompile(`^[A-Za-z0-9-]{0,32}$`)
+)
+
+func (b *L2Bridge) validate() error {
+	if b.Address == "" {
+		b.Address = "10.78.0.1/24"
+	}
+	pfx, err := netip.ParsePrefix(b.Address)
+	if err != nil || !pfx.Addr().Is4() || pfx.Bits() < 16 || pfx.Bits() > 29 {
+		return fmt.Errorf("l2.bridge.address must be an IPv4 address with a /16 to /29 prefix")
+	}
+	if pfx.Masked().Overlaps(netip.MustParsePrefix("10.77.0.0/24")) || pfx.Masked().Overlaps(netip.MustParsePrefix("172.16.0.0/12")) {
+		return fmt.Errorf("l2.bridge.address overlaps the tunnel (10.77.0.0/24) or the container network (172.16.0.0/12)")
+	}
+	gw := pfx.Addr()
+	within := func(field, v string) (netip.Addr, error) {
+		a, err := netip.ParseAddr(v)
+		if err != nil || !a.Is4() || !pfx.Contains(a) || a == gw || a == pfx.Masked().Addr() {
+			return a, fmt.Errorf("l2.bridge.%s must be a host address inside %s other than the gateway", field, pfx.Masked())
+		}
+		return a, nil
+	}
+	if b.DHCPStart == "" || b.DHCPEnd == "" {
+		return fmt.Errorf("l2.bridge needs dhcp_start and dhcp_end")
+	}
+	lo, err := within("dhcp_start", b.DHCPStart)
+	if err != nil {
+		return err
+	}
+	hi, err := within("dhcp_end", b.DHCPEnd)
+	if err != nil {
+		return err
+	}
+	if hi.Less(lo) {
+		return fmt.Errorf("l2.bridge.dhcp_end is before dhcp_start")
+	}
+	if b.Lease == "" {
+		b.Lease = "12h"
+	}
+	if !leaseRE.MatchString(b.Lease) {
+		return fmt.Errorf("l2.bridge.lease must look like 30m or 12h")
+	}
+	if len(b.DNS) == 0 {
+		b.DNS = []string{"1.1.1.1", "9.9.9.9"}
+	}
+	if len(b.DNS) > 3 {
+		return fmt.Errorf("l2.bridge.dns takes at most three resolvers")
+	}
+	for _, d := range b.DNS {
+		if a, err := netip.ParseAddr(d); err != nil || !a.Is4() {
+			return fmt.Errorf("l2.bridge.dns %q is not an IPv4 address", d)
+		}
+	}
+	if len(b.Hosts) > 64 {
+		return fmt.Errorf("l2.bridge.hosts takes at most 64 entries")
+	}
+	for i := range b.Hosts {
+		h := &b.Hosts[i]
+		hw, err := net.ParseMAC(h.MAC)
+		if err != nil || len(hw) != 6 || hw[0]&1 == 1 {
+			return fmt.Errorf("l2.bridge.hosts[%d].mac is not a unicast MAC", i)
+		}
+		h.MAC = hw.String()
+		if _, err := within(fmt.Sprintf("hosts[%d].ip", i), h.IP); err != nil {
+			return err
+		}
+		if !hostNameRE.MatchString(h.Name) {
+			return fmt.Errorf("l2.bridge.hosts[%d].name must be letters, digits and dashes", i)
+		}
+	}
+	return nil
 }
 
 func (l *L2Config) validate() error {
@@ -83,6 +182,9 @@ func (l *L2Config) validate() error {
 	}
 	if l.MACLimit < 0 || l.MACLimit > 4096 || l.BroadcastPPS < 0 || l.MulticastPPS < 0 || l.UnknownUnicastPPS < 0 {
 		return fmt.Errorf("l2 limits must not be negative (mac_limit <= 4096)")
+	}
+	if l.Bridge != nil {
+		return l.Bridge.validate()
 	}
 	return nil
 }

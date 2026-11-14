@@ -147,3 +147,40 @@ func TestL2SectionIsOptInValidatedAndReachesSessionOptions(t *testing.T) {
 		}
 	}
 }
+
+func TestL2BridgeSectionIsValidatedAndDefaulted(t *testing.T) {
+	decode := func(bridge map[string]any) (Config, error) {
+		input := configFixture()
+		input["l2"] = map[string]any{"enabled": true, "bridge": bridge}
+		data, _ := json.Marshal(input)
+		c, _, _, _, err := DecodeConfig(data)
+		return c, err
+	}
+	c, err := decode(map[string]any{"dhcp_start": "10.78.0.100", "dhcp_end": "10.78.0.149",
+		"hosts": []map[string]any{{"mac": "AA:BB:CC:00:11:22", "ip": "10.78.0.20", "name": "ps5"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := c.L2.Bridge
+	if b.Address != "10.78.0.1/24" || b.Lease != "12h" || len(b.DNS) != 2 || b.Hosts[0].MAC != "aa:bb:cc:00:11:22" {
+		t.Fatalf("defaults not applied: %+v", b)
+	}
+	for name, bad := range map[string]map[string]any{
+		"no range":         {},
+		"outside subnet":   {"dhcp_start": "10.79.0.5", "dhcp_end": "10.79.0.9"},
+		"reversed":         {"dhcp_start": "10.78.0.50", "dhcp_end": "10.78.0.40"},
+		"gateway in range": {"dhcp_start": "10.78.0.1", "dhcp_end": "10.78.0.9"},
+		"tunnel overlap":   {"address": "10.77.0.1/24", "dhcp_start": "10.77.0.5", "dhcp_end": "10.77.0.9"},
+		"docker overlap":   {"address": "172.18.0.1/24", "dhcp_start": "172.18.0.5", "dhcp_end": "172.18.0.9"},
+		"bad lease":        {"dhcp_start": "10.78.0.5", "dhcp_end": "10.78.0.9", "lease": "forever; rm"},
+		"bad dns":          {"dhcp_start": "10.78.0.5", "dhcp_end": "10.78.0.9", "dns": []string{"x"}},
+		"multicast mac":    {"dhcp_start": "10.78.0.5", "dhcp_end": "10.78.0.9", "hosts": []map[string]any{{"mac": "01:00:5e:00:00:01", "ip": "10.78.0.7"}}},
+		"host outside":     {"dhcp_start": "10.78.0.5", "dhcp_end": "10.78.0.9", "hosts": []map[string]any{{"mac": "aa:bb:cc:00:11:22", "ip": "10.99.0.7"}}},
+		"host name":        {"dhcp_start": "10.78.0.5", "dhcp_end": "10.78.0.9", "hosts": []map[string]any{{"mac": "aa:bb:cc:00:11:22", "ip": "10.78.0.7", "name": "a b;"}}},
+		"unknown field":    {"dhcp_start": "10.78.0.5", "dhcp_end": "10.78.0.9", "gateway": "x"},
+	} {
+		if _, err := decode(bad); err == nil {
+			t.Fatal("accepted", name)
+		}
+	}
+}
