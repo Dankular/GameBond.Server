@@ -126,14 +126,15 @@ publish_status() {
 # unreachable repo only means the peer cannot see us, which never blocks anything.
 push_state() {
   [ -n "$PEERS" ] && [ -n "$GITEA_URL" ] || return 0
-  local sig now last tok api sha b64
+  local sig now last tok api sha b64 method
   sig=$(jq -r '[.state,.image,.rejected]|join("|")' "$STATE/status.json" 2>/dev/null) || return 0
   now=$(date +%s); last=$(cat "$STATE/pushed-at" 2>/dev/null || echo 0)
   [ "$sig" = "$(cat "$STATE/pushed-sig" 2>/dev/null)" ] && [ $((now - last)) -lt "$HEARTBEAT" ] && return 0
   tok=$(cat "$STATE_TOKEN_FILE" 2>/dev/null); api="$GITEA_URL/api/v1/repos/$STATE_REPO/contents/$NODE_NAME.json"
   sha=$(curl -sS -m 8 -H "Authorization: token $tok" "$api" 2>/dev/null | jq -r '.sha // empty' 2>/dev/null)
   b64=$(base64 -w0 "$STATE/status.json")
-  if curl -sS -m 8 -o /dev/null -f -X "${sha:+PUT}${sha:-POST}" -H "Authorization: token $tok" -H 'Content-Type: application/json'       -d "{\"content\":\"$b64\",\"message\":\"$NODE_NAME $sig\"${sha:+,\"sha\":\"$sha\"}}" "$api" 2>/dev/null; then
+  method=POST; [ -n "$sha" ] && method=PUT
+  if curl -sS -m 8 -o /dev/null -f -X "$method" -H "Authorization: token $tok" -H 'Content-Type: application/json'       -d "{\"content\":\"$b64\",\"message\":\"$NODE_NAME $sig\"${sha:+,\"sha\":\"$sha\"}}" "$api" 2>/dev/null; then
     echo "$sig" > "$STATE/pushed-sig"; echo "$now" > "$STATE/pushed-at"
   fi
 }
