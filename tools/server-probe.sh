@@ -56,8 +56,13 @@ set_image() {
 }
 
 # Latest successful build of main; prints the commit sha. 304 (nothing new) prints nothing.
-# A conditional request that returns 304 does not count against GitHub's rate limit.
+# A conditional request that returns 304 does not count against GitHub's rate limit. The ETag
+# lives in a file: this function runs in a command substitution (a subshell), so a variable
+# set here would be lost after every call and every poll would count against the limit
+# (360 an hour against 60 unauthenticated).
 latest_build() {
+  local ETAG
+  ETAG=$(cat "$STATE/etag" 2>/dev/null)
   local url="https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW/runs?branch=main&status=success&per_page=1"
   local code
   code=$(curl -sS -m 15 -o "$STATE/body" -w '%{http_code}' -D "$STATE/headers" \
@@ -65,8 +70,9 @@ latest_build() {
     ${ETAG:+-H "If-None-Match: $ETAG"} "$url") || return 1
   case "$code" in
     304) return 0 ;;
-    200) ETAG=$(sed -n 's/^[Ee][Tt]ag: *//p' "$STATE/headers" | tr -d '\r' | head -1)
+    200) sed -n 's/^[Ee][Tt]ag: *//p' "$STATE/headers" | tr -d '\r' | head -1 > "$STATE/etag"
          sed -n 's/.*"head_sha": *"\([0-9a-f]\{40\}\)".*/\1/p' "$STATE/body" | head -1 ;;
+    403|429) log "github api rate limited ($code); retrying later"; sleep 60; return 1 ;;
     *)   log "github api returned $code"; return 1 ;;
   esac
 }
@@ -112,7 +118,8 @@ check_once() {
   sha=$(latest_build) || return 1
   [ -n "$sha" ] || return 0
   [ "$sha" = "$(cat "$STATE/rejected" 2>/dev/null)" ] && return 0
-  update_to "$sha"
+  # A failed update must be retried, so forget the ETag: otherwise the next poll answers 304.
+  update_to "$sha" || rm -f "$STATE/etag"
 }
 
 # container_state prints "<status>|<health>" ("missing|" if there is no such container).
@@ -170,7 +177,8 @@ sync_forward() {
 
 case "${1:-watch}" in
   update) if [ -n "${2:-}" ]; then update_to "$2"; else check_once; fi ;;
-  watch)  ETAG=""; log "probe started, polling every ${INTERVAL}s"
+  watch)  rm -f "$STATE/etag"   # one unconditional request per start
+          log "probe started, polling every ${INTERVAL}s"
           while true; do check_once; watchdog_check; sync_forward; sleep "$INTERVAL"; done ;;
   *)      echo "usage: gamebond-probe [watch|update [SHA]]" >&2; exit 2 ;;
 esac

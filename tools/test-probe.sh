@@ -71,4 +71,31 @@ update_to abc123 >/dev/null 2>&1
 check "update_to switched the image" "$(current_image)" "ghcr.io/dankular/gamebond-server:abc123"
 if flock -n "$T/lock" true; then echo "ok   update lock is released after an update"; else echo "FAIL update lock still held"; fail=1; fi
 
+# The ETag must survive between polls (latest_build runs in a command substitution), or every
+# poll counts against GitHub's rate limit. A fake curl records whether it was sent If-None-Match.
+cat > "$T/bin/curl" <<'CURL'
+#!/bin/bash
+hdr=""; out=""; sent=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -D) hdr=$2; shift ;;
+    -o) out=$2; shift ;;
+    -H) case "$2" in If-None-Match*) sent=$2 ;; esac; shift ;;
+  esac
+  shift
+done
+echo "$sent" >> "$FAKE/curl-sent"
+if [ -n "$sent" ]; then printf '304'; exit 0; fi
+printf 'HTTP/2 200
+ETag: W/"abc"
+' > "$hdr"
+echo '{"workflow_runs":[{"head_sha": "0123456789012345678901234567890123456789"}]}' > "$out"
+printf '200'
+CURL
+chmod +x "$T/bin/curl"
+rm -f "$FAKE/curl-sent" "$T/state/etag"
+first=$(latest_build); second=$(latest_build)
+check "first poll returns the build" "$first" 0123456789012345678901234567890123456789
+check "second poll is conditional and finds nothing new" "$second" ""
+check "second poll sent If-None-Match" "$(sed -n 2p "$FAKE/curl-sent" | cut -c1-13)" "If-None-Match"
 exit $fail
