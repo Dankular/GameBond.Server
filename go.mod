@@ -18,4 +18,4 @@ require (
 	golang.org/x/net v0.62.0 // indirect
 )
 
-require github.com/Dankular/GameBond.Core v0.1.18
+require github.com/Dankular/GameBond.Core v0.1.20
