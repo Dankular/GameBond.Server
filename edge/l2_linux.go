@@ -3,6 +3,7 @@
 package edge
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -28,12 +29,13 @@ const (
 // before they reach the TAP and the other way round, so MAC cap, loop guard and storm control
 // protect the bridged domain from either side.
 type l2Edge struct {
-	fd   int // the TAP, or in gateway mode an eventfd that wakes the loop when the gateway has frames
-	name string
-	sw   *bond.L2Switch
-	gw   *l2gw.Gateway
-	qmu  sync.Mutex
-	q    [][]byte // frames the gateway produced, drained by the packet loop
+	fd     int // the TAP, or in gateway mode an eventfd that wakes the loop when the gateway has frames
+	name   string
+	sw     *bond.L2Switch
+	gw     *l2gw.Gateway
+	bridge *L2Bridge // the section the gateway was started with
+	qmu    sync.Mutex
+	q      [][]byte // frames the gateway produced, drained by the packet loop
 	// counters touched only by the packet loop, read through Stats
 	toTap, fromTap, tapFull, switchDrops atomic.Uint64
 }
@@ -96,13 +98,103 @@ func openGateway(c *L2Config) (*l2Edge, error) {
 	if err != nil {
 		return nil, err
 	}
-	e := &l2Edge{fd: fd, name: "gateway", sw: l2Switch(c, "gateway")}
+	e := &l2Edge{fd: fd, name: "gateway", sw: l2Switch(c, "gateway"), bridge: b}
 	cfg.Out = e.enqueue
 	if e.gw, err = l2gw.New(cfg); err != nil {
 		unix.Close(fd)
 		return nil, err
 	}
+	if b.Policy != nil {
+		if err := e.applyPolicy(b); err != nil {
+			e.close()
+			return nil, err
+		}
+	}
+	activeL2.Store(e)
 	return e, nil
+}
+
+// activeL2 is the running gateway edge, so a config reload can reach it.
+var activeL2 atomic.Pointer[l2Edge]
+
+// policyFor turns the config section into the gateway's rule set.
+func policyFor(b *L2Bridge) (l2gw.Policy, error) {
+	var p l2gw.Policy
+	for _, h := range b.Hosts {
+		mac, err := net.ParseMAC(h.MAC)
+		if err != nil {
+			return p, err
+		}
+		ip, err := netip.ParseAddr(h.IP)
+		if err != nil {
+			return p, err
+		}
+		p.Hosts = append(p.Hosts, l2gw.Host{MAC: mac, IP: ip, Name: h.Name})
+	}
+	rule := func(r L2DeviceRule) (l2gw.DeviceRule, error) {
+		out := l2gw.DeviceRule{Deny: r.Deny, AllowPrivate: r.AllowPrivate, MaxFlows: r.MaxFlows}
+		for _, port := range r.BlockPorts {
+			out.BlockPorts = append(out.BlockPorts, uint16(port))
+		}
+		for _, n := range r.BlockNets {
+			pfx, err := netip.ParsePrefix(n)
+			if err != nil {
+				return out, err
+			}
+			out.BlockNets = append(out.BlockNets, pfx)
+		}
+		return out, nil
+	}
+	if b.Policy == nil {
+		return p, nil
+	}
+	p.Version = b.Policy.Version
+	var err error
+	if p.Default, err = rule(b.Policy.Default); err != nil {
+		return p, err
+	}
+	for _, d := range b.Policy.Devices {
+		mac, err := net.ParseMAC(d.MAC)
+		if err != nil {
+			return p, err
+		}
+		r, err := rule(d.L2DeviceRule)
+		if err != nil {
+			return p, err
+		}
+		p.Devices = append(p.Devices, l2gw.DevicePolicy{MAC: mac, Name: d.Name, Rule: r})
+	}
+	return p, nil
+}
+
+func (e *l2Edge) applyPolicy(b *L2Bridge) error {
+	p, err := policyFor(b)
+	if err != nil {
+		return err
+	}
+	return e.gw.SetPolicy(p)
+}
+
+// ReloadL2 applies the l2.bridge hosts and policy of a freshly read config to the running gateway,
+// without a restart. The address, pool and lease time still need one: changing them under live
+// leases would strand devices, so a change there is refused.
+func ReloadL2(data []byte) error {
+	e := activeL2.Load()
+	if e == nil || e.gw == nil {
+		return errors.New("no Layer 2 gateway is running")
+	}
+	c, _, _, _, err := DecodeConfig(data)
+	if err != nil {
+		return err
+	}
+	if c.L2 == nil || !c.L2.Enabled || c.L2.Bridge == nil {
+		return errors.New("the new config has no l2.bridge section")
+	}
+	if e.bridge != nil && (c.L2.Bridge.Address != e.bridge.Address || c.L2.Bridge.DHCPStart != e.bridge.DHCPStart ||
+		c.L2.Bridge.DHCPEnd != e.bridge.DHCPEnd || c.L2.Bridge.Lease != e.bridge.Lease) {
+		return errors.New("address, pool and lease changes need a restart")
+	}
+	return e.applyPolicy(c.L2.Bridge)
 }
 
 // enqueue is called from the gateway's goroutines; the packet loop does the sending.
@@ -227,6 +319,7 @@ func (e *l2Edge) Stats(now time.Time) map[string]any {
 			"blocked": g.Blocked, "dial_failed": g.DialFailed, "leases": g.Leases,
 			"dhcp_discover": g.DHCPDiscover, "dhcp_request": g.DHCPRequest, "dhcp_ack": g.DHCPAck, "dhcp_nak": g.DHCPNak,
 			"frames_in": g.FramesIn, "frames_out": g.FramesOut,
+			"policy_version": e.gw.PolicyVersion(), "draining": e.gw.Draining(), "devices": e.gw.DeviceStats(),
 		}, "active_flows": e.gw.ActiveFlows()}
 	}
 	st2 := map[string]any{
@@ -241,4 +334,15 @@ func (e *l2Edge) Stats(now time.Time) map[string]any {
 		st2[k] = v
 	}
 	return st2
+}
+
+// SetL2Draining makes the gateway refuse new flows while existing ones carry on; it is how an exit
+// empties itself before an update. It reports whether a gateway is running.
+func SetL2Draining(on bool) bool {
+	e := activeL2.Load()
+	if e == nil || e.gw == nil {
+		return false
+	}
+	e.gw.SetDraining(on)
+	return true
 }

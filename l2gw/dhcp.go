@@ -74,14 +74,8 @@ func (d *dhcpServer) init(cfg *Config) error {
 	d.static = map[[6]byte]netip.Addr{}
 	d.staticI = map[netip.Addr]bool{}
 	d.banned = map[netip.Addr]time.Time{}
-	for _, h := range cfg.Hosts {
-		if len(h.MAC) != 6 || !pfx.Contains(h.IP) || h.IP == gw {
-			return errors.New("l2gw: fixed host outside the subnet")
-		}
-		var m [6]byte
-		copy(m[:], h.MAC)
-		d.static[m] = h.IP
-		d.staticI[h.IP] = true
+	if err := d.setHosts(cfg.Hosts); err != nil {
+		return err
 	}
 	return nil
 }
@@ -346,4 +340,63 @@ func (g *Gateway) startDHCP(ctx context.Context) error {
 		}
 	}()
 	return nil
+}
+
+// setHosts replaces the fixed leases. A held lease that now conflicts with a fixed address is dropped,
+// so the device that owned it re-requests and is told to use the right one.
+func (d *dhcpServer) setHosts(hosts []Host) error {
+	pfx, gw := d.cfg.Address, d.cfg.Address.Addr()
+	static := map[[6]byte]netip.Addr{}
+	staticI := map[netip.Addr]bool{}
+	for _, h := range hosts {
+		if len(h.MAC) != 6 || !pfx.Contains(h.IP) || h.IP == gw {
+			return errors.New("l2gw: fixed host outside the subnet")
+		}
+		var m [6]byte
+		copy(m[:], h.MAC)
+		if staticI[h.IP] {
+			return errors.New("l2gw: two fixed hosts share an address")
+		}
+		static[m] = h.IP
+		staticI[h.IP] = true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.static, d.staticI = static, staticI
+	for mac, l := range d.byMAC {
+		if fixed, ok := static[mac]; ok && fixed != l.ip {
+			delete(d.byIP, l.ip)
+			delete(d.byMAC, mac)
+		} else if _, isFixed := static[mac]; !isFixed && staticI[l.ip] {
+			delete(d.byIP, l.ip)
+			delete(d.byMAC, mac)
+		}
+	}
+	return nil
+}
+
+// macFor says which device holds ip: a live lease, or a fixed host.
+func (d *dhcpServer) macFor(ip netip.Addr) ([6]byte, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if l, ok := d.byIP[ip]; ok && time.Now().Before(l.expires) {
+		return l.mac, true
+	}
+	for mac, a := range d.static {
+		if a == ip {
+			return mac, true
+		}
+	}
+	return [6]byte{}, false
+}
+
+// ipFor is the address a device holds.
+func (d *dhcpServer) ipFor(mac [6]byte) (netip.Addr, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if l, ok := d.byMAC[mac]; ok && time.Now().Before(l.expires) {
+		return l.ip, true
+	}
+	a, ok := d.static[mac]
+	return a, ok
 }

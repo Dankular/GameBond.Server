@@ -80,6 +80,84 @@ type L2Bridge struct {
 	Lease     string   `json:"lease"`      // lease time such as 12h, default 12h
 	DNS       []string `json:"dns"`        // resolvers handed out, default 1.1.1.1 and 9.9.9.9
 	Hosts     []L2Host `json:"hosts"`      // fixed leases by MAC
+	// Policy is the live rule set: per-device limits applied to the next flow. It can be reloaded
+	// (SIGHUP) without restarting the exit; hosts above are reloaded with it.
+	Policy *L2Policy `json:"policy"`
+}
+
+// L2Policy is the control-plane document for the gateway.
+type L2Policy struct {
+	Version int64            `json:"version"` // bumped by whoever pushes it; shown in the stats
+	Default L2DeviceRule     `json:"default"`
+	Devices []L2DevicePolicy `json:"devices"`
+}
+
+// L2DevicePolicy is the rule for one MAC.
+type L2DevicePolicy struct {
+	MAC  string `json:"mac"`
+	Name string `json:"name"`
+	L2DeviceRule
+}
+
+// L2DeviceRule limits what a device may open.
+type L2DeviceRule struct {
+	Deny         bool     `json:"deny"`
+	AllowPrivate bool     `json:"allow_private"`
+	BlockPorts   []int    `json:"block_ports"`
+	BlockNets    []string `json:"block_nets"`
+	MaxFlows     int      `json:"max_flows"`
+}
+
+func (r *L2DeviceRule) validate(where string) error {
+	if r.MaxFlows < 0 || r.MaxFlows > 100000 {
+		return fmt.Errorf("%s.max_flows must be 0 to 100000", where)
+	}
+	if len(r.BlockPorts) > 64 || len(r.BlockNets) > 64 {
+		return fmt.Errorf("%s takes at most 64 block_ports and 64 block_nets", where)
+	}
+	for _, p := range r.BlockPorts {
+		if p < 1 || p > 65535 {
+			return fmt.Errorf("%s.block_ports has a bad port", where)
+		}
+	}
+	for _, n := range r.BlockNets {
+		if _, err := netip.ParsePrefix(n); err != nil {
+			return fmt.Errorf("%s.block_nets %q is not a prefix", where, n)
+		}
+	}
+	return nil
+}
+
+func (p *L2Policy) validate() error {
+	if p.Version < 0 {
+		return fmt.Errorf("l2.bridge.policy.version must not be negative")
+	}
+	if len(p.Devices) > 256 {
+		return fmt.Errorf("l2.bridge.policy.devices takes at most 256 entries")
+	}
+	if err := p.Default.validate("l2.bridge.policy.default"); err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	for i := range p.Devices {
+		d := &p.Devices[i]
+		hw, err := net.ParseMAC(d.MAC)
+		if err != nil || len(hw) != 6 || hw[0]&1 == 1 {
+			return fmt.Errorf("l2.bridge.policy.devices[%d].mac is not a unicast MAC", i)
+		}
+		d.MAC = hw.String()
+		if seen[d.MAC] {
+			return fmt.Errorf("l2.bridge.policy.devices has two rules for %s", d.MAC)
+		}
+		seen[d.MAC] = true
+		if !hostNameRE.MatchString(d.Name) {
+			return fmt.Errorf("l2.bridge.policy.devices[%d].name must be letters, digits and dashes", i)
+		}
+		if err := d.L2DeviceRule.validate(fmt.Sprintf("l2.bridge.policy.devices[%d]", i)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // L2Host pins an address to a MAC.
@@ -160,6 +238,9 @@ func (b *L2Bridge) validate() error {
 		if !hostNameRE.MatchString(h.Name) {
 			return fmt.Errorf("l2.bridge.hosts[%d].name must be letters, digits and dashes", i)
 		}
+	}
+	if b.Policy != nil {
+		return b.Policy.validate()
 	}
 	return nil
 }

@@ -89,6 +89,8 @@ type Gateway struct {
 	dhcp                dhcpServer
 	closed              atomic.Bool
 	draining            atomic.Bool
+	policy              atomic.Pointer[compiledPolicy]
+	devs                devices
 }
 
 // New builds and starts the gateway.
@@ -217,6 +219,9 @@ func (g *Gateway) ActiveFlows() int { return int(g.tcpFlows.Load() + g.udpFlows.
 // SetDraining makes the gateway refuse new flows (TCP gets a reset, UDP is dropped) while existing
 // ones continue, so devices move their next connections to the other exit.
 func (g *Gateway) SetDraining(on bool) { g.draining.Store(on) }
+
+// Draining says whether new flows are being refused.
+func (g *Gateway) Draining() bool { return g.draining.Load() }
 
 // Stats snapshots the counters.
 func (g *Gateway) Stats() Stats {

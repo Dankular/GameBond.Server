@@ -60,6 +60,7 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+	go controlLoop(ctx, *configPath)
 	var observers []func(map[string]any)
 	var restart atomic.Bool
 	// Firewall, DNS filter and intrusion detection. The manager always exists so a section saved from the portal
@@ -188,4 +189,41 @@ func serveStreamGateway(ctx context.Context) {
 	go func() { <-ctx.Done(); ep.Close() }()
 	fmt.Fprintln(os.Stdout, `{"status":"stream_gateway","bind":"10.77.0.1:4436"}`)
 	(&stream.Gateway{Ep: ep, Dial: stream.SafeDial}).Serve()
+}
+
+// drainFile is written by the update probe: while it exists the Layer 2 gateway refuses new flows,
+// so devices move to the other exit and the flows still open finish on this one.
+const drainFile = "/tmp/gamebond-draining"
+
+// controlLoop is the exit's local control surface: SIGHUP reloads the Layer 2 hosts and policy from
+// the config file, and the drain file toggles draining.
+func controlLoop(ctx context.Context, configPath string) {
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	draining := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hup:
+			raw, err := os.ReadFile(configPath)
+			if err == nil {
+				err = edge.ReloadL2(raw)
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stdout, "{\"status\":\"l2_reload_failed\",\"error\":%q}\n", err.Error())
+			} else {
+				fmt.Fprintln(os.Stdout, `{"status":"l2_reloaded"}`)
+			}
+		case <-tick.C:
+			_, err := os.Stat(drainFile)
+			if want := err == nil; want != draining && edge.SetL2Draining(want) {
+				draining = want
+				fmt.Fprintf(os.Stdout, "{\"status\":\"l2_draining\",\"on\":%t}\n", want)
+			}
+		}
+	}
 }

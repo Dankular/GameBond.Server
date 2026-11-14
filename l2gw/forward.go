@@ -41,26 +41,34 @@ func (g *Gateway) installForwarders() {
 	tcpFwd := tcp.NewForwarder(g.stack, 0, 4096, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		dst := netip.AddrPortFrom(addrOf(id.LocalAddress), id.LocalPort)
-		if g.draining.Load() || !g.allowed(dst.Addr()) {
+		release, v := g.decide(addrOf(id.RemoteAddress), dst)
+		if g.draining.Load() || v != allow {
+			if release != nil {
+				release()
+			}
 			g.blocked.Add(1)
 			r.Complete(true)
 			return
 		}
 		g.tcpFlows.Add(1)
 		g.tcpTotal.Add(1)
-		go g.tcpFlow(r, dst)
+		go func() { defer release(); g.tcpFlow(r, dst) }()
 	})
 	g.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 	udpFwd := udp.NewForwarder(g.stack, func(r *udp.ForwarderRequest) {
 		id := r.ID()
 		dst := netip.AddrPortFrom(addrOf(id.LocalAddress), id.LocalPort)
-		if g.draining.Load() || !g.allowed(dst.Addr()) {
+		release, v := g.decide(addrOf(id.RemoteAddress), dst)
+		if g.draining.Load() || v != allow {
+			if release != nil {
+				release()
+			}
 			g.blocked.Add(1)
 			return
 		}
 		g.udpFlows.Add(1)
 		g.udpTotal.Add(1)
-		go g.udpFlow(r, dst)
+		go func() { defer release(); g.udpFlow(r, dst) }()
 	})
 	g.stack.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 }

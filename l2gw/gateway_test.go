@@ -361,3 +361,59 @@ func TestARPAnswersOnlyForTheGateway(t *testing.T) {
 		t.Fatal("no ARP reply for the gateway address")
 	}
 }
+
+// A pushed policy applies to the next flow without a restart, per device, and never cuts a flow
+// that is already open.
+func TestPolicyIsLiveAndPerDevice(t *testing.T) {
+	g, out := newTestGateway(t, func(c *Config) { c.Dial = fakeInternet(t) })
+	dev := newDevice(t, g, out, "10.78.0.20") // deviceMAC holds the fixed host 10.78.0.20
+	dial := func() (net.Conn, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		return gonet.DialContextTCP(ctx, dev.s, internet, ipv4.ProtocolNumber)
+	}
+	hosts := []Host{{MAC: deviceMAC, IP: netip.MustParseAddr("10.78.0.20"), Name: "ps5"}}
+
+	open, err := dial()
+	if err != nil {
+		t.Fatal("no policy should allow:", err)
+	}
+	defer open.Close()
+
+	if err := g.SetPolicy(Policy{Version: 2, Hosts: hosts, Devices: []DevicePolicy{{MAC: deviceMAC, Rule: DeviceRule{Deny: true}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if g.PolicyVersion() != 2 {
+		t.Fatal("version not reported")
+	}
+	if c, err := dial(); err == nil {
+		c.Close()
+		t.Fatal("denied device opened a flow")
+	}
+	open.Write([]byte("x"))
+	b := make([]byte, 8)
+	open.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if n, err := open.Read(b); err != nil || n != 1 {
+		t.Fatal("the open flow was cut by the policy change", err)
+	}
+
+	if err := g.SetPolicy(Policy{Version: 3, Hosts: hosts, Devices: []DevicePolicy{{MAC: deviceMAC, Rule: DeviceRule{MaxFlows: 1}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := dial(); err == nil {
+		c.Close()
+		t.Fatal("max_flows not enforced")
+	}
+	var seen bool
+	for _, d := range g.DeviceStats() {
+		if d.IP == "10.78.0.20" && d.Denied >= 2 && d.Flows == 1 {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatalf("device stats wrong: %+v", g.DeviceStats())
+	}
+	if err := g.SetPolicy(Policy{Devices: []DevicePolicy{{MAC: net.HardwareAddr{1, 2, 3, 4, 5, 6}}}}); err == nil {
+		t.Fatal("a multicast MAC rule was accepted")
+	}
+}

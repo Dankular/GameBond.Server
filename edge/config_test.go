@@ -184,3 +184,29 @@ func TestL2BridgeSectionIsValidatedAndDefaulted(t *testing.T) {
 		}
 	}
 }
+
+func TestL2PolicyIsValidated(t *testing.T) {
+	decode := func(policy map[string]any) error {
+		input := configFixture()
+		input["l2"] = map[string]any{"enabled": true, "bridge": map[string]any{"dhcp_start": "10.78.0.100", "dhcp_end": "10.78.0.149", "policy": policy}}
+		data, _ := json.Marshal(input)
+		_, _, _, _, err := DecodeConfig(data)
+		return err
+	}
+	if err := decode(map[string]any{"version": 3, "devices": []map[string]any{
+		{"mac": "AA:BB:CC:00:11:22", "name": "ps5", "max_flows": 500, "block_ports": []int{25}, "block_nets": []string{"203.0.113.0/24"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	for name, bad := range map[string]map[string]any{
+		"multicast mac": {"devices": []map[string]any{{"mac": "01:00:5e:00:00:01"}}},
+		"duplicate":     {"devices": []map[string]any{{"mac": "aa:bb:cc:00:11:22"}, {"mac": "AA:BB:CC:00:11:22"}}},
+		"bad port":      {"default": map[string]any{"block_ports": []int{70000}}},
+		"bad net":       {"default": map[string]any{"block_nets": []string{"nope"}}},
+		"negative":      {"default": map[string]any{"max_flows": -1}},
+		"version":       {"version": -2},
+	} {
+		if decode(bad) == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}
