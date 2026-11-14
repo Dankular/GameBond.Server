@@ -31,14 +31,17 @@ WATCHDOG_MAX_RESTARTS=${GAMEBOND_WATCHDOG_MAX_RESTARTS:-3}
 WATCHDOG_WINDOW=${GAMEBOND_WATCHDOG_WINDOW:-600}
 INTERVAL=${GAMEBOND_PROBE_INTERVAL:-10}
 READY_TRIES=300   # x 0.1 s
-# Peer gating: exits advertise their state (probe-status.py) and never update while a peer is
-# updating. GAMEBOND_PEERS is a space-separated list of peer status URLs; rank breaks ties
-# (lower rank updates first; primary 0, backup 1). A peer that is unreachable or silent does not block.
+# Peer gating: exits advertise their state in a private Gitea repo (one file per node) and never
+# update while a peer is updating. GAMEBOND_PEERS is a space-separated list of peer node names;
+# rank breaks ties (lower rank updates first; primary 0, backup 1). A peer that has not been
+# heard from does not block. Needs GAMEBOND_GITEA_URL; the token needs write access to the repo.
 PEERS=${GAMEBOND_PEERS:-}
-PEER_TOKEN_FILE=${GAMEBOND_PEER_TOKEN_FILE:-/etc/gamebond/peer.token}
+STATE_REPO=${GAMEBOND_STATE_REPO:-dan/exit-state}
+STATE_TOKEN_FILE=${GAMEBOND_STATE_TOKEN_FILE:-/etc/gamebond/state.token}
 NODE_NAME=${GAMEBOND_NODE_NAME:-$(hostname)}
 NODE_RANK=${GAMEBOND_PROBE_RANK:-1}
 PEER_MAX_WAIT=${GAMEBOND_PEER_MAX_WAIT:-600}
+HEARTBEAT=${GAMEBOND_HEARTBEAT:-300}
 mkdir -p "$STATE"
 
 log() { echo "$(date -Is) $*"; }
@@ -115,6 +118,24 @@ publish_status() {
   fi
   printf '{"node":"%s","rank":%s,"state":"%s","image":"%s","rejected":"%s","at":%s}
 '     "$NODE_NAME" "$NODE_RANK" "$state" "$(current_image)" "$(cat "$STATE/rejected" 2>/dev/null)" "$(date +%s)"     > "$STATE/status.json.new" && mv "$STATE/status.json.new" "$STATE/status.json"
+  push_state
+}
+
+# push_state copies status.json to the state repo when the state changed or HEARTBEAT seconds
+# passed (each push is a commit, so a steady node writes rarely). Failures are ignored: an
+# unreachable repo only means the peer cannot see us, which never blocks anything.
+push_state() {
+  [ -n "$PEERS" ] && [ -n "$GITEA_URL" ] || return 0
+  local sig now last tok api sha b64
+  sig=$(jq -r '[.state,.image,.rejected]|join("|")' "$STATE/status.json" 2>/dev/null) || return 0
+  now=$(date +%s); last=$(cat "$STATE/pushed-at" 2>/dev/null || echo 0)
+  [ "$sig" = "$(cat "$STATE/pushed-sig" 2>/dev/null)" ] && [ $((now - last)) -lt "$HEARTBEAT" ] && return 0
+  tok=$(cat "$STATE_TOKEN_FILE" 2>/dev/null); api="$GITEA_URL/api/v1/repos/$STATE_REPO/contents/$NODE_NAME.json"
+  sha=$(curl -sS -m 8 -H "Authorization: token $tok" "$api" 2>/dev/null | jq -r '.sha // empty' 2>/dev/null)
+  b64=$(base64 -w0 "$STATE/status.json")
+  if curl -sS -m 8 -o /dev/null -f -X "${sha:+PUT}${sha:-POST}" -H "Authorization: token $tok" -H 'Content-Type: application/json'       -d "{\"content\":\"$b64\",\"message\":\"$NODE_NAME $sig\"${sha:+,\"sha\":\"$sha\"}}" "$api" 2>/dev/null; then
+    echo "$sig" > "$STATE/pushed-sig"; echo "$now" > "$STATE/pushed-at"
+  fi
 }
 
 # peer_blocks SHA succeeds (blocks) when an update to SHA should wait for a peer: a peer is
@@ -123,15 +144,15 @@ publish_status() {
 peer_blocks() {
   [ -n "$PEERS" ] || return 1
   local want="$IMAGE_REPO:$1" tok now peer body f state rank image rejected at why="" t0
-  tok=$(cat "$PEER_TOKEN_FILE" 2>/dev/null); now=$(date +%s)
+  tok=$(cat "$STATE_TOKEN_FILE" 2>/dev/null); now=$(date +%s)
   for peer in $PEERS; do
-    body=$(curl -sS -m 4 -H "X-Probe-Token: $tok" "$peer/status" 2>/dev/null) || continue
+    body=$(curl -sS -m 8 -f -H "Authorization: token $tok" "$GITEA_URL/api/v1/repos/$STATE_REPO/raw/$peer.json" 2>/dev/null) || continue
     f=$(printf '%s' "$body" | jq -r '[.state // "-", (.rank // 1), .image // "-", .rejected // "-", (.at // 0)] | @tsv' 2>/dev/null) || continue
     IFS=$'	' read -r state rank image rejected at <<<"$f"
     case "$state" in
-      updating|rolling_back) [ $((now - at)) -le 300 ] && why="$peer is $state" ;;
-      starting) [ $((now - at)) -le 120 ] && why="$peer is starting" ;;
-      ready) [ $((now - at)) -le 120 ] && [ "$rank" -lt "$NODE_RANK" ] && [ "$image" != "$want" ] && [ "$rejected" != "$1" ] && why="$peer goes first" ;;
+      updating|rolling_back) [ $((now - at)) -le 600 ] && why="$peer is $state" ;;
+      starting) [ $((now - at)) -le 600 ] && why="$peer is starting" ;;
+      ready) [ $((now - at)) -le $((HEARTBEAT * 5)) ] && [ "$rank" -lt "$NODE_RANK" ] && [ "$image" != "$want" ] && [ "$rejected" != "$1" ] && why="$peer goes first" ;;
     esac
     [ -n "$why" ] && break
   done

@@ -131,7 +131,7 @@ printf '{"node":"p","rank":$2,"state":"$1","image":"$3","rejected":"$4","at":%s}
 CURL
   chmod +x "$T/bin/curl"
 }
-PEERS=http://peer:8099; NODE_RANK=1; IMAGE_REPO=img; rm -f "$T/state/peer-wait"
+PEERS=peer; GITEA_URL=https://gitea.example; NODE_RANK=1; IMAGE_REPO=img; rm -f "$T/state/peer-wait"
 SHA=eeee000000000000000000000000000000000005
 peer updating 0 img:old - 5
 peer_blocks $SHA; check "updating peer blocks" "$?" 0
@@ -156,7 +156,7 @@ peer_blocks $SHA; check "unreachable peer does not block" "$?" 1
 peer updating 0 img:old - 5; rm -f "$T/state/peer-wait"
 peer_blocks $SHA; echo $(( $(date +%s) - 700 )) > "$T/state/peer-wait"
 peer_blocks $SHA; check "wait is bounded by PEER_MAX_WAIT" "$?" 1
-PEERS=
+PEERS=; GITEA_URL=
 reset; echo "running|healthy" > "$FAKE/state"; publish_status
 check "published state is ready" "$(jq -r .state "$T/state/status.json")" ready
 echo "exited|" > "$FAKE/state"; publish_status
