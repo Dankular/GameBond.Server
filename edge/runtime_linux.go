@@ -92,12 +92,23 @@ func Run(ctx context.Context, c Config, options bond.SessionOptions, address net
 		return err
 	}
 	defer unix.Close(tun)
+	var l2 *l2Edge
+	if c.L2 != nil && c.L2.Enabled {
+		if l2, err = openL2(c.L2); err != nil {
+			return err
+		}
+		defer l2.close()
+	}
 	poller, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(poller)
-	for _, fd := range []int{sock, tun} {
+	watched := []int{sock, tun}
+	if l2 != nil {
+		watched = append(watched, l2.fd)
+	}
+	for _, fd := range watched {
 		if err = unix.EpollCtl(poller, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)}); err != nil {
 			return err
 		}
@@ -109,6 +120,12 @@ func Run(ctx context.Context, c Config, options bond.SessionOptions, address net
 		return unix.Sendto(sock, d.Frame, unix.MSG_DONTWAIT, &unix.SockaddrInet4{Port: int(d.Endpoint.Port()), Addr: d.Endpoint.Addr().As4()})
 	}
 	inject := func(packet []byte) error {
+		if len(packet) > 0 && packet[0] == bond.L2Marker {
+			if l2 == nil {
+				return bond.ErrPacketRejected
+			}
+			return l2.deliver(packet, time.Now())
+		}
 		n, err := unix.Write(tun, packet)
 		if err == unix.EAGAIN || err == unix.ENOBUFS || err == unix.ENETDOWN {
 			return bond.ErrWouldBlock
@@ -177,6 +194,20 @@ func Run(ctx context.Context, c Config, options bond.SessionOptions, address net
 					if err = engine.UDP(buffer[:size], netip.AddrPortFrom(netip.AddrFrom4(peer.Addr), uint16(peer.Port)), time.Now(), write); err != nil {
 						return err
 					}
+				} else if l2 != nil && fd == l2.fd {
+					size, err := unix.Read(l2.fd, buffer)
+					if err == unix.EAGAIN {
+						break
+					}
+					if err == unix.EINTR {
+						continue
+					}
+					if err != nil {
+						return err
+					}
+					if size > 0 {
+						l2.fromTapFrame(buffer[:size], engine, time.Now())
+					}
 				} else if fd == tun {
 					size, err := unix.Read(tun, buffer)
 					if err == unix.EAGAIN {
@@ -206,6 +237,9 @@ func Run(ctx context.Context, c Config, options bond.SessionOptions, address net
 		if !now.Before(reportAt) {
 			stats := engine.Stats(now)
 			stats["observed_at"] = now.UTC().Format(time.RFC3339Nano)
+			if l2 != nil {
+				stats["l2"] = l2.Stats(now)
+			}
 			for _, observe := range observers {
 				observe(stats)
 			}

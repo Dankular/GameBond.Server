@@ -18,6 +18,6 @@ require (
 )
 
 require (
-	github.com/Dankular/GameBond.Core v0.1.32
+	github.com/Dankular/GameBond.Core v0.1.33
 	golang.org/x/net v0.62.0
 )

@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Dankular/GameBond.Core/bond"
@@ -48,6 +49,42 @@ type Config struct {
 	Protection      string                      `json:"protection"` // ignored: every packet is always duplicated
 	ParityRowsMin   int                         `json:"parity_rows_min"`
 	ParityRowsMax   int                         `json:"parity_rows_max"`
+	L2              *L2Config                   `json:"l2"`
+}
+
+// L2Config turns on Ethernet carriage: a TAP port beside the TUN. Frames cross the bond like IP
+// packets and pass the transport's switch core (MAC learning and cap, loop guard, storm control).
+// The TAP is meant to be joined to a bridge by the host or container entrypoint.
+type L2Config struct {
+	Enabled           bool    `json:"enabled"`
+	TapName           string  `json:"tap_name"`
+	FrameMTU          int     `json:"frame_mtu"`
+	MACLimit          int     `json:"mac_limit"`
+	BroadcastPPS      float64 `json:"broadcast_pps"`
+	MulticastPPS      float64 `json:"multicast_pps"`
+	UnknownUnicastPPS float64 `json:"unknown_unicast_pps"`
+}
+
+func (l *L2Config) validate() error {
+	if l == nil || !l.Enabled {
+		return nil
+	}
+	if l.TapName == "" {
+		l.TapName = "gamebond-tap0"
+	}
+	if len(l.TapName) > 15 || strings.ContainsAny(l.TapName, " /") {
+		return fmt.Errorf("l2.tap_name must be a valid interface name")
+	}
+	if l.FrameMTU == 0 {
+		l.FrameMTU = bond.DefaultL2FrameMTU
+	}
+	if l.FrameMTU < 600 || l.FrameMTU > 1500 {
+		return fmt.Errorf("l2.frame_mtu must be 600-1500")
+	}
+	if l.MACLimit < 0 || l.MACLimit > 4096 || l.BroadcastPPS < 0 || l.MulticastPPS < 0 || l.UnknownUnicastPPS < 0 {
+		return fmt.Errorf("l2 limits must not be negative (mac_limit <= 4096)")
+	}
+	return nil
 }
 
 func DecodeConfig(data []byte) (Config, bond.SessionOptions, netip.AddrPort, []byte, error) {
@@ -92,6 +129,12 @@ func DecodeConfig(data []byte) (Config, bond.SessionOptions, netip.AddrPort, []b
 	session, err := hex.DecodeString(c.Session)
 	if err != nil || len(session) != 16 {
 		return fail(fmt.Errorf("invalid session identifier"))
+	}
+	if err := c.L2.validate(); err != nil {
+		return fail(err)
+	}
+	if c.L2 != nil && c.L2.Enabled {
+		options.L2, options.L2FrameMTU = true, c.L2.FrameMTU
 	}
 	options.MTU = c.MTU
 	options.ClientIP = netip.MustParseAddr(c.ClientIP)

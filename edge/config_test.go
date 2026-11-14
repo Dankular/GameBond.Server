@@ -114,3 +114,36 @@ func TestSecurityBlockIsValidatedAtLoad(t *testing.T) {
 		}
 	}
 }
+
+func TestL2SectionIsOptInValidatedAndReachesSessionOptions(t *testing.T) {
+	decode := func(l2 any) (Config, bool, int, error) {
+		input := configFixture()
+		if l2 != nil {
+			input["l2"] = l2
+		}
+		data, _ := json.Marshal(input)
+		c, options, _, _, err := DecodeConfig(data)
+		return c, options.L2, options.L2FrameMTU, err
+	}
+	if _, on, _, err := decode(nil); err != nil || on {
+		t.Fatal("L2 must be off unless configured", err, on)
+	}
+	if _, on, _, err := decode(map[string]any{"enabled": false}); err != nil || on {
+		t.Fatal("disabled L2 section must stay off", err, on)
+	}
+	c, on, mtu, err := decode(map[string]any{"enabled": true, "mac_limit": 8, "broadcast_pps": 200})
+	if err != nil || !on || mtu != 1394 || c.L2.TapName != "gamebond-tap0" {
+		t.Fatal("defaults not applied", err, on, mtu)
+	}
+	for name, bad := range map[string]map[string]any{
+		"mtu low":   {"enabled": true, "frame_mtu": 100},
+		"mtu high":  {"enabled": true, "frame_mtu": 9000},
+		"long name": {"enabled": true, "tap_name": "this-name-is-too-long"},
+		"negative":  {"enabled": true, "broadcast_pps": -1},
+		"unknown":   {"enabled": true, "vlan": 10},
+	} {
+		if _, _, _, err := decode(bad); err == nil {
+			t.Fatal("accepted", name)
+		}
+	}
+}
