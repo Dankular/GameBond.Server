@@ -8,7 +8,8 @@ func AES67() Profile {
 		ID:   "aes67",
 		Name: "AES67",
 		Settings: []Setting{
-			{Key: "timing.ptp-version", Value: "ieee-1588-2008", Rationale: "AES67 synchronization uses the IEEE 1588-2008 Precision Time Protocol profile.", SourceURL: aes67Standard},
+			{Key: "timing.ptp-version", Value: "ieee-1588-compatible", Rationale: "AES67 synchronization uses its media profile over IEEE 1588; AES67-2023 clarifies interoperability handling for IEEE 1588-2008 and IEEE 1588-2019.", SourceURL: aes67Standard},
+			{Key: "qos.queue.order", Value: "46>34", Rationale: "AES67 clock traffic (EF/DSCP 46) is prioritized above RTP/RTCP media traffic (AF41/DSCP 34).", SourceURL: aes67Standard},
 			{Key: "qos.dscp.ptp", Value: "46", Rationale: "AES67 marks PTP clock event traffic for Expedited Forwarding (EF).", SourceURL: aes67Standard},
 			{Key: "qos.dscp.audio", Value: "34", Rationale: "AES67 marks RTP/RTCP media traffic for AF41 below clock traffic.", SourceURL: aes67Standard},
 			{Key: "qos.dscp.other", Value: "0", Rationale: "AES67 leaves PTP management, discovery, and connection-management traffic in Default Forwarding (DF).", SourceURL: aes67Standard},

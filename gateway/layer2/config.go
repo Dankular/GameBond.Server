@@ -2,14 +2,19 @@ package layer2
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+
+	"github.com/Dankular/GameBond.Server/gateway/layer2/avprofiles"
 )
 
 const MaxConfigBytes = 1 << 20
@@ -19,25 +24,59 @@ const MaxMACACLRules = 256
 const MaxIPACLRules = 256
 
 var (
-	stableIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
-	ifNamePattern   = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,15}$`)
+	stableIDPattern   = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
+	ifNamePattern     = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,15}$`)
+	radiusHostPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$`)
+	nasIDPattern      = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,253}$`)
 )
+
+func enabled(value *bool) bool { return value != nil && *value }
+
+func validRadiusHostname(value string) bool {
+	return len(value) <= 253 && radiusHostPattern.MatchString(value)
+}
+
+func validLLDPMEDApplication(value string) bool {
+	switch value {
+	case "voice", "voice-signaling", "guest-voice", "guest-voice-signaling", "softphone-voice", "video-conferencing", "streaming-video", "video-signaling":
+		return true
+	default:
+		return false
+	}
+}
 
 // Config is the versioned Layer 2 desired topology. References use stable IDs;
 // interface names are resolved on the managed host when a plan is prepared.
 type Config struct {
-	Version             int                  `json:"version"`
-	Interfaces          []Interface          `json:"interfaces"`
-	Bridges             []Bridge             `json:"bridges"`
-	Networks            []Network            `json:"networks"`
-	Overrides           []DeviceOverride     `json:"virtual_network_overrides,omitempty"`
-	MACPortRestrictions []MACPortRestriction `json:"mac_port_restrictions,omitempty"`
-	MACBlocks           []MACBlock           `json:"mac_address_blocks,omitempty"`
-	MACACL              []MACACLRule         `json:"mac_acls,omitempty"`
-	IPACL               []IPACLRule          `json:"ip_acls,omitempty"`
-	EgressRates         []EgressRateLimit    `json:"egress_rate_limits,omitempty"`
-	FlowControl         []FlowControlPolicy  `json:"flow_control,omitempty"`
-	Bonds               []Bond               `json:"bonds,omitempty"`
+	Version                  int                           `json:"version"`
+	Interfaces               []Interface                   `json:"interfaces"`
+	Bridges                  []Bridge                      `json:"bridges"`
+	Networks                 []Network                     `json:"networks"`
+	Overrides                []DeviceOverride              `json:"virtual_network_overrides,omitempty"`
+	MACPortRestrictions      []MACPortRestriction          `json:"mac_port_restrictions,omitempty"`
+	MACBlocks                []MACBlock                    `json:"mac_address_blocks,omitempty"`
+	MACACL                   []MACACLRule                  `json:"mac_acls,omitempty"`
+	IPACL                    []IPACLRule                   `json:"ip_acls,omitempty"`
+	NetworkACL               []NetworkACLRule              `json:"inter_network_acls,omitempty"`
+	EgressRates              []EgressRateLimit             `json:"egress_rate_limits,omitempty"`
+	StormControl             []StormControl                `json:"storm_control,omitempty"`
+	MulticastBroadcastLimits []MulticastBroadcastRateLimit `json:"multicast_broadcast_rate_limits,omitempty"`
+	FlowControl              []FlowControlPolicy           `json:"flow_control,omitempty"`
+	QoS                      []QoSPolicy                   `json:"qos,omitempty"`
+	PortMirrors              []PortMirror                  `json:"port_mirrors,omitempty"`
+	Bonds                    []Bond                        `json:"bonds,omitempty"`
+	DHCPGuard                []DHCPGuardPort               `json:"dhcp_guard,omitempty"`
+	PortAuth                 []PortAuth                    `json:"port_auth,omitempty"`
+	AVProfiles               []AVProfileSelection          `json:"pro_av_profiles,omitempty"`
+}
+
+// AVProfileSelection records an evidence-backed AV profile for a managed
+// network. It is persisted with the topology so operators can review the
+// profile's recommendations alongside the effective bridge configuration.
+// Profile settings that the Linux gateway cannot own remain advisory.
+type AVProfileSelection struct {
+	Profile string `json:"profile"`
+	Network string `json:"network"`
 }
 
 type Interface struct {
@@ -61,22 +100,84 @@ type Bridge struct {
 	ID            string       `json:"id"`
 	Name          string       `json:"name"`
 	VLANFiltering bool         `json:"vlan_filtering"`
+	STPPriority   *uint16      `json:"stp_priority,omitempty"`
+	STPEnabled    *bool        `json:"stp_enabled,omitempty"`
+	STPMode       string       `json:"stp_mode,omitempty"`
+	IGMPSnooping  *bool        `json:"igmp_snooping,omitempty"`
+	IGMPQuerier   *bool        `json:"igmp_querier,omitempty"`
 	Ports         []BridgePort `json:"ports"`
 }
 
 type BridgePort struct {
-	Interface       string   `json:"interface"`
-	UntaggedNetwork string   `json:"untagged_network,omitempty"`
-	TaggedNetworks  []string `json:"tagged_networks,omitempty"`
-	Isolated        bool     `json:"isolated,omitempty"`
+	Interface            string          `json:"interface"`
+	STPPriority          *uint8          `json:"stp_priority,omitempty"`
+	STPPathCost          *uint32         `json:"stp_path_cost,omitempty"`
+	STPRootBlock         *bool           `json:"stp_root_block,omitempty"`
+	STPEdge              *bool           `json:"stp_edge,omitempty"`
+	STPPointToPoint      string          `json:"stp_point_to_point,omitempty"`
+	STPBPDUGuard         *bool           `json:"stp_bpdu_guard,omitempty"`
+	UntaggedNetwork      string          `json:"untagged_network,omitempty"`
+	TaggedNetworks       []string        `json:"tagged_networks,omitempty"`
+	VoiceNetwork         string          `json:"voice_network,omitempty"`
+	LLDPMED              []LLDPMEDPolicy `json:"lldp_med,omitempty"`
+	Isolated             bool            `json:"isolated,omitempty"`
+	IGMPFastLeave        *bool           `json:"igmp_fast_leave,omitempty"`
+	IGMPSharedDownstream *bool           `json:"igmp_shared_downstream,omitempty"`
+	IGMPRouterPort       *bool           `json:"igmp_router_port,omitempty"`
+	LoopProtection       *bool           `json:"loop_protection,omitempty"`
+}
+
+// LLDPMEDPolicy advertises a documented application network policy to peers.
+type LLDPMEDPolicy struct {
+	Application string `json:"application"`
+	Network     string `json:"network,omitempty"`
+	Tagged      bool   `json:"tagged,omitempty"`
+	Priority    *uint8 `json:"priority,omitempty"`
+	DSCP        *uint8 `json:"dscp,omitempty"`
+}
+
+// DHCPGuardPort marks a bridge port as a trusted DHCP server/relay path and
+// optionally rate-limits DHCP packets received from that port.
+type DHCPGuardPort struct {
+	Interface        string `json:"interface"`
+	Trusted          bool   `json:"trusted"`
+	RateLimitPPS     uint32 `json:"rate_limit_pps,omitempty"`
+	ValidateBindings bool   `json:"validate_bindings,omitempty"`
+}
+
+// PortAuth configures wired IEEE 802.1X authentication for a managed bridge
+// port. RADIUS credentials are referenced from a root-owned file and never
+// embedded in the API configuration.
+type PortAuth struct {
+	Interface     string `json:"interface"`
+	ExclusivePort bool   `json:"exclusive_port"`
+	RadiusServer  string `json:"radius_server"`
+	RadiusPort    uint16 `json:"radius_port"`
+	SecretFile    string `json:"secret_file"`
+	NASAddress    string `json:"nas_address"`
+	NASID         string `json:"nas_id"`
+	ReauthSeconds uint32 `json:"reauth_seconds,omitempty"`
+	FailurePolicy string `json:"failure_policy"`
 }
 
 // Network represents one VLAN-backed virtual network on a managed bridge.
 type Network struct {
-	ID     string `json:"id"`
-	Bridge string `json:"bridge"`
-	VLAN   uint16 `json:"vlan"`
-	MTU    int    `json:"mtu"`
+	ID             string `json:"id"`
+	Bridge         string `json:"bridge"`
+	VLAN           uint16 `json:"vlan"`
+	MTU            int    `json:"mtu"`
+	IGMPSnooping   *bool  `json:"igmp_snooping,omitempty"`
+	RouteInterface string `json:"route_interface,omitempty"`
+}
+
+// NetworkACLRule explicitly permits a directed flow between two routed Layer 2
+// networks. Other new flows between configured routed networks are dropped.
+type NetworkACLRule struct {
+	ID                 string `json:"id"`
+	SourceNetwork      string `json:"source_network"`
+	DestinationNetwork string `json:"destination_network"`
+	Protocol           string `json:"protocol,omitempty"`
+	Port               uint16 `json:"port,omitempty"`
 }
 
 // DeviceOverride assigns an explicitly authorized device identity to a
@@ -139,6 +240,24 @@ type EgressRateLimit struct {
 	BurstBytes uint32 `json:"burst_bytes"`
 }
 
+// StormControl applies ingress policing independently to broadcast and
+// multicast destination MAC classes. A zero rate leaves that class unlimited.
+type StormControl struct {
+	Interface        string `json:"interface"`
+	BroadcastRateBPS uint64 `json:"broadcast_rate_bps,omitempty"`
+	MulticastRateBPS uint64 `json:"multicast_rate_bps,omitempty"`
+	BurstBytes       uint32 `json:"burst_bytes"`
+}
+
+// MulticastBroadcastRateLimit applies ingress rate caps independently from
+// storm control so operators can enable these limits on selected interfaces.
+type MulticastBroadcastRateLimit struct {
+	Interface        string `json:"interface"`
+	BroadcastRateBPS uint64 `json:"broadcast_rate_bps,omitempty"`
+	MulticastRateBPS uint64 `json:"multicast_rate_bps,omitempty"`
+	BurstBytes       uint32 `json:"burst_bytes"`
+}
+
 type FlowControlPolicy struct {
 	Interface string `json:"interface"`
 	Autoneg   string `json:"autoneg"`
@@ -146,18 +265,56 @@ type FlowControlPolicy struct {
 	TX        bool   `json:"tx"`
 }
 
+// QoSPolicy configures Linux software HTB classes selected by DSCP.
+type QoSPolicy struct {
+	Interface   string     `json:"interface"`
+	LinkRateBPS uint64     `json:"link_rate_bps"`
+	Classes     []QoSClass `json:"classes"`
+}
+
+type QoSClass struct {
+	ID         uint8   `json:"id"`
+	DSCP       []uint8 `json:"dscp"`
+	RateBPS    uint64  `json:"rate_bps"`
+	CeilingBPS uint64  `json:"ceiling_bps"`
+	Priority   uint8   `json:"priority"`
+}
+
+// PortMirror copies selected source-port ingress or egress traffic to a
+// dedicated monitor interface using tc mirred mirror actions.
+type PortMirror struct {
+	Source            string `json:"source"`
+	Destination       string `json:"destination"`
+	Direction         string `json:"direction"`
+	Network           string `json:"network,omitempty"`
+	CaptureRateBPS    uint64 `json:"capture_rate_bps,omitempty"`
+	CaptureBurstBytes uint32 `json:"capture_burst_bytes,omitempty"`
+}
+
 func ipACLRuleComments(cfg Config) []string {
 	comments := make([]string, 0, len(cfg.IPACL)*2)
 	for _, rule := range cfg.IPACL {
-		if rule.Direction == "ingress" || rule.Direction == "both" {
-			comments = append(comments, "gamebond-ip-acl:"+rule.ID+":in", "gamebond-ip-acl:"+rule.ID+":host-in")
-		}
-		if rule.Direction == "egress" || rule.Direction == "both" {
-			comments = append(comments, "gamebond-ip-acl:"+rule.ID+":out", "gamebond-ip-acl:"+rule.ID+":host-out")
-		}
+		comments = append(comments, ipACLCommentsForRule(cfg, rule)...)
 	}
 	sort.Strings(comments)
 	return comments
+}
+
+func ipACLCommentsForRule(cfg Config, rule IPACLRule) []string {
+	comments := []string{}
+	if rule.Direction == "ingress" || rule.Direction == "both" {
+		comments = append(comments, ipACLRuleComment(cfg, rule, "in"), ipACLRuleComment(cfg, rule, "host-in"))
+	}
+	if rule.Direction == "egress" || rule.Direction == "both" {
+		comments = append(comments, ipACLRuleComment(cfg, rule, "out"), ipACLRuleComment(cfg, rule, "host-out"))
+	}
+	return comments
+}
+
+func ipACLRuleComment(cfg Config, rule IPACLRule, suffix string) string {
+	iface, network, port := configInterfaceByID(cfg.Interfaces, rule.Interface), configNetworkByID(cfg.Networks, rule.Network), bridgePortByInterface(cfg.Bridges, rule.Interface)
+	fingerprint := policyFingerprint(rule.ID, rule.Interface, iface.Name, rule.Network, fmt.Sprint(network.VLAN), port.UntaggedNetwork, rule.Direction, rule.Family, rule.Source, rule.Dest, rule.Protocol, fmt.Sprint(rule.Port), rule.Action)
+	return "gamebond-ip-acl:" + rule.ID + ":" + suffix + ":" + fingerprint
 }
 
 func macBlockRuleComments(cfg Config) []string {
@@ -173,21 +330,67 @@ func macBlockRuleComments(cfg Config) []string {
 func macACLRuleComments(cfg Config) []string {
 	comments := make([]string, 0, len(cfg.MACACL)*4)
 	for _, rule := range cfg.MACACL {
-		chains := []string{}
-		switch rule.Direction {
-		case "ingress":
-			chains = []string{"forward-in", "input"}
-		case "egress":
-			chains = []string{"forward-out", "output"}
-		case "both":
-			chains = []string{"forward-in", "forward-out", "input", "output"}
-		}
-		for _, chain := range chains {
-			comments = append(comments, "gamebond-mac-acl:"+rule.ID+":"+chain)
-		}
+		comments = append(comments, macACLCommentsForRule(cfg, rule)...)
 	}
 	sort.Strings(comments)
 	return comments
+}
+
+func macACLCommentsForRule(cfg Config, rule MACACLRule) []string {
+	chains := []string{}
+	switch rule.Direction {
+	case "ingress":
+		chains = []string{"forward-in", "input"}
+	case "egress":
+		chains = []string{"forward-out", "output"}
+	case "both":
+		chains = []string{"forward-in", "forward-out", "input", "output"}
+	}
+	comments := make([]string, 0, len(chains))
+	for _, chain := range chains {
+		comments = append(comments, macACLRuleComment(cfg, rule, chain))
+	}
+	return comments
+}
+
+func macACLRuleComment(cfg Config, rule MACACLRule, suffix string) string {
+	iface, network, port := configInterfaceByID(cfg.Interfaces, rule.Interface), configNetworkByID(cfg.Networks, rule.Network), bridgePortByInterface(cfg.Bridges, rule.Interface)
+	fingerprint := policyFingerprint(rule.ID, rule.Interface, iface.Name, rule.Network, fmt.Sprint(network.VLAN), port.UntaggedNetwork, rule.Direction, rule.SourceMAC, rule.DestinationMAC, rule.Action)
+	return "gamebond-mac-acl:" + rule.ID + ":" + suffix + ":" + fingerprint
+}
+
+func bridgePortByInterface(bridges []Bridge, interfaceID string) BridgePort {
+	for _, bridge := range bridges {
+		for _, port := range bridge.Ports {
+			if port.Interface == interfaceID {
+				return port
+			}
+		}
+	}
+	return BridgePort{}
+}
+
+func configInterfaceByID(interfaces []Interface, id string) Interface {
+	for _, iface := range interfaces {
+		if iface.ID == id {
+			return iface
+		}
+	}
+	return Interface{}
+}
+
+func configNetworkByID(networks []Network, id string) Network {
+	for _, network := range networks {
+		if network.ID == id {
+			return network
+		}
+	}
+	return Network{}
+}
+
+func policyFingerprint(parts ...string) string {
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return fmt.Sprintf("%x", sum[:16])
 }
 
 // DecodeConfig strictly decodes and validates a Layer 2 configuration before
@@ -293,9 +496,11 @@ func (c Config) Validate() error {
 	}
 
 	bridgeIDs := make(map[string]struct{}, len(c.Bridges))
+	bridgeConfigs := make(map[string]Bridge, len(c.Bridges))
 	bridgeNames := make(map[string]struct{}, len(c.Bridges))
 	interfaceBridge := make(map[string]string)
 	interfacePorts := make(map[string]BridgePort)
+	snoopingPorts := make(map[string]bool)
 	for i, br := range c.Bridges {
 		if !stableIDPattern.MatchString(br.ID) {
 			return fmt.Errorf("bridges[%d].id must be a lowercase stable ID", i)
@@ -304,6 +509,7 @@ func (c Config) Validate() error {
 			return fmt.Errorf("bridge ID %q is duplicated", br.ID)
 		}
 		bridgeIDs[br.ID] = struct{}{}
+		bridgeConfigs[br.ID] = br
 		if !ifNamePattern.MatchString(br.Name) || br.Name == "." || br.Name == ".." {
 			return fmt.Errorf("bridges[%d].name is not a valid Linux interface name", i)
 		}
@@ -313,9 +519,51 @@ func (c Config) Validate() error {
 		if _, exists := interfaceNames[br.Name]; exists {
 			return fmt.Errorf("bridge name %q conflicts with a managed interface", br.Name)
 		}
+		if br.STPMode != "" && br.STPMode != "stp" && br.STPMode != "rstp" {
+			return fmt.Errorf("bridge %q stp_mode must be stp or rstp", br.ID)
+		}
+		if br.STPMode != "" && br.STPEnabled != nil {
+			return fmt.Errorf("bridge %q cannot set both stp_mode and stp_enabled", br.ID)
+		}
+		if br.STPPriority != nil && (*br.STPPriority > 61440 || *br.STPPriority%4096 != 0) {
+			return fmt.Errorf("bridge %q stp_priority must be a multiple of 4096 in 0..61440", br.ID)
+		}
+		if br.STPPriority != nil && br.STPMode == "" && !enabled(br.STPEnabled) {
+			return fmt.Errorf("bridge %q STP priority requires STP to be enabled or a protocol mode selected", br.ID)
+		}
+		if enabled(br.IGMPQuerier) && (!enabled(br.IGMPSnooping) || br.IGMPSnooping == nil) {
+			return fmt.Errorf("bridge %q IGMP querier requires IGMP snooping", br.ID)
+		}
 		bridgeNames[br.Name] = struct{}{}
 		seenPorts := make(map[string]struct{}, len(br.Ports))
 		for _, port := range br.Ports {
+			if port.LoopProtection != nil && port.STPBPDUGuard != nil {
+				return fmt.Errorf("bridge %q port %q cannot configure both loop_protection and stp_bpdu_guard", br.ID, port.Interface)
+			}
+			if port.STPPointToPoint != "" && port.STPPointToPoint != "yes" && port.STPPointToPoint != "no" && port.STPPointToPoint != "auto" {
+				return fmt.Errorf("bridge %q port %q stp_point_to_point must be yes, no, or auto", br.ID, port.Interface)
+			}
+			if (port.STPEdge != nil || port.STPPointToPoint != "" || port.STPBPDUGuard != nil) && br.STPMode != "rstp" {
+				return fmt.Errorf("bridge %q edge, point-to-point, and BPDU guard settings require stp_mode rstp", br.ID)
+			}
+			if (port.STPPriority != nil || port.STPPathCost != nil || port.STPRootBlock != nil) && br.STPMode == "" && !enabled(br.STPEnabled) {
+				return fmt.Errorf("bridge %q STP port tuning on %q requires STP to be enabled or a protocol mode selected", br.ID, port.Interface)
+			}
+			if port.STPPriority != nil && *port.STPPriority > 63 {
+				return fmt.Errorf("bridge %q port %q stp_priority must be 0..63", br.ID, port.Interface)
+			}
+			if port.STPPathCost != nil && (*port.STPPathCost < 1 || *port.STPPathCost > 65535) {
+				return fmt.Errorf("bridge %q port %q stp_path_cost must be 1..65535", br.ID, port.Interface)
+			}
+			if enabled(br.IGMPSnooping) {
+				snoopingPorts[port.Interface] = true
+			}
+			if (enabled(port.IGMPFastLeave) || enabled(port.IGMPRouterPort)) && !enabled(br.IGMPSnooping) {
+				return fmt.Errorf("bridge %q IGMP fast leave and router-port settings require IGMP snooping", br.ID)
+			}
+			if enabled(port.IGMPFastLeave) && (port.IGMPSharedDownstream == nil || *port.IGMPSharedDownstream) {
+				return fmt.Errorf("bridge %q fast leave requires an explicitly confirmed non-shared downstream port", br.ID)
+			}
 			if _, exists := interfaceIDs[port.Interface]; !exists {
 				return fmt.Errorf("bridge %q references unknown interface %q", br.ID, port.Interface)
 			}
@@ -340,8 +588,86 @@ func (c Config) Validate() error {
 			return fmt.Errorf("bond interface %q cannot be another bond member", interfaceID)
 		}
 	}
+	if len(c.DHCPGuard) > 256 {
+		return fmt.Errorf("dhcp_guard exceeds limit 256")
+	}
+	seenDHCPGuard := make(map[string]bool, len(c.DHCPGuard))
+	for i, policy := range c.DHCPGuard {
+		field := fmt.Sprintf("dhcp_guard[%d]", i)
+		if _, exists := interfaceIDs[policy.Interface]; !exists {
+			return fmt.Errorf("%s references unknown interface %q", field, policy.Interface)
+		}
+		if _, exists := interfaceBridge[policy.Interface]; !exists {
+			return fmt.Errorf("%s interface %q is not a bridge port", field, policy.Interface)
+		}
+		if seenDHCPGuard[policy.Interface] {
+			return fmt.Errorf("%s duplicates interface %q", field, policy.Interface)
+		}
+		seenDHCPGuard[policy.Interface] = true
+		if policy.RateLimitPPS > 10000 {
+			return fmt.Errorf("%s.rate_limit_pps must be 0 or 1..10000", field)
+		}
+	}
+	if len(c.PortAuth) > 128 {
+		return fmt.Errorf("port_auth exceeds limit 128")
+	}
+	seenPortAuth := make(map[string]bool, len(c.PortAuth))
+	for i, policy := range c.PortAuth {
+		field := fmt.Sprintf("port_auth[%d]", i)
+		if _, exists := interfaceIDs[policy.Interface]; !exists || interfaceBridge[policy.Interface] == "" {
+			return fmt.Errorf("%s.interface %q must reference a managed bridge port", field, policy.Interface)
+		}
+		if seenPortAuth[policy.Interface] {
+			return fmt.Errorf("%s duplicates interface %q", field, policy.Interface)
+		}
+		seenPortAuth[policy.Interface] = true
+		if policy.RadiusServer == "" || strings.ContainsAny(policy.RadiusServer, "/\\ \t\r\n") {
+			return fmt.Errorf("%s.radius_server must be an IP address or DNS name", field)
+		}
+		if ip, err := netip.ParseAddr(policy.RadiusServer); err != nil || ip.Zone() != "" {
+			if !validRadiusHostname(policy.RadiusServer) {
+				return fmt.Errorf("%s.radius_server must be an IP address or DNS name", field)
+			}
+		}
+		if policy.RadiusPort == 0 {
+			return fmt.Errorf("%s.radius_port must be 1..65535", field)
+		}
+		if address, err := netip.ParseAddr(policy.NASAddress); err != nil || address.Zone() != "" {
+			return fmt.Errorf("%s.nas_address must be a local IPv4 or IPv6 address", field)
+		}
+		if policy.SecretFile != filepath.Join("/etc/gamebond/8021x", policy.Interface+".secret") {
+			return fmt.Errorf("%s.secret_file must be the managed per-port secret path", field)
+		}
+		if !nasIDPattern.MatchString(policy.NASID) {
+			return fmt.Errorf("%s.nas_id is invalid", field)
+		}
+		if policy.ReauthSeconds != 0 && (policy.ReauthSeconds < 60 || policy.ReauthSeconds > 86400) {
+			return fmt.Errorf("%s.reauth_seconds must be 0 or 60..86400", field)
+		}
+		if policy.FailurePolicy != "closed" {
+			return fmt.Errorf("%s.failure_policy must be closed; fail-open is not supported", field)
+		}
+		if !policy.ExclusivePort {
+			return fmt.Errorf("%s.exclusive_port must be true; shared downstream 802.1X ports cannot safely receive broadcast or multicast traffic", field)
+		}
+		bridgeID := interfaceBridge[policy.Interface]
+		for _, bridge := range c.Bridges {
+			if bridge.ID != bridgeID {
+				continue
+			}
+			if enabled(bridge.STPEnabled) || bridge.STPMode != "" {
+				return fmt.Errorf("%s cannot be enabled on bridge %q while STP/RSTP is configured; EAPOL forwarding compatibility is unverified", field, bridge.ID)
+			}
+			for _, port := range bridge.Ports {
+				if port.Interface == policy.Interface && (port.STPPriority != nil || port.STPPathCost != nil || enabled(port.STPRootBlock) || enabled(port.STPEdge) || enabled(port.STPBPDUGuard)) {
+					return fmt.Errorf("%s cannot be enabled on port %q while STP controls are configured; EAPOL forwarding compatibility is unverified", field, policy.Interface)
+				}
+			}
+		}
+	}
 
 	networkIDs := make(map[string]struct{}, len(c.Networks))
+	networkConfigs := make(map[string]Network, len(c.Networks))
 	networkBridge := make(map[string]string, len(c.Networks))
 	bridgeVLANs := make(map[string]map[uint16]struct{})
 	bridgeMTUs := make(map[string]int)
@@ -353,6 +679,7 @@ func (c Config) Validate() error {
 			return fmt.Errorf("network ID %q is duplicated", network.ID)
 		}
 		networkIDs[network.ID] = struct{}{}
+		networkConfigs[network.ID] = network
 		networkBridge[network.ID] = network.Bridge
 		if _, exists := bridgeIDs[network.Bridge]; !exists {
 			return fmt.Errorf("network %q references unknown bridge %q", network.ID, network.Bridge)
@@ -362,6 +689,9 @@ func (c Config) Validate() error {
 		}
 		if network.MTU < 576 || network.MTU > 65535 {
 			return fmt.Errorf("network %q MTU must be 576..65535", network.ID)
+		}
+		if network.IGMPSnooping != nil && !enabled(bridgeConfigs[network.Bridge].IGMPSnooping) {
+			return fmt.Errorf("network %q per-VLAN IGMP snooping requires bridge-wide IGMP snooping", network.ID)
 		}
 		if mtu, exists := bridgeMTUs[network.Bridge]; exists && mtu != network.MTU {
 			return fmt.Errorf("bridge %q networks must use one MTU", network.Bridge)
@@ -374,6 +704,71 @@ func (c Config) Validate() error {
 			return fmt.Errorf("bridge %q VLAN is duplicated: %d", network.Bridge, network.VLAN)
 		}
 		bridgeVLANs[network.Bridge][network.VLAN] = struct{}{}
+	}
+	if len(c.AVProfiles) > 64 {
+		return fmt.Errorf("pro_av_profiles exceeds limit 64")
+	}
+	profileSettings := map[string]map[string]string{}
+	selectedProfiles := map[string]bool{}
+	for i, selection := range c.AVProfiles {
+		field := fmt.Sprintf("pro_av_profiles[%d]", i)
+		if !stableIDPattern.MatchString(selection.Network) {
+			return fmt.Errorf("%s.network must be a lowercase stable network ID", field)
+		}
+		if _, exists := networkIDs[selection.Network]; !exists {
+			return fmt.Errorf("%s references unknown network %q", field, selection.Network)
+		}
+		profile, ok := avprofiles.Lookup(selection.Profile)
+		if !ok {
+			return fmt.Errorf("%s.profile %q is not a supported Pro AV profile", field, selection.Profile)
+		}
+		selectionKey := selection.Network + "/" + selection.Profile
+		if selectedProfiles[selectionKey] {
+			return fmt.Errorf("%s duplicates profile %q on network %q", field, selection.Profile, selection.Network)
+		}
+		selectedProfiles[selectionKey] = true
+		network := networkConfigs[selection.Network]
+		bridge := bridgeConfigs[network.Bridge]
+		if profileSettings[selection.Network] == nil {
+			profileSettings[selection.Network] = map[string]string{}
+		}
+		profileRequiresSnooping := false
+		profileRequiresQuerier := false
+		for _, setting := range profile.Settings {
+			if setting.Key == "igmp.snooping" && setting.Value == "enabled" {
+				profileRequiresSnooping = true
+			}
+			if setting.Key == "igmp.querier" && setting.Value == "one-per-vlan" {
+				profileRequiresQuerier = true
+			}
+			if setting.Key == "jumbo-frames" && setting.Value == "disabled" && network.MTU > 1500 {
+				return fmt.Errorf("%s profile %q requires MTU 1500 or less on network %q", field, profile.ID, network.ID)
+			}
+			key, value := normalizeAVProfileSetting(setting)
+			requirements := expandAVProfileSetting(key, value)
+			for _, requirement := range requirements {
+				if existing, found := profileSettings[selection.Network][requirement.key]; found && !avProfileValuesCompatible(requirement.key, existing, requirement.value) {
+					if strings.HasPrefix(requirement.key, "qos.queue.dscp.") {
+						dscp := strings.TrimPrefix(requirement.key, "qos.queue.dscp.")
+						return fmt.Errorf("%s conflicts on network %q: profile %q requires DSCP %s queue rank %s but another selected profile requires rank %s", field, selection.Network, profile.ID, dscp, requirement.value, existing)
+					}
+					return fmt.Errorf("%s conflicts on network %q: profile %q requires %s=%q but another selected profile requires %q", field, selection.Network, profile.ID, requirement.key, requirement.value, existing)
+				}
+				if existing, found := profileSettings[selection.Network][requirement.key]; !found || existing == "v2-or-v3" {
+					profileSettings[selection.Network][requirement.key] = requirement.value
+				}
+			}
+		}
+		snoopingEnabled := enabled(bridge.IGMPSnooping)
+		if network.IGMPSnooping != nil {
+			snoopingEnabled = enabled(network.IGMPSnooping)
+		}
+		if profileRequiresSnooping && !snoopingEnabled {
+			return fmt.Errorf("%s profile %q requires IGMP snooping on network %q", field, profile.ID, network.ID)
+		}
+		if profileRequiresQuerier && snoopingEnabled && !enabled(bridge.IGMPQuerier) {
+			return fmt.Errorf("%s profile %q requires an IGMP querier on bridge %q", field, profile.ID, bridge.ID)
+		}
 	}
 
 	for _, br := range c.Bridges {
@@ -396,6 +791,42 @@ func (c Config) Validate() error {
 			}
 			if len(seenNetworks) > 0 && !br.VLANFiltering {
 				return fmt.Errorf("bridge %q must enable VLAN filtering for configured network membership", br.ID)
+			}
+			if port.VoiceNetwork != "" {
+				if port.VoiceNetwork == port.UntaggedNetwork {
+					return fmt.Errorf("bridge %q port %q voice_network must be tagged separately from its untagged access network", br.ID, port.Interface)
+				}
+				if !containsString(port.TaggedNetworks, port.VoiceNetwork) {
+					return fmt.Errorf("bridge %q port %q voice_network %q must be in tagged_networks", br.ID, port.Interface, port.VoiceNetwork)
+				}
+			}
+			applications := map[string]bool{}
+			for i, policy := range port.LLDPMED {
+				field := fmt.Sprintf("bridge %q port %q lldp_med[%d]", br.ID, port.Interface, i)
+				if !validLLDPMEDApplication(policy.Application) || applications[policy.Application] {
+					return fmt.Errorf("%s.application is invalid or duplicated", field)
+				}
+				applications[policy.Application] = true
+				if policy.Network != "" {
+					if _, exists := seenNetworks[policy.Network]; !exists {
+						return fmt.Errorf("%s.network must be a VLAN assigned to this port", field)
+					}
+					if policy.Tagged && policy.Network == port.UntaggedNetwork {
+						return fmt.Errorf("%s tagged network cannot be the untagged access network", field)
+					}
+					if !policy.Tagged && policy.Network != port.UntaggedNetwork {
+						return fmt.Errorf("%s untagged network must match untagged_network", field)
+					}
+				}
+				if policy.Priority != nil && *policy.Priority > 7 {
+					return fmt.Errorf("%s.priority must be 0..7", field)
+				}
+				if policy.DSCP != nil && *policy.DSCP > 63 {
+					return fmt.Errorf("%s.dscp must be 0..63", field)
+				}
+			}
+			if port.VoiceNetwork != "" && applications["voice"] {
+				return fmt.Errorf("bridge %q port %q must not duplicate the automatic voice policy from voice_network", br.ID, port.Interface)
 			}
 		}
 	}
@@ -500,6 +931,55 @@ func (c Config) Validate() error {
 		}
 		seenIPACLMatches[match] = true
 	}
+	if len(c.NetworkACL) > MaxIPACLRules {
+		return fmt.Errorf("inter_network_acls exceed limit %d", MaxIPACLRules)
+	}
+	routedInterfaces := map[string]string{}
+	for i, network := range c.Networks {
+		if network.RouteInterface == "" {
+			continue
+		}
+		if !ifNamePattern.MatchString(network.RouteInterface) || network.RouteInterface == "." || network.RouteInterface == ".." {
+			return fmt.Errorf("networks[%d].route_interface is invalid", i)
+		}
+		if prior, exists := routedInterfaces[network.RouteInterface]; exists {
+			return fmt.Errorf("routed interface %q must be unique to one network (used by %q and %q)", network.RouteInterface, prior, network.ID)
+		}
+		routedInterfaces[network.RouteInterface] = network.ID
+	}
+	if len(c.NetworkACL) > 0 {
+		for i, network := range c.Networks {
+			if network.RouteInterface == "" {
+				return fmt.Errorf("networks[%d].route_interface is required when inter-network ACLs are configured", i)
+			}
+		}
+	}
+	seenNetworkACLIDs, seenNetworkACLMatches := map[string]bool{}, map[string]bool{}
+	for i, rule := range c.NetworkACL {
+		if !stableIDPattern.MatchString(rule.ID) || seenNetworkACLIDs[rule.ID] {
+			return fmt.Errorf("inter_network_acls[%d].id is invalid or duplicated", i)
+		}
+		seenNetworkACLIDs[rule.ID] = true
+		source, sourceOK := networkConfigs[rule.SourceNetwork]
+		destination, destinationOK := networkConfigs[rule.DestinationNetwork]
+		if !sourceOK || !destinationOK {
+			return fmt.Errorf("inter-network ACL %q references an unknown network", rule.ID)
+		}
+		if rule.SourceNetwork == rule.DestinationNetwork || source.RouteInterface == destination.RouteInterface {
+			return fmt.Errorf("inter-network ACL %q must reference two distinct routed networks", rule.ID)
+		}
+		if rule.Protocol != "" && rule.Protocol != "tcp" && rule.Protocol != "udp" && rule.Protocol != "icmp" && rule.Protocol != "icmpv6" {
+			return fmt.Errorf("inter-network ACL %q has unsupported protocol", rule.ID)
+		}
+		if rule.Port != 0 && rule.Protocol != "tcp" && rule.Protocol != "udp" {
+			return fmt.Errorf("inter-network ACL %q port requires tcp or udp", rule.ID)
+		}
+		match := strings.Join([]string{rule.SourceNetwork, rule.DestinationNetwork, rule.Protocol, fmt.Sprint(rule.Port)}, "/")
+		if seenNetworkACLMatches[match] {
+			return fmt.Errorf("inter-network ACL contains ambiguous duplicate match %q", match)
+		}
+		seenNetworkACLMatches[match] = true
+	}
 	if len(c.EgressRates) > 64 {
 		return fmt.Errorf("egress rate limits exceed limit 64")
 	}
@@ -529,6 +1009,66 @@ func (c Config) Validate() error {
 			}
 		}
 	}
+	if len(c.StormControl) > 64 {
+		return fmt.Errorf("storm control policies exceed limit 64")
+	}
+	seenStormControl := map[string]bool{}
+	stormClasses := map[string]map[string]bool{}
+	for i, policy := range c.StormControl {
+		if _, ok := interfaceIDs[policy.Interface]; !ok {
+			return fmt.Errorf("storm_control[%d] references unknown interface %q", i, policy.Interface)
+		}
+		if policy.BroadcastRateBPS == 0 && policy.MulticastRateBPS == 0 {
+			return fmt.Errorf("storm_control[%d] must set a broadcast or multicast rate", i)
+		}
+		if policy.MulticastRateBPS > 0 && snoopingPorts[policy.Interface] {
+			return fmt.Errorf("storm_control[%d] multicast policing cannot share an interface with IGMP snooping because control traffic would be rate-limited", i)
+		}
+		for _, rate := range []uint64{policy.BroadcastRateBPS, policy.MulticastRateBPS} {
+			if rate != 0 && (rate < 8000 || rate > 4_294_967_295) {
+				return fmt.Errorf("storm_control[%d].rate_bps must be 8000..4294967295", i)
+			}
+		}
+		if policy.BurstBytes < 1024 || policy.BurstBytes > 16*1024*1024 {
+			return fmt.Errorf("storm_control[%d].burst_bytes must be 1024..16777216", i)
+		}
+		if seenStormControl[policy.Interface] {
+			return fmt.Errorf("storm control policy for interface %q is duplicated", policy.Interface)
+		}
+		seenStormControl[policy.Interface] = true
+		stormClasses[policy.Interface] = map[string]bool{"broadcast": policy.BroadcastRateBPS > 0, "multicast": policy.MulticastRateBPS > 0}
+	}
+	if len(c.MulticastBroadcastLimits) > 64 {
+		return fmt.Errorf("multicast_broadcast_rate_limits exceed limit 64")
+	}
+	seenMulticastBroadcast := map[string]bool{}
+	for i, policy := range c.MulticastBroadcastLimits {
+		field := fmt.Sprintf("multicast_broadcast_rate_limits[%d]", i)
+		if _, ok := interfaceIDs[policy.Interface]; !ok {
+			return fmt.Errorf("%s references unknown interface %q", field, policy.Interface)
+		}
+		if policy.BroadcastRateBPS == 0 && policy.MulticastRateBPS == 0 {
+			return fmt.Errorf("%s must set a broadcast or multicast rate", field)
+		}
+		if policy.MulticastRateBPS > 0 && snoopingPorts[policy.Interface] {
+			return fmt.Errorf("%s multicast policing cannot share an interface with IGMP snooping because control traffic would be rate-limited", field)
+		}
+		for _, rate := range []uint64{policy.BroadcastRateBPS, policy.MulticastRateBPS} {
+			if rate != 0 && (rate < 8000 || rate > 4_294_967_295) {
+				return fmt.Errorf("%s rates must be 8000..4294967295", field)
+			}
+		}
+		if policy.BurstBytes < 1024 || policy.BurstBytes > 16*1024*1024 {
+			return fmt.Errorf("%s.burst_bytes must be 1024..16777216", field)
+		}
+		if seenMulticastBroadcast[policy.Interface] {
+			return fmt.Errorf("multicast/broadcast rate-limit policy for interface %q is duplicated", policy.Interface)
+		}
+		seenMulticastBroadcast[policy.Interface] = true
+		if classes := stormClasses[policy.Interface]; (policy.BroadcastRateBPS > 0 && classes["broadcast"]) || (policy.MulticastRateBPS > 0 && classes["multicast"]) {
+			return fmt.Errorf("%s overlaps a storm-control class on interface %q", field, policy.Interface)
+		}
+	}
 	if len(c.FlowControl) > 64 {
 		return fmt.Errorf("flow control policies exceed limit 64")
 	}
@@ -546,6 +1086,152 @@ func (c Config) Validate() error {
 		seenFlow[policy.Interface] = true
 		if bondMembers[policy.Interface] {
 			return fmt.Errorf("flow control policy cannot target aggregate member %q; configure the aggregate interface policy", policy.Interface)
+		}
+	}
+	if len(c.QoS) > 64 {
+		return fmt.Errorf("QoS policies exceed limit 64")
+	}
+	seenQoSInterfaces := map[string]bool{}
+	for i, policy := range c.QoS {
+		if _, ok := interfaceIDs[policy.Interface]; !ok {
+			return fmt.Errorf("qos[%d] references unknown interface %q", i, policy.Interface)
+		}
+		if seenQoSInterfaces[policy.Interface] {
+			return fmt.Errorf("QoS policy for interface %q is duplicated", policy.Interface)
+		}
+		seenQoSInterfaces[policy.Interface] = true
+		if policy.LinkRateBPS < 8_000_000 || policy.LinkRateBPS > 100_000_000_000 {
+			return fmt.Errorf("qos[%d].link_rate_bps must be 8000000..100000000000", i)
+		}
+		if policy.LinkRateBPS%1000 != 0 {
+			return fmt.Errorf("qos[%d].link_rate_bps must use whole kilobits per second for the shared QoS provider", i)
+		}
+		if len(policy.Classes) == 0 || len(policy.Classes) > 8 {
+			return fmt.Errorf("QoS policy for %q must contain 1..8 classes", policy.Interface)
+		}
+		classIDs, dscps := map[uint8]bool{}, map[uint8]bool{}
+		var reserved uint64
+		for j, class := range policy.Classes {
+			if class.ID < 10 || class.ID > 99 || classIDs[class.ID] {
+				return fmt.Errorf("qos[%d].classes[%d].id must be unique and between 10 and 99", i, j)
+			}
+			classIDs[class.ID] = true
+			if len(class.DSCP) == 0 {
+				return fmt.Errorf("QoS class %d must match at least one DSCP value", class.ID)
+			}
+			if class.RateBPS < 1000 || class.RateBPS > policy.LinkRateBPS {
+				return fmt.Errorf("QoS class %d rate is outside the link rate", class.ID)
+			}
+			if class.RateBPS%1000 != 0 {
+				return fmt.Errorf("QoS class %d rate must use whole kilobits per second for the shared QoS provider", class.ID)
+			}
+			if class.CeilingBPS < class.RateBPS || class.CeilingBPS > policy.LinkRateBPS {
+				return fmt.Errorf("QoS class %d ceiling must be at least its rate and no more than the link rate", class.ID)
+			}
+			if class.CeilingBPS%1000 != 0 {
+				return fmt.Errorf("QoS class %d ceiling must use whole kilobits per second for the shared QoS provider", class.ID)
+			}
+			if class.Priority > 7 {
+				return fmt.Errorf("QoS class %d priority must be 0..7", class.ID)
+			}
+			reserved += class.RateBPS
+			for _, dscp := range class.DSCP {
+				if dscp > 63 {
+					return fmt.Errorf("QoS class %d DSCP must be 0..63", class.ID)
+				}
+				if dscps[dscp] {
+					return fmt.Errorf("DSCP %d is assigned more than once", dscp)
+				}
+				dscps[dscp] = true
+			}
+		}
+		if reserved+1000 > policy.LinkRateBPS {
+			return fmt.Errorf("QoS class guaranteed rates exceed link rate")
+		}
+		for _, rate := range c.EgressRates {
+			if rate.Interface == policy.Interface && rate.Network == "" {
+				return fmt.Errorf("QoS and whole-port egress rate limit cannot own the same root qdisc on %q", policy.Interface)
+			}
+		}
+	}
+	if len(c.PortMirrors) > 64 {
+		return fmt.Errorf("port mirrors exceed limit 64")
+	}
+	seenMirrorSources := map[string]bool{}
+	monitorDestination, monitorRate, monitorBurst := "", uint64(0), uint32(0)
+	monitorCaptureConfigured := false
+	for i, mirror := range c.PortMirrors {
+		if _, ok := interfaceIDs[mirror.Source]; !ok {
+			return fmt.Errorf("port_mirrors[%d].source references unknown interface %q", i, mirror.Source)
+		}
+		if _, ok := interfaceIDs[mirror.Destination]; !ok {
+			return fmt.Errorf("port_mirrors[%d].destination references unknown interface %q", i, mirror.Destination)
+		}
+		if mirror.Source == mirror.Destination {
+			return fmt.Errorf("port_mirrors[%d] source and destination must differ", i)
+		}
+		if mirror.Direction != "ingress" && mirror.Direction != "egress" && mirror.Direction != "both" {
+			return fmt.Errorf("port_mirrors[%d].direction must be ingress, egress, or both", i)
+		}
+		if mirror.Network != "" {
+			if _, exists := networkConfigs[mirror.Network]; !exists {
+				return fmt.Errorf("port_mirrors[%d].network references unknown network %q", i, mirror.Network)
+			}
+			port, exists := interfacePorts[mirror.Source]
+			if !exists {
+				return fmt.Errorf("port_mirrors[%d] VLAN scope requires a bridge-port source", i)
+			}
+			if port.UntaggedNetwork == mirror.Network || !containsString(port.TaggedNetworks, mirror.Network) {
+				return fmt.Errorf("port_mirrors[%d].network must be a tagged member of source port %q", i, mirror.Source)
+			}
+		}
+		if bondMembers[mirror.Source] || bondInterfaces[mirror.Source] {
+			return fmt.Errorf("port mirror source %q cannot be an aggregate member or bond", mirror.Source)
+		}
+		if bondMembers[mirror.Destination] || bondInterfaces[mirror.Destination] || interfaceBridge[mirror.Destination] != "" {
+			return fmt.Errorf("port mirror destination %q must be a dedicated standalone interface", mirror.Destination)
+		}
+		if monitorDestination != "" && monitorDestination != mirror.Destination {
+			return fmt.Errorf("port mirrors must use one monitor destination")
+		}
+		monitorDestination = mirror.Destination
+		if mirror.CaptureRateBPS == 0 && mirror.CaptureBurstBytes != 0 {
+			return fmt.Errorf("port_mirrors[%d].capture_burst_bytes requires capture_rate_bps", i)
+		}
+		if mirror.CaptureRateBPS != 0 {
+			if mirror.CaptureRateBPS < 1000 || mirror.CaptureRateBPS > 100_000_000_000 {
+				return fmt.Errorf("port_mirrors[%d].capture_rate_bps must be 1000..100000000000", i)
+			}
+			if mirror.CaptureBurstBytes < 1500 || mirror.CaptureBurstBytes > 1<<20 {
+				return fmt.Errorf("port_mirrors[%d].capture_burst_bytes must be 1500..1048576", i)
+			}
+		}
+		if monitorCaptureConfigured && (monitorRate != mirror.CaptureRateBPS || monitorBurst != mirror.CaptureBurstBytes) {
+			return fmt.Errorf("all port mirrors sharing a monitor must use one capture rate and burst")
+		}
+		monitorRate, monitorBurst, monitorCaptureConfigured = mirror.CaptureRateBPS, mirror.CaptureBurstBytes, true
+		directions := []string{mirror.Direction}
+		if mirror.Direction == "both" {
+			directions = []string{"ingress", "egress"}
+		}
+		for _, direction := range directions {
+			key := mirror.Source + "/" + direction
+			if seenMirrorSources[key] {
+				return fmt.Errorf("port mirror source direction is configured more than once: %s", key)
+			}
+			seenMirrorSources[key] = true
+		}
+	}
+	if monitorRate > 0 {
+		for _, limit := range c.EgressRates {
+			if limit.Interface == monitorDestination {
+				return fmt.Errorf("capture rate and port egress rate limit cannot share the monitor qdisc")
+			}
+		}
+		for _, policy := range c.QoS {
+			if policy.Interface == monitorDestination {
+				return fmt.Errorf("capture rate and QoS cannot share the monitor qdisc")
+			}
 		}
 	}
 	seenACLIDs, seenACLMatches := map[string]bool{}, map[string]bool{}
@@ -644,6 +1330,80 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func avProfileValuesCompatible(key, first, second string) bool {
+	if first == second {
+		return true
+	}
+	if key == "igmp.version" {
+		return first == "v2-or-v3" && (second == "v2" || second == "v3") || second == "v2-or-v3" && (first == "v2" || first == "v3")
+	}
+	if key == "igmp.snooping" {
+		return strings.HasPrefix(first, "enabled") && strings.HasPrefix(second, "enabled") || strings.HasPrefix(first, "required-") && second == "enabled" || strings.HasPrefix(second, "required-") && first == "enabled"
+	}
+	if key == "qos.classification" {
+		return first == "diffserv-dscp" && second == "trust-dscp" || second == "diffserv-dscp" && first == "trust-dscp"
+	}
+	return false
+}
+
+func normalizeAVProfileSetting(setting avprofiles.Setting) (string, string) {
+	switch setting.Key {
+	case "multicast.unregistered-filtering":
+		if setting.Value == "disabled" {
+			return "multicast.unregistered-flooding", "enabled"
+		}
+		if setting.Value == "enabled" {
+			return "multicast.unregistered-flooding", "disabled"
+		}
+	}
+	return setting.Key, setting.Value
+}
+
+type avProfileRequirement struct{ key, value string }
+
+func expandAVProfileSetting(key, value string) []avProfileRequirement {
+	if key == "qos.queue.order" {
+		parts := strings.Split(value, ">")
+		requirements := make([]avProfileRequirement, 0, len(parts))
+		for rank, part := range parts {
+			dscp, err := strconv.ParseUint(strings.TrimSpace(part), 10, 8)
+			if err != nil || dscp == 0 || dscp > 63 {
+				return []avProfileRequirement{{key: key, value: value}}
+			}
+			requirements = append(requirements, avProfileRequirement{key: fmt.Sprintf("qos.queue.dscp.%d", dscp), value: strconv.Itoa(rank)})
+		}
+		return requirements
+	}
+	if strings.HasPrefix(key, "qos.queue.") {
+		var dscpText, rank string
+		switch {
+		case strings.HasPrefix(key, "qos.queue.dscp"):
+			dscpText, rank = strings.TrimPrefix(key, "qos.queue.dscp"), value
+		default:
+			dscpText, rank, _ = strings.Cut(value, ":")
+		}
+		if dscp, err := strconv.ParseUint(dscpText, 10, 8); err == nil && dscp > 0 && dscp <= 63 {
+			if normalized, ok := normalizeAVQueueRank(rank); ok {
+				return []avProfileRequirement{{key: fmt.Sprintf("qos.queue.dscp.%d", dscp), value: strconv.Itoa(normalized)}}
+			}
+		}
+	}
+	return []avProfileRequirement{{key: key, value: value}}
+}
+
+func normalizeAVQueueRank(rank string) (int, bool) {
+	switch rank {
+	case "highest", "strict-highest":
+		return 0, true
+	case "second-highest", "strict-second-highest":
+		return 1, true
+	case "third-highest", "strict-third-highest":
+		return 2, true
+	default:
+		return 0, false
+	}
 }
 
 func containsString(values []string, target string) bool {

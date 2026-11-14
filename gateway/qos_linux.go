@@ -21,10 +21,15 @@ type tcQdiscRow struct {
 }
 
 type QoSClassStatus struct {
-	ID      string `json:"id,omitempty"`
-	ClassID string `json:"class_id"`
-	Packets uint64 `json:"packets"`
-	Bytes   uint64 `json:"bytes"`
+	ID       string  `json:"id,omitempty"`
+	ClassID  string  `json:"class_id"`
+	DSCP     *uint8  `json:"dscp,omitempty"`
+	DSCPs    []uint8 `json:"dscps,omitempty"`
+	RateKbit *uint32 `json:"rate_kbit,omitempty"`
+	CeilKbit *uint32 `json:"ceiling_kbit,omitempty"`
+	Priority *uint8  `json:"priority,omitempty"`
+	Packets  uint64  `json:"packets"`
+	Bytes    uint64  `json:"bytes"`
 }
 
 type QoSInterfaceStatus struct {
@@ -37,6 +42,7 @@ type QoSInterfaceStatus struct {
 type QoSSnapshot struct {
 	Enabled    bool                 `json:"enabled"`
 	Interfaces []QoSInterfaceStatus `json:"interfaces"`
+	Error      string               `json:"error,omitempty"`
 }
 
 func rootQdiscs(ctx context.Context, runner Runner, name string) ([]tcQdiscRow, error) {
@@ -126,15 +132,19 @@ func qosCommands(config QoSInterface, iface Interface) [][]string {
 	commands := [][]string{{"qdisc", "replace", "dev", iface.Name, "root", "handle", gameBondQoSHandle, "htb", "default", "4095", "r2q", "10"}}
 	commands = append(commands, []string{"class", "replace", "dev", iface.Name, "parent", gameBondQoSHandle, "classid", "7e:1", "htb", "rate", strconv.FormatUint(uint64(config.TotalKbit), 10) + "kbit", "ceil", strconv.FormatUint(uint64(config.TotalKbit), 10) + "kbit"})
 	commands = append(commands, []string{"class", "replace", "dev", iface.Name, "parent", "7e:1", "classid", "7e:fff", "htb", "rate", "1kbit", "ceil", strconv.FormatUint(uint64(config.TotalKbit), 10) + "kbit", "prio", "7"})
+	filterPriority := 2
 	for i, class := range classes {
 		minor := i + 2
 		classID := "7e:" + strconv.Itoa(minor)
 		rate := strconv.FormatUint(uint64(class.RateKbit), 10) + "kbit"
 		ceil := strconv.FormatUint(uint64(class.CeilKbit), 10) + "kbit"
 		commands = append(commands, []string{"class", "replace", "dev", iface.Name, "parent", "7e:1", "classid", classID, "htb", "rate", rate, "ceil", ceil, "prio", strconv.Itoa(int(class.Priority))})
-		value := "0x" + hex.EncodeToString([]byte{class.DSCP << 2}) + "/0xfc"
-		for _, protocol := range []string{"ip", "ipv6"} {
-			commands = append(commands, []string{"filter", "replace", "dev", iface.Name, "protocol", protocol, "parent", gameBondQoSHandle, "prio", strconv.Itoa(minor), "flower", "ip_tos", value, "classid", classID})
+		for _, dscp := range class.dscpValues() {
+			value := "0x" + hex.EncodeToString([]byte{dscp << 2}) + "/0xfc"
+			for _, protocol := range []string{"ip", "ipv6"} {
+				commands = append(commands, []string{"filter", "replace", "dev", iface.Name, "protocol", protocol, "parent", gameBondQoSHandle, "prio", strconv.Itoa(filterPriority), "flower", "ip_tos", value, "classid", classID})
+			}
+			filterPriority++
 		}
 	}
 	return commands
@@ -241,7 +251,11 @@ func verifyQoS(ctx context.Context, runner Runner, cfg Config) error {
 		if err := json.Unmarshal(filterResult.Stdout, &filters); err != nil {
 			return fmt.Errorf("parse effective QoS filters on %s: %w", iface.Name, err)
 		}
-		if len(filters) < len(wanted.Classes)*2 {
+		expectedFilters := 0
+		for _, class := range wanted.Classes {
+			expectedFilters += len(class.dscpValues()) * 2
+		}
+		if len(filters) < expectedFilters {
 			return fmt.Errorf("QoS DSCP filters are missing on %s", iface.Name)
 		}
 	}
@@ -298,8 +312,26 @@ func snapshotQoS(ctx context.Context, runner Runner, cfg Config) QoSSnapshot {
 			for i, class := range configured {
 				classNames["7e:"+strconv.Itoa(i+2)] = class.ID
 			}
+			configuredByKernelID := map[string]QoSClass{}
+			for i, class := range configured {
+				configuredByKernelID["7e:"+strconv.Itoa(i+2)] = class
+			}
 			for _, row := range classRows {
-				state.Classes = append(state.Classes, QoSClassStatus{ID: classNames[row.ClassID], ClassID: row.ClassID, Bytes: row.Stats.Bytes, Packets: row.Stats.Packets})
+				class := configuredByKernelID[row.ClassID]
+				var dscp *uint8
+				var dscps []uint8
+				var rate, ceiling *uint32
+				var priority *uint8
+				if _, configuredClass := configuredByKernelID[row.ClassID]; configuredClass {
+					values := class.dscpValues()
+					if len(values) == 1 {
+						dscp = &values[0]
+					} else {
+						dscps = append([]uint8(nil), values...)
+					}
+					rate, ceiling, priority = &class.RateKbit, &class.CeilKbit, &class.Priority
+				}
+				state.Classes = append(state.Classes, QoSClassStatus{ID: classNames[row.ClassID], ClassID: row.ClassID, DSCP: dscp, DSCPs: dscps, RateKbit: rate, CeilKbit: ceiling, Priority: priority, Bytes: row.Stats.Bytes, Packets: row.Stats.Packets})
 			}
 		}
 		snapshot.Interfaces = append(snapshot.Interfaces, state)

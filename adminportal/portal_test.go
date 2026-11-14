@@ -18,6 +18,20 @@ import (
 	"github.com/Dankular/GameBond.Server/adminauth"
 )
 
+func TestGatewayMutationRequiresAuthAndCSRF(t *testing.T) {
+	r := newRig(t)
+	if got := r.do(http.MethodPost, "/api/gateway/rollback", map[string]any{}, "", ""); got.code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated gateway rollback status = %d, body=%v", got.code, got.body)
+	}
+	token, csrf := r.portal.Sessions.Create()
+	if got := r.do(http.MethodPost, "/api/gateway/rollback", map[string]any{}, token, "wrong"); got.code != http.StatusForbidden {
+		t.Fatalf("gateway rollback with bad CSRF status = %d, body=%v", got.code, got.body)
+	}
+	if got := r.do(http.MethodPost, "/api/gateway/rollback", map[string]any{}, token, csrf); got.code != http.StatusServiceUnavailable {
+		t.Fatalf("gateway rollback with unavailable socket status = %d, body=%v", got.code, got.body)
+	}
+}
+
 const password = "correct horse battery"
 
 type rig struct {

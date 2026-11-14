@@ -107,16 +107,8 @@ func validateKeepalivedHost(ctx context.Context, runner Runner, cfg Config) erro
 	if !source.IsValid() {
 		return fmt.Errorf("VRRP interface %s has no IPv%d source address", iface, family)
 	}
-	for _, peer := range cfg.VRRP.Peers {
-		if !subnet.Contains(netip.MustParseAddr(peer)) {
-			return fmt.Errorf("VRRP peer %s is outside interface subnet %s", peer, subnet)
-		}
-	}
-	for _, value := range cfg.VRRP.VirtualAddresses {
-		vip, _ := netip.ParsePrefix(value)
-		if !subnet.Contains(vip.Addr()) {
-			return fmt.Errorf("VRRP virtual address %s is outside interface subnet %s", value, subnet)
-		}
+	if err := validateVRRPAddressesOnSubnet(cfg.VRRP, subnet); err != nil {
+		return err
 	}
 	data, err := renderKeepalivedConfig(cfg.VRRP, cfg.Interfaces, source.String())
 	if err != nil {
@@ -141,6 +133,22 @@ func validateKeepalivedHost(ctx context.Context, runner Runner, cfg Config) erro
 	}
 	if _, err := runner.Run(ctx, "keepalived", "-t", "-f", path); err != nil {
 		return fmt.Errorf("validate Keepalived config: %w", err)
+	}
+	return nil
+}
+
+func validateVRRPAddressesOnSubnet(cfg VRRPConfig, subnet netip.Prefix) error {
+	for _, peer := range cfg.Peers {
+		addr, err := netip.ParseAddr(peer)
+		if err != nil || !subnet.Contains(addr) {
+			return fmt.Errorf("VRRP peer %s is outside interface subnet %s", peer, subnet)
+		}
+	}
+	for _, value := range cfg.VirtualAddresses {
+		vip, err := netip.ParsePrefix(value)
+		if err != nil || !subnet.Contains(vip.Addr()) {
+			return fmt.Errorf("VRRP virtual address %s is outside interface subnet %s", value, subnet)
+		}
 	}
 	return nil
 }

@@ -3,30 +3,179 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/Dankular/GameBond.Server/gateway/layer2"
 )
 
 const (
-	keaUnit       = "gamebond-kea-dhcp4.service"
-	keaConfigPath = "/etc/gamebond/kea-dhcp4.json"
+	keaUnit           = "gamebond-kea-dhcp4.service"
+	keaConfigPath     = "/etc/gamebond/kea-dhcp4.json"
+	keaLeasePath      = "/var/lib/gamebond-kea/leases4.csv"
+	dhcpGuardNftTable = "gamebond_dhcp_guard"
 )
 
 type DHCPSnapshot struct {
-	Enabled bool   `json:"enabled"`
-	Active  bool   `json:"active"`
-	Error   string `json:"error,omitempty"`
+	Enabled           bool               `json:"enabled"`
+	Active            bool               `json:"active"`
+	Error             string             `json:"error,omitempty"`
+	LeaseBindings     []DHCPLeaseBinding `json:"lease_bindings,omitempty"`
+	LeaseBindingError string             `json:"lease_binding_error,omitempty"`
 }
 
-func snapshotDHCP(ctx context.Context, runner Runner, enabled bool) DHCPSnapshot {
-	out := DHCPSnapshot{Enabled: enabled}
-	if !enabled {
+// DHCPLeaseBinding is an active Kea IPv4 lease binding. The CSV format is
+// append-only between lease-file cleanups, so callers must use the final row
+// for each address before enforcing bindings.
+type DHCPLeaseBinding struct {
+	Address string `json:"address"`
+	MAC     string `json:"mac"`
+}
+
+func hasDHCPBindingGuard(cfg *layer2.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, policy := range cfg.DHCPGuard {
+		if !policy.Trusted && policy.ValidateBindings {
+			return true
+		}
+	}
+	return false
+}
+
+// validateDHCPBindingAuthority rejects lease-to-port enforcement until the
+// managed DHCP provider supplies authenticated ingress metadata. Kea's memfile
+// lease database records address and MAC but not the receiving bridge port;
+// the learned bridge FDB is endpoint-influenced and cannot be an authority for
+// a security decision.
+func validateDHCPBindingAuthority(cfg *layer2.Config) error {
+	if !hasDHCPBindingGuard(cfg) {
+		return nil
+	}
+	return errors.New("DHCP binding guard is unavailable without authoritative DHCP ingress metadata; Kea memfile leases and the learned bridge FDB cannot securely identify the client port")
+}
+
+func syncDHCPGuardBindings(ctx context.Context, runner Runner, cfg Config, leasePath string, now time.Time) (int, int, error) {
+	if !hasDHCPBindingGuard(cfg.Layer2) {
+		return 0, 0, nil
+	}
+	return 0, 0, validateDHCPBindingAuthority(cfg.Layer2)
+}
+
+func parseKeaLeaseCSV(input io.Reader, now time.Time) ([]DHCPLeaseBinding, error) {
+	const maxLeaseFileBytes = 16 << 20
+	data, err := io.ReadAll(io.LimitReader(input, maxLeaseFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read Kea lease database: %w", err)
+	}
+	if len(data) > maxLeaseFileBytes {
+		return nil, fmt.Errorf("Kea lease database exceeds %d bytes", maxLeaseFileBytes)
+	}
+	reader := csv.NewReader(bytes.NewReader(data))
+	reader.FieldsPerRecord = -1
+	reader.ReuseRecord = false
+	header, err := reader.Read()
+	if err != nil {
+		return nil, fmt.Errorf("read Kea lease header: %w", err)
+	}
+	columns := make(map[string]int, len(header))
+	for i, name := range header {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, errors.New("Kea lease file has an empty column name")
+		}
+		if _, exists := columns[name]; exists {
+			return nil, fmt.Errorf("duplicate Kea lease column %q", name)
+		}
+		columns[name] = i
+	}
+	for _, name := range []string{"address", "hwaddr", "expire", "state"} {
+		if _, exists := columns[name]; !exists {
+			return nil, fmt.Errorf("Kea lease file is missing %q column", name)
+		}
+	}
+	index := func(row []string, name string) (string, error) {
+		i := columns[name]
+		if i >= len(row) {
+			return "", fmt.Errorf("Kea lease row is missing %q value", name)
+		}
+		return strings.TrimSpace(row[i]), nil
+	}
+	latest := make(map[string]DHCPLeaseBinding)
+	for line := 2; ; line++ {
+		row, readErr := reader.Read()
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return nil, fmt.Errorf("read Kea lease row %d: %w", line, readErr)
+		}
+		addressText, err := index(row, "address")
+		if err != nil {
+			return nil, fmt.Errorf("Kea lease row %d: %w", line, err)
+		}
+		address, err := netip.ParseAddr(addressText)
+		if err != nil || !address.Is4() || address.IsUnspecified() || address.IsMulticast() {
+			return nil, fmt.Errorf("Kea lease row %d has invalid IPv4 address", line)
+		}
+		macText, err := index(row, "hwaddr")
+		if err != nil {
+			return nil, fmt.Errorf("Kea lease row %d: %w", line, err)
+		}
+		mac, err := net.ParseMAC(macText)
+		if err != nil || len(mac) != 6 || mac[0]&1 != 0 {
+			return nil, fmt.Errorf("Kea lease row %d has invalid client MAC", line)
+		}
+		expireText, err := index(row, "expire")
+		if err != nil {
+			return nil, fmt.Errorf("Kea lease row %d: %w", line, err)
+		}
+		expire, err := time.ParseInLocation("2006-01-02 15:04:05", expireText, time.Local)
+		if err != nil {
+			return nil, fmt.Errorf("Kea lease row %d has invalid expiration time", line)
+		}
+		stateText, err := index(row, "state")
+		if err != nil {
+			return nil, fmt.Errorf("Kea lease row %d: %w", line, err)
+		}
+		state, err := strconv.ParseUint(stateText, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("Kea lease row %d has invalid state", line)
+		}
+		key := address.String()
+		// Retain every newest record, including inactive records, so an old
+		// active row cannot resurrect a released, declined, or expired lease.
+		if state == 0 && expire.After(now) {
+			latest[key] = DHCPLeaseBinding{Address: key, MAC: strings.ToLower(mac.String())}
+		} else {
+			delete(latest, key)
+		}
+	}
+	bindings := make([]DHCPLeaseBinding, 0, len(latest))
+	for _, binding := range latest {
+		bindings = append(bindings, binding)
+	}
+	sort.Slice(bindings, func(i, j int) bool { return bindings[i].Address < bindings[j].Address })
+	return bindings, nil
+}
+
+func snapshotDHCP(ctx context.Context, runner Runner, cfg DHCPConfig) DHCPSnapshot {
+	out := DHCPSnapshot{Enabled: cfg.Enabled}
+	if !cfg.Enabled {
 		return out
 	}
 	_, err := runner.Run(ctx, "systemctl", "is-active", "--quiet", keaUnit)
@@ -35,6 +184,16 @@ func snapshotDHCP(ctx context.Context, runner Runner, enabled bool) DHCPSnapshot
 		return out
 	}
 	out.Active = true
+	leaseFile, err := os.Open(keaLeasePath)
+	if err != nil {
+		out.LeaseBindingError = fmt.Sprintf("open Kea lease database: %v", err)
+		return out
+	}
+	defer leaseFile.Close()
+	out.LeaseBindings, err = parseKeaLeaseCSV(leaseFile, time.Now())
+	if err != nil {
+		out.LeaseBindingError = fmt.Sprintf("read Kea lease database: %v", err)
+	}
 	return out
 }
 

@@ -1,0 +1,21 @@
+[Unit]
+Description=GameBond 802.1X fail-closed event monitor for port %i
+After=gamebond-hostapd@%i.service
+Requires=gamebond-hostapd@%i.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/gamebond/8021x/ports/%i.env
+ExecStartPre=/usr/bin/gamebond-8021x-event --flush-interface ${GB_INTERFACE}
+ExecStart=/usr/sbin/hostapd_cli -p /run/gamebond-hostapd/%i -i ${GB_INTERFACE} -a /usr/bin/gamebond-8021x-event
+ExecStopPost=/usr/bin/gamebond-8021x-event --flush-interface ${GB_INTERFACE}
+Restart=always
+RestartSec=1s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

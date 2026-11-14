@@ -5,6 +5,12 @@ import (
 	"testing"
 )
 
+const (
+	ndiConfigurationSource = "https://docs.ndi.video/all/developing-with-ndi/sdk/configuration-files"
+	ndiMulticastSource     = "https://docs.ndi.video/all/getting-started/white-paper/multicast"
+	ndiLayoutSource        = "https://docs.ndi.video/all/getting-started/white-paper/network-layout"
+)
+
 func TestNDIMatchesCurrentNDINetworkGuidance(t *testing.T) {
 	p := NDI()
 
@@ -15,31 +21,42 @@ func TestNDIMatchesCurrentNDINetworkGuidance(t *testing.T) {
 		t.Fatalf("Name = %q, want %q", p.Name, "NDI")
 	}
 
-	want := map[string]string{
-		"transport.preferred": "reliable-udp",
-		"multicast.send":      "disabled",
-		"igmp.snooping":       "required-when-multicast-enabled",
-		"igmp.querier":        "required-when-multicast-enabled",
-		"link.minimum-speed":  "1-gbps-full-duplex",
-		"jumbo-frames":        "not-required",
+	type expectedSetting struct {
+		value  string
+		source string
+	}
+	want := map[string]expectedSetting{
+		"transport.preferred": {value: "reliable-udp", source: ndiConfigurationSource},
+		"multicast.send":      {value: "disabled", source: ndiMulticastSource},
+		"igmp.snooping":       {value: "required-when-multicast-enabled", source: ndiMulticastSource},
+		"igmp.querier":        {value: "required-when-multicast-enabled", source: ndiMulticastSource},
+		"link.minimum-speed":  {value: "1-gbps-full-duplex", source: ndiLayoutSource},
+		"jumbo-frames":        {value: "not-required", source: ndiConfigurationSource},
 	}
 	if len(p.Settings) != len(want) {
 		t.Fatalf("len(Settings) = %d, want %d", len(p.Settings), len(want))
 	}
+	seen := make(map[string]int, len(want))
 	for _, setting := range p.Settings {
-		value, ok := want[setting.Key]
+		expected, ok := want[setting.Key]
 		if !ok {
 			t.Errorf("unexpected setting key %q", setting.Key)
 			continue
 		}
-		if setting.Value != value {
-			t.Errorf("%s = %q, want %q", setting.Key, setting.Value, value)
+		seen[setting.Key]++
+		if setting.Value != expected.value {
+			t.Errorf("%s = %q, want %q", setting.Key, setting.Value, expected.value)
 		}
 		if setting.Rationale == "" {
 			t.Errorf("%s has an empty rationale", setting.Key)
 		}
-		if !strings.HasPrefix(setting.SourceURL, "https://docs.ndi.video/") {
-			t.Errorf("%s SourceURL = %q, want an official NDI documentation URL", setting.Key, setting.SourceURL)
+		if setting.SourceURL != expected.source {
+			t.Errorf("%s SourceURL = %q, want %q", setting.Key, setting.SourceURL, expected.source)
+		}
+	}
+	for key := range want {
+		if seen[key] != 1 {
+			t.Errorf("setting %q occurs %d times, want exactly once", key, seen[key])
 		}
 	}
 

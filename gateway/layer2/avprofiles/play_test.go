@@ -5,6 +5,8 @@ import (
 	"testing"
 )
 
+const playSourceURL = "https://help.ui.com/hc/en-us/articles/29946699826199-Getting-Started-with-UniFi-Play"
+
 func TestPlayDocumentsOnlyPublishedUniFiPlayNetworkGuidance(t *testing.T) {
 	p := Play()
 
@@ -25,8 +27,8 @@ func TestPlayDocumentsOnlyPublishedUniFiPlayNetworkGuidance(t *testing.T) {
 	if setting.Rationale == "" {
 		t.Fatal("setting rationale is empty")
 	}
-	if !strings.HasPrefix(setting.SourceURL, "https://help.ui.com/") {
-		t.Fatalf("SourceURL = %q, want an official Ubiquiti help URL", setting.SourceURL)
+	if setting.SourceURL != playSourceURL {
+		t.Fatalf("SourceURL = %q, want %q", setting.SourceURL, playSourceURL)
 	}
 
 	if len(p.Caveats) != 2 {

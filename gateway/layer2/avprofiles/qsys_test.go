@@ -5,6 +5,11 @@ import (
 	"testing"
 )
 
+const (
+	qsysNetworkSource   = "https://help.qsys.com/Content/Networking/Switches_Infrastructure.htm"
+	qsysChecklistSource = "https://www.qsys.com/products-solutions/q-sys/networking/q-sys-networking-solutions/qsc-q-sys-network-support-checklist/"
+)
+
 func TestQSYSMatchesQSYSNetworkRequirements(t *testing.T) {
 	p := QSYS()
 
@@ -15,35 +20,46 @@ func TestQSYSMatchesQSYSNetworkRequirements(t *testing.T) {
 		t.Fatalf("Name = %q, want %q", p.Name, "Q-SYS")
 	}
 
-	want := map[string]string{
-		"link.minimum-speed":   "1-gbps",
-		"qos.classification":   "diffserv-dscp",
-		"qos.queue.ptpv2":      "46:strict-highest",
-		"qos.queue.audio":      "34:strict-second-highest",
-		"qos.queue.video":      "26:third-highest",
-		"igmp.version":         "v2",
-		"igmp.snooping":        "enabled-for-multicast",
-		"igmp.querier":         "one-per-vlan",
-		"vlan.endpoint-frames": "untagged",
-		"jumbo-frames":         "disabled",
+	type expectedSetting struct {
+		value  string
+		source string
+	}
+	want := map[string]expectedSetting{
+		"link.minimum-speed":   {value: "1-gbps", source: qsysNetworkSource},
+		"qos.classification":   {value: "diffserv-dscp", source: qsysNetworkSource},
+		"qos.queue.ptpv2":      {value: "46:strict-highest", source: qsysNetworkSource},
+		"qos.queue.audio":      {value: "34:strict-second-highest", source: qsysNetworkSource},
+		"qos.queue.video":      {value: "26:third-highest", source: qsysNetworkSource},
+		"igmp.version":         {value: "v2", source: qsysNetworkSource},
+		"igmp.snooping":        {value: "enabled-for-multicast", source: qsysNetworkSource},
+		"igmp.querier":         {value: "one-per-vlan", source: qsysChecklistSource},
+		"vlan.endpoint-frames": {value: "untagged", source: qsysChecklistSource},
+		"jumbo-frames":         {value: "disabled", source: qsysChecklistSource},
 	}
 	if len(p.Settings) != len(want) {
 		t.Fatalf("len(Settings) = %d, want %d", len(p.Settings), len(want))
 	}
+	seen := make(map[string]int, len(want))
 	for _, setting := range p.Settings {
-		value, ok := want[setting.Key]
+		expected, ok := want[setting.Key]
 		if !ok {
 			t.Errorf("unexpected setting key %q", setting.Key)
 			continue
 		}
-		if setting.Value != value {
-			t.Errorf("%s = %q, want %q", setting.Key, setting.Value, value)
+		seen[setting.Key]++
+		if setting.Value != expected.value {
+			t.Errorf("%s = %q, want %q", setting.Key, setting.Value, expected.value)
 		}
 		if setting.Rationale == "" {
 			t.Errorf("%s has an empty rationale", setting.Key)
 		}
-		if !strings.HasPrefix(setting.SourceURL, "https://") || !strings.Contains(setting.SourceURL, "qsys.com/") {
-			t.Errorf("%s SourceURL = %q, want an official Q-SYS URL", setting.Key, setting.SourceURL)
+		if setting.SourceURL != expected.source {
+			t.Errorf("%s SourceURL = %q, want %q", setting.Key, setting.SourceURL, expected.source)
+		}
+	}
+	for key := range want {
+		if seen[key] != 1 {
+			t.Errorf("setting %q occurs %d times, want exactly once", key, seen[key])
 		}
 	}
 

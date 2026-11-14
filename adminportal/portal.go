@@ -458,6 +458,19 @@ func (p *Portal) apiGet(w http.ResponseWriter, r *http.Request, path string) {
 		p.send(w, 200, out, "application/json; charset=utf-8")
 		return
 	}
+	if path == "/api/gateway/layer2/profiles" {
+		if p.gateway == nil {
+			p.json(w, 200, map[string]any{"available": false})
+			return
+		}
+		out, err := p.gateway.Request(r.Context(), http.MethodGet, "/v1/layer2/profiles", nil)
+		if err != nil {
+			p.json(w, 200, map[string]any{"available": false, "error": err.Error()})
+			return
+		}
+		p.send(w, 200, out, "application/json; charset=utf-8")
+		return
+	}
 	routes := map[string]func() any{
 		"/api/hardware": func() any {
 			if p.o.Hardware == nil {
@@ -618,9 +631,18 @@ func (p *Portal) post(w http.ResponseWriter, r *http.Request, path string) {
 			return
 		}
 		p.json(w, 200, map[string]any{"ok": true, "error": nil, "result": out})
-	case "/api/gateway/validate", "/api/gateway/config":
+	case "/api/gateway/validate", "/api/gateway/plan", "/api/gateway/config", "/api/gateway/rollback":
 		if p.gateway == nil {
 			p.json(w, 503, map[string]any{"ok": false, "error": "gateway daemon is not configured"})
+			return
+		}
+		if path == "/api/gateway/rollback" {
+			out, err := p.gateway.Request(r.Context(), http.MethodPost, "/v1/config/rollback", nil)
+			if err != nil {
+				p.json(w, 422, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			p.send(w, 200, out, "application/json; charset=utf-8")
 			return
 		}
 		config, ok := b["config"]
@@ -634,7 +656,9 @@ func (p *Portal) post(w http.ResponseWriter, r *http.Request, path string) {
 			return
 		}
 		method, endpoint := http.MethodPost, "/v1/config/validate"
-		if path == "/api/gateway/config" {
+		if path == "/api/gateway/plan" {
+			endpoint = "/v1/config/plan"
+		} else if path == "/api/gateway/config" {
 			method, endpoint = http.MethodPut, "/v1/config"
 		}
 		out, err := p.gateway.Request(r.Context(), method, endpoint, raw)

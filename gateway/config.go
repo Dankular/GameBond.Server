@@ -35,6 +35,7 @@ type Config struct {
 	DynamicRouting DynamicRoutingConfig `json:"dynamic_routing"`
 	MDNS           MDNSConfig           `json:"mdns"`
 	RADIUS         RADIUSConfig         `json:"radius"`
+	Redundancy     RedundancyConfig     `json:"redundancy"`
 }
 
 // Interface assigns one Linux interface to one managed network role.
@@ -134,14 +135,24 @@ func (c Config) Validate() error {
 	if err := c.Routing.Validate(c.Interfaces); err != nil {
 		return fmt.Errorf("routing: %w", err)
 	}
-	if err := c.QoS.Validate(c.Interfaces); err != nil {
+	effectiveQoS, err := effectiveQoSConfig(c)
+	if err != nil {
+		return fmt.Errorf("qos: %w", err)
+	}
+	if err := effectiveQoS.QoS.Validate(effectiveQoS.Interfaces); err != nil {
 		return fmt.Errorf("qos: %w", err)
 	}
 	if err := c.DHCP.Validate(c.Interfaces); err != nil {
 		return fmt.Errorf("dhcp: %w", err)
 	}
+	if err := validateLayer2DHCPBindings(c.Layer2, c.DHCP.Enabled); err != nil {
+		return err
+	}
 	if err := c.VRRP.Validate(c.Interfaces); err != nil {
 		return fmt.Errorf("vrrp: %w", err)
+	}
+	if err := validateRedundancy(c.Redundancy, c.Layer2, c.VRRP, c.Interfaces); err != nil {
+		return err
 	}
 	if err := c.IGMPProxy.Validate(c.Interfaces); err != nil {
 		return fmt.Errorf("igmp_proxy: %w", err)
@@ -264,6 +275,18 @@ func (c Config) Validate() error {
 	for _, bridge := range c.Bridges {
 		if bridge.MaxLearnedEntries > 0 && !c.Features.MacLimit {
 			return errors.New("a nonzero bridge max_learned_entries requires features.mac_limit")
+		}
+	}
+	return nil
+}
+
+func validateLayer2DHCPBindings(cfg *layer2.Config, dhcpEnabled bool) error {
+	if cfg == nil {
+		return nil
+	}
+	for _, policy := range cfg.DHCPGuard {
+		if policy.ValidateBindings && !dhcpEnabled {
+			return fmt.Errorf("layer2 DHCP binding validation on %q requires managed DHCP to be enabled", policy.Interface)
 		}
 	}
 	return nil

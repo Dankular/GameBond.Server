@@ -18,6 +18,17 @@ import (
 type LinuxApplier struct{ Runner Runner }
 
 func (a LinuxApplier) Prepare(ctx context.Context, current, desired Config) (PreparedChange, error) {
+	if err := validateDHCPBindingAuthority(desired.Layer2); err != nil {
+		return nil, err
+	}
+	qosCurrent, err := effectiveQoSConfig(current)
+	if err != nil {
+		return nil, fmt.Errorf("current QoS policy: %w", err)
+	}
+	qosDesired, err := effectiveQoSConfig(desired)
+	if err != nil {
+		return nil, fmt.Errorf("desired QoS policy: %w", err)
+	}
 	var changes []bridgeLimitChange
 	targets := make(map[string]uint32, len(desired.Bridges))
 	for _, bridge := range desired.Bridges {
@@ -65,7 +76,15 @@ func (a LinuxApplier) Prepare(ctx context.Context, current, desired Config) (Pre
 		if err != nil {
 			return nil, fmt.Errorf("inspect Layer 2 host: %w", err)
 		}
+		if err := layer2.ValidateAVProfileCompatibility(desiredL2, host, effectiveAVQoSPolicies(qosDesired)); err != nil {
+			return nil, err
+		}
 		if desired.Layer2 != nil {
+			if len(desiredL2.PortMirrors) > 0 {
+				if err := validatePortMirrorProvider(ctx, a.Runner); err != nil {
+					return nil, err
+				}
+			}
 			var currentBonds []layer2.Bond
 			if current.Layer2 != nil {
 				currentBonds = current.Layer2.Bonds
@@ -97,6 +116,23 @@ func (a LinuxApplier) Prepare(ctx context.Context, current, desired Config) (Pre
 		prepared.layer2Previous = &previous
 		prepared.layer2Desired = &desiredL2
 		prepared.layer2Snapshot = snapshotConfig
+		if hasLLDPMEDPolicies(previous) || hasLLDPMEDPolicies(desiredL2) {
+			if err := validateLLDPMEDHost(ctx, a.Runner, previous, desiredL2); err != nil {
+				return nil, err
+			}
+			prepared.lldpMEDCurrent = previous
+			prepared.lldpMEDDesired = desiredL2
+		}
+		if len(previous.PortAuth) > 0 || len(desiredL2.PortAuth) > 0 {
+			if err := validatePortAuthHost(ctx, a.Runner, previous); err != nil {
+				return nil, fmt.Errorf("validate current 802.1X state: %w", err)
+			}
+			if err := validatePortAuthHost(ctx, a.Runner, desiredL2); err != nil {
+				return nil, err
+			}
+			prepared.portAuthCurrent = previous
+			prepared.portAuthDesired = desiredL2
+		}
 	}
 	if current.NAT.Enabled || desired.NAT.Enabled {
 		if !a.Runner.Available("nft") {
@@ -135,12 +171,12 @@ func (a LinuxApplier) Prepare(ctx context.Context, current, desired Config) (Pre
 		prepared.routingCurrent = cloneConfig(current)
 		prepared.routingDesired = cloneConfig(desired)
 	}
-	if current.QoS.Enabled || desired.QoS.Enabled {
-		if err := validateQoSHost(ctx, a.Runner, current, desired); err != nil {
+	if qosCurrent.QoS.Enabled || qosDesired.QoS.Enabled {
+		if err := validateQoSHost(ctx, a.Runner, qosCurrent, qosDesired); err != nil {
 			return nil, err
 		}
-		prepared.qosCurrent = cloneConfig(current)
-		prepared.qosDesired = cloneConfig(desired)
+		prepared.qosCurrent = cloneConfig(qosCurrent)
+		prepared.qosDesired = cloneConfig(qosDesired)
 	}
 	if current.DHCP.Enabled || desired.DHCP.Enabled {
 		if desired.DHCP.Enabled {
@@ -225,6 +261,88 @@ type bridgeLimitChange struct {
 
 func mergeLayer2SnapshotConfig(previous, desired layer2.Config) layer2.Config {
 	merged := desired
+	merged.Bridges = append([]layer2.Bridge(nil), desired.Bridges...)
+	networkIndex := make(map[string]int, len(merged.Networks))
+	for i := range merged.Networks {
+		networkIndex[merged.Networks[i].ID] = i
+	}
+	for _, old := range previous.Networks {
+		if index, exists := networkIndex[old.ID]; exists {
+			if merged.Networks[index].RouteInterface == "" {
+				merged.Networks[index].RouteInterface = old.RouteInterface
+			}
+		} else {
+			merged.Networks = append(merged.Networks, old)
+			networkIndex[old.ID] = len(merged.Networks) - 1
+		}
+	}
+	networkACLIDs := map[string]bool{}
+	for _, rule := range merged.NetworkACL {
+		networkACLIDs[rule.ID] = true
+	}
+	for _, rule := range previous.NetworkACL {
+		if !networkACLIDs[rule.ID] {
+			merged.NetworkACL = append(merged.NetworkACL, rule)
+			networkACLIDs[rule.ID] = true
+		}
+	}
+	bridgeIndex := make(map[string]int, len(merged.Bridges))
+	for i := range merged.Bridges {
+		bridgeIndex[merged.Bridges[i].ID] = i
+	}
+	for _, old := range previous.Bridges {
+		index, exists := bridgeIndex[old.ID]
+		if !exists {
+			// Keep removed bridges in the read-only snapshot config so STP
+			// controller discovery still runs before teardown planning.
+			merged.Bridges = append(merged.Bridges, old)
+			bridgeIndex[old.ID] = len(merged.Bridges) - 1
+			continue
+		}
+		bridge := merged.Bridges[index]
+		if bridge.STPMode == "" {
+			bridge.STPMode = old.STPMode
+		}
+		if bridge.STPEnabled == nil {
+			bridge.STPEnabled = old.STPEnabled
+		}
+		if bridge.STPPriority == nil {
+			bridge.STPPriority = old.STPPriority
+		}
+		bridge.Ports = append([]layer2.BridgePort(nil), bridge.Ports...)
+		portIndex := make(map[string]int, len(bridge.Ports))
+		for i := range bridge.Ports {
+			portIndex[bridge.Ports[i].Interface] = i
+		}
+		for _, oldPort := range old.Ports {
+			i, exists := portIndex[oldPort.Interface]
+			if !exists {
+				bridge.Ports = append(bridge.Ports, oldPort)
+				portIndex[oldPort.Interface] = len(bridge.Ports) - 1
+				continue
+			}
+			port := &bridge.Ports[i]
+			if port.STPPriority == nil {
+				port.STPPriority = oldPort.STPPriority
+			}
+			if port.STPPathCost == nil {
+				port.STPPathCost = oldPort.STPPathCost
+			}
+			if port.STPRootBlock == nil {
+				port.STPRootBlock = oldPort.STPRootBlock
+			}
+			if port.STPEdge == nil {
+				port.STPEdge = oldPort.STPEdge
+			}
+			if port.STPPointToPoint == "" {
+				port.STPPointToPoint = oldPort.STPPointToPoint
+			}
+			if port.STPBPDUGuard == nil {
+				port.STPBPDUGuard = oldPort.STPBPDUGuard
+			}
+		}
+		merged.Bridges[index] = bridge
+	}
 	seenNames := make(map[string]bool, len(desired.Interfaces))
 	for _, in := range desired.Interfaces {
 		seenNames[in.Name] = true
@@ -246,6 +364,26 @@ func mergeLayer2SnapshotConfig(previous, desired layer2.Config) layer2.Config {
 			seenRates[key] = true
 		}
 	}
+	seenStorm := map[string]bool{}
+	for _, policy := range merged.StormControl {
+		seenStorm[policy.Interface] = true
+	}
+	for _, policy := range previous.StormControl {
+		if !seenStorm[policy.Interface] {
+			merged.StormControl = append(merged.StormControl, policy)
+			seenStorm[policy.Interface] = true
+		}
+	}
+	seenMulticastBroadcast := map[string]bool{}
+	for _, policy := range merged.MulticastBroadcastLimits {
+		seenMulticastBroadcast[policy.Interface] = true
+	}
+	for _, policy := range previous.MulticastBroadcastLimits {
+		if !seenMulticastBroadcast[policy.Interface] {
+			merged.MulticastBroadcastLimits = append(merged.MulticastBroadcastLimits, policy)
+			seenMulticastBroadcast[policy.Interface] = true
+		}
+	}
 	seenFlow := map[string]bool{}
 	for _, policy := range merged.FlowControl {
 		seenFlow[policy.Interface] = true
@@ -254,6 +392,16 @@ func mergeLayer2SnapshotConfig(previous, desired layer2.Config) layer2.Config {
 		if !seenFlow[policy.Interface] {
 			merged.FlowControl = append(merged.FlowControl, policy)
 			seenFlow[policy.Interface] = true
+		}
+	}
+	seenQoS := map[string]bool{}
+	for _, policy := range merged.QoS {
+		seenQoS[policy.Interface] = true
+	}
+	for _, policy := range previous.QoS {
+		if !seenQoS[policy.Interface] {
+			merged.QoS = append(merged.QoS, policy)
+			seenQoS[policy.Interface] = true
 		}
 	}
 	return merged
@@ -296,9 +444,63 @@ type linuxPreparedChange struct {
 	radiusCurrent         Config
 	radiusDesired         Config
 	radiusApplied         bool
+	lldpMEDCurrent        layer2.Config
+	lldpMEDDesired        layer2.Config
+	lldpMEDApplied        bool
+	portAuthCurrent       layer2.Config
+	portAuthDesired       layer2.Config
+	portAuthPaused        bool
+	portAuthApplied       bool
+}
+
+// Summary returns bounded, human-readable provider actions without exposing
+// command strings or secrets from the prepared host transaction.
+func (p *linuxPreparedChange) Summary() []string {
+	operations := make([]string, 0, len(p.changes)+16)
+	if len(p.changes) > 0 {
+		operations = append(operations, fmt.Sprintf("reconcile %d bridge FDB learning limit(s)", len(p.changes)))
+	}
+	if p.layer2Plan != nil {
+		for _, change := range p.layer2Plan.Changes {
+			operations = append(operations, change.Description)
+		}
+	}
+	if hasLLDPMEDPolicies(p.lldpMEDCurrent) || hasLLDPMEDPolicies(p.lldpMEDDesired) {
+		operations = append(operations, "reconcile LLDP-MED and voice VLAN advertisements")
+	}
+	if len(p.portAuthCurrent.PortAuth) > 0 || len(p.portAuthDesired.PortAuth) > 0 {
+		operations = append(operations, "reconcile wired 802.1X RADIUS authenticators and fail-closed port authorization")
+	}
+	if strings.TrimSpace(p.natScript) != "" {
+		operations = append(operations, "reconcile GameBond NAT rules")
+	}
+	for _, item := range []struct {
+		active bool
+		name   string
+	}{
+		{p.routingCurrent.Routing.Enabled || p.routingDesired.Routing.Enabled, "policy routing"},
+		{p.qosCurrent.QoS.Enabled || p.qosDesired.QoS.Enabled, "shared QoS"},
+		{p.dhcpCurrent.DHCP.Enabled || p.dhcpDesired.DHCP.Enabled, "DHCP service"},
+		{p.vrrpCurrent.VRRP.Enabled || p.vrrpDesired.VRRP.Enabled, "VRRP service"},
+		{p.igmpCurrent.IGMPProxy.Enabled || p.igmpDesired.IGMPProxy.Enabled, "IGMP proxy"},
+		{p.dynamicRoutingCurrent.DynamicRouting.Enabled || p.dynamicRoutingDesired.DynamicRouting.Enabled, "dynamic routing"},
+		{p.mdnsCurrent.MDNS.Enabled || p.mdnsDesired.MDNS.Enabled, "mDNS reflection"},
+		{p.radiusCurrent.RADIUS.Enabled || p.radiusDesired.RADIUS.Enabled, "RADIUS service"},
+	} {
+		if item.active {
+			operations = append(operations, "reconcile "+item.name)
+		}
+	}
+	return operations
 }
 
 func (p *linuxPreparedChange) Apply(ctx context.Context) error {
+	if len(p.portAuthCurrent.PortAuth) > 0 || len(p.portAuthDesired.PortAuth) > 0 {
+		p.portAuthPaused = true
+		if err := pausePortAuthServices(ctx, p.runner, p.portAuthCurrent); err != nil {
+			return err
+		}
+	}
 	for i, change := range p.changes {
 		p.applied = i + 1 // include this interface in rollback if the kernel rejects a partial request
 		if _, err := p.runner.Run(ctx, "ip", "link", "set", "dev", change.iface, "type", "bridge", "fdb_max_learned", strconv.FormatUint(uint64(change.after), 10)); err != nil {
@@ -310,6 +512,18 @@ func (p *linuxPreparedChange) Apply(ctx context.Context) error {
 			return err
 		}
 		p.layer2Applied = true
+	}
+	if len(p.portAuthCurrent.PortAuth) > 0 || len(p.portAuthDesired.PortAuth) > 0 {
+		p.portAuthApplied = true
+		if err := applyPortAuthTransition(ctx, p.runner, p.portAuthCurrent, p.portAuthDesired); err != nil {
+			return err
+		}
+	}
+	if hasLLDPMEDPolicies(p.lldpMEDCurrent) || hasLLDPMEDPolicies(p.lldpMEDDesired) {
+		p.lldpMEDApplied = true
+		if err := applyLLDPMEDTransition(ctx, p.runner, p.lldpMEDCurrent, p.lldpMEDDesired); err != nil {
+			return err
+		}
 	}
 	if strings.TrimSpace(p.natScript) != "" {
 		if err := applyNATScript(ctx, p.runner, p.natScript, false); err != nil {
@@ -416,7 +630,7 @@ func (p *linuxPreparedChange) Verify(ctx context.Context) error {
 		}
 	}
 	if p.dhcpApplied {
-		status := snapshotDHCP(ctx, p.runner, p.dhcpDesired.DHCP.Enabled)
+		status := snapshotDHCP(ctx, p.runner, p.dhcpDesired.DHCP)
 		if status.Error != "" || status.Active != p.dhcpDesired.DHCP.Enabled {
 			return errors.New("GameBond DHCP service verification failed: " + status.Error)
 		}
@@ -443,6 +657,16 @@ func (p *linuxPreparedChange) Verify(ctx context.Context) error {
 	}
 	if p.radiusApplied {
 		if err := verifyRADIUS(ctx, p.runner, p.radiusDesired.RADIUS); err != nil {
+			return err
+		}
+	}
+	if p.lldpMEDApplied {
+		if err := verifyLLDPMED(ctx, p.runner, p.lldpMEDDesired); err != nil {
+			return err
+		}
+	}
+	if p.portAuthApplied {
+		if err := verifyPortAuth(ctx, p.runner, p.portAuthDesired); err != nil {
 			return err
 		}
 	}
@@ -511,6 +735,16 @@ func (p *linuxPreparedChange) Rollback(ctx context.Context) error {
 			if first == nil {
 				first = fmt.Errorf("restore Layer 2 topology: %w", err)
 			}
+		}
+	}
+	if p.lldpMEDApplied {
+		if err := applyLLDPMEDTransition(ctx, p.runner, p.lldpMEDDesired, p.lldpMEDCurrent); err != nil && first == nil {
+			first = fmt.Errorf("restore LLDP-MED policy: %w", err)
+		}
+	}
+	if p.portAuthPaused || p.portAuthApplied {
+		if err := applyPortAuthTransition(ctx, p.runner, p.portAuthDesired, p.portAuthCurrent); err != nil && first == nil {
+			first = fmt.Errorf("restore wired 802.1X state: %w", err)
 		}
 	}
 	for i := p.applied - 1; i >= 0; i-- {

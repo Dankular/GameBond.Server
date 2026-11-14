@@ -64,32 +64,33 @@ The existing gateway foundation plan is a prerequisite and owns the `gateway` da
 
 **Files:** `GameBond.Client/FEATURES.md`, `GameBond.Client/docs/superpowers/specs/2026-11-13-linux-router-capabilities-design.md`.
 
-- [ ] Add a `Layer 2 Gateway Features (planned)` section listing each requested capability exactly once.
-- [ ] Group the list by switching, resilience, multicast/media, access control, and traffic control while preserving individual feature names.
-- [ ] State that configuration availability is not proof of host support or application.
-- [ ] Add the Layer 2 design to the canonical Linux router spec and identify the `gatewayd` host boundary.
-- [ ] Review the list against the user's request and confirm no item or AV profile is missing or duplicated.
+- [x] Add a `Layer 2 Gateway Features` status section listing each requested capability exactly once.
+- [x] Group the list by switching, resilience, multicast/media, access control, and traffic control while preserving individual feature names.
+- [x] State that configuration availability is not proof of host support or application.
+- [x] Add the Layer 2 design to the canonical Linux router spec and identify the `gatewayd` host boundary.
+- [x] Review the list against the user's request and confirm no item or AV profile is missing or duplicated.
 
 ### Task 1b: Integrate the optional admin-portal gateway socket
 
-**Files:** `GameBond.Server/adminportal/gateway.go`, `GameBond.Server/adminportal/portal.go`, `GameBond.Server/cmd/edge/main_linux.go`, `GameBond.Server/gateway/api.go`, `GameBond.Server/compose.gateway.yaml`, `GameBond.Server/docs/admin-portal.md`.
+**Files:** `adminportal/gateway.go`, `adminportal/portal.go`, `cmd/edge/main_linux.go`, `gateway/api_linux.go`, `compose.gateway.yaml`, `docs/linux-router.md`.
 
-- [ ] Define a client that dials only the configured Unix socket and supports the allowlisted status, validate, plan, apply, and rollback API operations with request/response size bounds.
-- [ ] Require the existing portal authentication and CSRF checks before forwarding mutating requests; keep the daemon-side schema/capability validation authoritative.
-- [ ] Add an optional Compose overlay with a read-only bind mount of the dedicated socket directory and a configured shared group ID; do not change the default Compose service's network mode or capabilities.
-- [ ] If the socket is absent, expose gateway management as unavailable and preserve existing tunnel/admin portal startup.
-- [ ] Document the host socket ownership/mode, group mapping, optional overlay activation, and the fact that the socket still grants its allowlisted host-management API to the edge container.
+- [x] Define a client that dials only the configured Unix socket and supports the allowlisted status, validate, plan, apply, and rollback API operations with request/response size bounds.
+- [x] Require the existing portal authentication and CSRF checks before forwarding mutating requests; keep the daemon-side schema/capability validation authoritative.
+- [x] Add an optional Compose overlay with a read-only bind mount of the dedicated socket directory and a configured shared group ID; do not change the default Compose service's network mode or capabilities.
+- [x] If the socket is absent, expose gateway management as unavailable and preserve existing tunnel/admin portal startup.
+- [x] Document the host socket ownership/mode, group mapping, optional overlay activation, and the fact that the socket still grants its allowlisted host-management API to the edge container.
 
 ### Task 2: Define shared Layer 2 desired state and capability contract
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/capabilities_linux.go`, `gateway/layer2/config_test.go`, `gateway/layer2/capabilities_test.go`.
 
-- [ ] Add strict, versioned configuration objects for managed interfaces, bridges, VLANs/virtual networks, port membership, feature settings, and provider selection.
-- [ ] Implement the base managed bridge, VLAN-filtering, and port-membership provider operations needed by every higher-level Layer 2 capability; snapshot current state and include these operations in the existing reversible apply transaction.
-- [ ] Reject unknown fields, invalid identifiers, duplicate interface ownership, missing references, invalid ranges, and feature dependency conflicts before creating an apply plan.
-- [ ] Report each capability as supported, unsupported, or unavailable with a machine-readable reason and discovered kernel/tool/provider requirements.
-- [ ] Define the operation interface consumed by the existing reversible gateway transaction coordinator.
-- [ ] Add tests for malformed configuration, interface conflicts, unsupported capability rejection, and deterministic serialization.
+- [x] Add strict, versioned configuration objects for managed interfaces, bridges, VLANs/virtual networks, port membership, and feature settings.
+- [x] Select the sole verified Linux provider for each integrated capability; STP/RSTP provider mode is explicit in typed bridge settings (`stp_mode` selects `mstpd` RSTP). Unsupported vendor or alternate providers are rejected rather than selected implicitly.
+- [x] Implement the base managed bridge, VLAN-filtering, and port-membership operations; snapshot and reversible transaction integration are in place.
+- [x] Reject unknown fields, invalid identifiers, duplicate interface ownership, missing references, invalid ranges, and feature dependency conflicts before planning.
+- [x] Report capabilities as supported, unsupported, or unavailable with machine-readable reasons and discovered kernel/tool/provider requirements.
+- [x] Feed deterministic Layer 2 plan operations into the existing reversible gateway transaction coordinator.
+- [x] Test malformed configuration, interface conflicts, unsupported capability rejection, and deterministic serialization.
 
 ### Task 3: Add virtual network override
 
@@ -145,7 +146,7 @@ The existing gateway foundation plan is a prerequisite and owns the `gateway` da
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
 - [x] Define ordered IP prefix/protocol/port policies tied to named virtual networks.
-- [ ] Enforce routed inter-network isolation through the gateway firewall, with explicit allows between named networks.
+- [x] Enforce routed inter-network isolation through an owned inet forward chain, with explicit allows between named networks and default deny for other routed pairs.
 - [x] Apply an atomic GameBond-owned bridge-family ACL table and report active rule counters without replacing unrelated host firewall state.
 
 ### Task 10: Add Egress Rate Limit
@@ -168,81 +169,87 @@ The existing gateway foundation plan is a prerequisite and owns the `gateway` da
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Define DSCP-to-class and class-to-queue/rate policy shared with the existing adaptive QoS model.
-- [ ] Apply `tc` classification and queue policy without overriding GameBond tunnel DSCP semantics.
-- [ ] Report class counters and effective mappings.
+- [x] Define DSCP-to-class and class-to-queue/rate policy shared with the existing adaptive QoS model.
+- [x] Apply `tc` classification and queue policy without overriding GameBond tunnel DSCP semantics.
+- [x] Report class counters and effective mappings.
 
 ### Task 13: Add Storm Control
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Define per-port broadcast, multicast, and unknown-unicast thresholds and action.
-- [ ] Apply only supported policers and report whether enforcement is kernel, driver, or hardware offload.
-- [ ] Verify thresholds and expose drop counters.
+- [ ] Define per-port broadcast and multicast thresholds and drop action; generic Linux `tc` cannot classify unknown-unicast based on the bridge FDB, so that class remains unsupported.
+- [x] Apply broadcast/multicast policers with `skip_hw` and report software `tc` enforcement.
+- [x] Verify configured thresholds and expose drop counters.
 
 ### Task 14: Add Multicast and Broadcast Rate Limiting
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Define separate multicast and broadcast rate/burst policies and scope.
-- [ ] Apply supported policers without disabling IGMP control traffic needed by snooping.
-- [ ] Verify counters and policy precedence with ACL and storm-control settings.
+- [x] Define separate per-interface multicast and broadcast rate/burst policies.
+- [x] Apply dedicated-priority `tc` policers; reject multicast policing on IGMP-snooping ports and reject overlapping classes with storm control.
+- [x] Verify exact filters and drop counters; policers run at `tc` ingress before bridge-family ACL evaluation.
 
 ### Task 15: Add IGMP Snooping
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Configure Linux bridge multicast snooping per bridge and VLAN where available.
-- [ ] Report MDB membership, listener ports, and querier presence from effective kernel state.
-- [ ] Reject unsupported per-VLAN behavior rather than silently applying a bridge-global setting.
+- [x] Configure Linux bridge multicast snooping per bridge and VLAN using bridge VLAN global controls where available.
+- [x] Report MDB membership, listener ports, and multicast-router ports from effective kernel state; elected-querier presence remains a reporting gap.
+- [x] Gate per-VLAN changes on host capability and known live state, with exact rollback; reject unknown or unsupported state.
 
 ### Task 16: Add Advanced IGMP Configuration
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Implement Querier, Fast Leave, and Router Port as independently configurable settings.
-- [ ] Validate that Fast Leave is not enabled on shared downstream segments where multiple listeners can share one port.
-- [ ] Verify effective bridge/VLAN settings and report the detected multicast-router port state.
+- [x] Implement Querier, Fast Leave, and Router Port as independently configurable settings.
+- [x] Validate that Fast Leave is not enabled on shared downstream segments where multiple listeners can share one port; require explicit non-shared confirmation.
+- [x] Verify effective bridge settings and report the detected multicast-router port state.
 
 ### Task 17: Add DHCP Snooping and Guarding
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Define trusted DHCP server ports, untrusted access ports, rate limits, and optional binding-table retention.
-- [ ] Enforce DHCP server replies only on trusted ports and validate client binding before applying related IP/MAC guards.
-- [ ] Preserve the existing DHCP server behavior where configured and report lease/binding conflicts.
+- [x] Define per-port trusted/untrusted roles and bounded DHCP request rate limits.
+- [x] Read the managed Kea memfile lease database into runtime status, using the latest record per IPv4 address and excluding expired, declined, or released leases.
+- [ ] Enforce IPv4/MAC/bridge-port tuples on opted-in untrusted ports from an authoritative DHCP ingress source. Kea memfile has no receiving port and learned FDB state is not trusted; requests currently fail closed before host changes.
+- [ ] Add configurable binding-table retention after authoritative DHCP ingress metadata is integrated.
+- [x] Enforce DHCP server replies only on trusted ports and report unsupported client binding enforcement distinctly.
+- [x] Preserve existing Kea DHCP server behavior; do not claim lease bindings are enforced from endpoint-influenced FDB state.
 
 ### Task 18: Add 802.1X Control
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`, provider service packaging.
 
-- [ ] Select and package a Linux authenticator provider only after documenting supported driver modes and RADIUS behavior.
-- [ ] Define port authorization states, controlled/uncontrolled traffic, reauthentication, and failure policy.
-- [ ] Keep credentials write-only, validate provider-native config before activation, and report supplicant/authenticator state per port.
+**Provider constraint:** hostapd can act as the wired RADIUS authenticator, but it does not enforce the bridge traffic decision by itself. The feature must include a fail-closed bridge traffic-plane controller driven by authenticated-client events; hostapd status alone is not sufficient evidence of access control. Wired EAPOL forwarding through the Linux bridge must be enabled and verified, and the interaction with the selected STP controller must be tested for the supported kernel/provider matrix before this capability is advertised. The current RHEL wired-auth example sets bridge group-forward-mask `8` and disables STP, so the generic integration must not assume that EAPOL forwarding and the project's STP/RSTP path coexist automatically.
+
+- [x] Select and package the Linux hostapd wired authenticator provider; document its `wired` driver mode, external RADIUS settings, and separate traffic-plane enforcement behavior.
+- [x] Define per-port authorization through a fail-closed nftables set, EAPOL-only unauthenticated traffic, reauthentication, and closed failure behavior; reject the unverified STP/RSTP combination.
+- [ ] Keep credentials write-only, validate provider-native config before activation, and report supplicant/authenticator state per port. Credentials stay out of management JSON, protected configs are generated from root-only secrets, service health and authorized clients are reported; hostapd has no non-activating native config-check mode, so config rejection is currently detected by transactional service startup and rollback.
 
 ### Task 19: Add Voice VLAN
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Define voice VLAN membership, tagged/untagged behavior, and device identification source.
-- [ ] Validate it against LLDP-MED policy and existing access VLAN assignments.
-- [ ] Apply and report effective VLAN membership per port.
+- [x] Define voice VLAN membership as a tagged `voice_network` on each bridge port; LLDP-MED network policy identifies the phone-facing voice VLAN.
+- [x] Validate it against LLDP-MED application policy and the port's tagged/untagged access network assignments.
+- [x] Apply through the reversible bridge VLAN plan and report advertised voice policy plus effective bridge VLAN state.
 
 ### Task 20: Add LLDP-MED
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`, provider service packaging.
 
-- [ ] Select a Linux LLDP provider and document its supported LLDP-MED policies and capabilities.
-- [ ] Configure network policy, voice/application VLAN, and power-via-MDI fields only when supported by provider and NIC.
-- [ ] Report advertised and received LLDP-MED data with secrets and untrusted input handled safely.
+- [x] Select `lldpd`/`lldpcli` as the Linux provider and document supported application-policy values and provider constraints.
+- [x] Configure network policy and voice/application VLAN through the reversible bridge plan and LLDP-MED provider.
+- [ ] Probe provider/NIC power-via-MDI support before exposing power fields.
+- [x] Report configured advertised policies and bounded, JSON-validated received neighbor data; LLDP input is exposed as data and never used for authorization.
 
 ### Task 21: Add STP and RSTP
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`, provider service packaging.
 
-- [ ] Report the kernel bridge STP mode and select a compatible RSTP implementation where rapid convergence is requested.
-- [ ] Define bridge priority, port priority, path cost, edge/point-to-point role, and BPDU guard behavior.
-- [ ] Validate one authoritative STP controller per bridge and report root, role, state, and topology changes.
+- [x] Report kernel bridge STP state, select STP/RSTP through `mstpd` when requested, and read back root ID/port, per-port role/state, and topology-change state/count.
+- [x] Define and apply bridge priority, port priority, path cost, root-block, edge, point-to-point, and BPDU-guard controls with live-state reads and rollback; edge and BPDU-guard settings require the `mstpd` RSTP controller.
+- [x] Validate controller ownership before planning: inspect known local STP services and query NetworkManager, systemd-networkd, and Open vSwitch per affected bridge/port; fail closed for managed targets or ambiguous ownership. Arbitrary external agents and remote switches cannot be discovered reliably.
 
 ### Task 22: Add Loop Protection
 
@@ -265,9 +272,9 @@ The existing gateway foundation plan is a prerequisite and owns the `gateway` da
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Define the supported redundancy policy as a health/status coordinator over configured mechanisms such as LACP, STP/RSTP, and VRRP; do not implement a second independent failover protocol.
-- [ ] Attribute every transition to the mechanism that owns it and reject overlapping failover controllers on the same network/interface.
-- [ ] Report active/standby state, tracked health, transitions, recovery behavior, and any mechanism that is unavailable on this host.
+- [x] Define the supported redundancy policy as a health/status coordinator over configured mechanisms such as LACP, STP/RSTP, and VRRP; do not implement a second independent failover protocol.
+- [x] Attribute every transition to the mechanism whose health or role changed and reject cross-group overlap on shared bond, bridge, port, and VRRP interface resources.
+- [x] Report active/standby state, tracked health, transitions, recovery behavior, and unavailable mechanisms with reasons; recovery guidance remains owned by each underlying mechanism.
 
 ### Task 25: Add MC-LAG
 
@@ -281,18 +288,18 @@ The existing gateway foundation plan is a prerequisite and owns the `gateway` da
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`, provider service packaging.
 
-- [ ] Define shadow/standby role, virtual IP/MAC behavior, priority, preemption, advertisements, and tracked health.
-- [ ] Select a Linux VRRP provider and validate peer subnet/interface compatibility.
-- [ ] Apply provider-native config transactionally and report MASTER/BACKUP/FAULT role and failover events.
-- [ ] State that conntrack/session continuity is unavailable unless a separate state-sync capability is configured and verified.
+- [x] Define a non-preempting BACKUP role, virtual IPs, peer addresses, priority, and advertisement interval; explicit virtual-MAC control and tracked health remain open.
+- [x] Select Keepalived and validate peer and VIP subnet compatibility against the live interface before apply.
+- [x] Apply the provider config transactionally and report MASTER/BACKUP/FAULT from service and local VIP ownership; event history is not yet exposed.
+- [x] Document that conntrack/session continuity is unavailable without a separate verified state-sync provider.
 
 ### Task 27: Add Port Mirroring
 
 **Files:** `gateway/layer2/config.go`, `gateway/layer2/capabilities_linux.go`, `gateway/layer2/provider_linux.go`, `gateway/layer2/status_linux.go`.
 
-- [ ] Define source interfaces/directions, one destination, VLAN scope, and capture limits.
-- [ ] Detect supported driver/`tc` mirroring behavior before apply and reject a destination that is also a forwarding source.
-- [ ] Report effective mirror action and counters without retaining packet payloads.
+- [x] Define source interfaces/directions, one dedicated destination, tagged VLAN scope, and a TBF capture-rate/burst limit.
+- [x] Prove software `tc mirred` support in an isolated veth namespace before apply; force the mirror filters onto the software path, reject non-standalone destinations, and verify effective filters after apply.
+- [x] Report effective mirror action and packet/byte counters without retaining packet payloads.
 
 ### Tasks 28–35: Add Pro AV profiles one at a time
 
@@ -300,18 +307,18 @@ The existing gateway foundation plan is a prerequisite and owns the `gateway` da
 
 For each separate profile (28 Play, 29 Dante, 30 Q-SYS, 31 NDI, 32 SDVoE, 33 Shure, 34 AES67, 35 Crestron):
 
-- [ ] Research current primary vendor/standards documentation for the named profile and record exact multicast, QoS/DSCP, VLAN, and MTU recommendations that the profile changes.
-- [ ] Represent only documented settings as a named preset; do not claim protocol certification, device discovery, or interoperability testing.
-- [ ] Validate compatibility with the active network, DSCP map, IGMP configuration, and other profiles before apply.
-- [ ] Apply through the same reversible provider plan and expose the selected profile plus effective settings.
-- [ ] Add a profile-specific configuration/plan test that proves its settings and conflict handling independently.
+- [ ] Recheck primary vendor/standards documentation for all eight catalogue entries and confirm every recommendation remains current; profile source URLs and setting-level rationale are recorded in the preset implementations and tests.
+- [x] Represent the documented recommendations as named presets and state that they do not imply certification, discovery, or interoperability testing.
+- [x] Reconcile required minimum link speeds across every bridge member carrying a selected AV network and validate numeric DSCP/queue recommendations against the final merged Layer 2 plus adaptive QoS map when QoS is active. External switch/endpoint recommendations and optional QoS remain advisory.
+- [x] Persist per-network profile selections through the reversible gateway config transaction and expose the complete recommendation catalogue through the authenticated gateway API and portal proxy. Minimum link speed and active numeric QoS requirements are validated; external switch/endpoint controls and recommendations without verified providers remain advisory.
+- [x] Add per-profile setting/source assertions, stable catalogue coverage, per-network selection validation, cross-profile conflict tests, and gateway/portal catalogue route tests.
 
 ## Completion and Integration
 
-- [ ] Run focused gateway package and admin portal tests after each feature integration, then the complete Server and Client suites after all features are integrated.
-- [ ] Run Linux namespace/veth integration checks for bridge, VLAN, ACL, IGMP, DHCP guarding, shaping, LACP where two virtual peers are available, and rollback.
-- [ ] Run a deployment acceptance check proving the existing edge Compose service remains isolated and the host daemon alone owns host interfaces.
-- [ ] Update the admin portal documentation, install guide, capability matrix, and `FEATURES.md` to distinguish available, unsupported, and implemented capabilities.
-- [ ] Review all diffs and stage only Layer 2 integration files; preserve pre-existing local file mode changes and unrelated working tree edits.
-- [ ] Commit the Client roadmap/spec change separately. Commit each Server feature integration as its own descriptive commit so every capability remains independently reviewable.
+- [x] Run focused gateway and admin portal tests plus the full Server suite and build; all pass. The full Client suite is not green because of existing unrelated `native-edge` compile/runtime failures (`Manager.Sessions`, Linux test missing Windows-only `OpenDevice`, noexec `/tmp`, and a timing-sensitive throughput assertion); `netstack` passes.
+- [ ] Run Linux namespace/veth integration checks for bridge, VLAN, ACL, IGMP, DHCP guarding, shaping, LACP where two virtual peers are available, and rollback. Isolated veth, bridge VLAN, multicast snooping, and software mirroring pass; the host kernel rejects nftables bridge-table creation as unsupported, so ACL, DHCP, and 802.1X live checks remain unavailable here.
+- [ ] Run a deployment acceptance check proving the existing edge Compose service remains isolated and the host daemon alone owns host interfaces. The optional Compose overlay renders with the edge service on its bridge network, read-only gateway socket mount, and the separate root-owned host service; no live deployment was run.
+- [x] Update the admin portal documentation, install guide, capability matrix, and `FEATURES.md` to distinguish available, unsupported, and implemented capabilities.
+- [x] Review diffs and stage only Layer 2 integration files; preserve unrelated Client working tree changes and local file-mode noise.
+- [x] Commit the Client Layer 2 roadmap change separately and the integrated Server subsystem as a descriptive, reviewable commit.
 - [ ] Push the requested commits only after confirming the intended branch and the commits already ahead of each remote.

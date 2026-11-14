@@ -37,12 +37,15 @@ func (c *GatewayClient) Request(ctx context.Context, method, endpoint string, co
 		return nil, errors.New("gateway socket is not configured")
 	}
 	if !(method == http.MethodGet && endpoint == "/v1/status") &&
+		!(method == http.MethodGet && endpoint == "/v1/layer2/profiles") &&
 		!(method == http.MethodPost && endpoint == "/v1/config/validate") &&
+		!(method == http.MethodPost && endpoint == "/v1/config/plan") &&
+		!(method == http.MethodPost && endpoint == "/v1/config/rollback") &&
 		!(method == http.MethodPut && endpoint == "/v1/config") {
 		return nil, errors.New("gateway endpoint is not allowed")
 	}
 	var body io.Reader
-	if method != http.MethodGet {
+	if endpoint != "/v1/config/rollback" && method != http.MethodGet {
 		if len(config) == 0 || len(config) > maxBody || !json.Valid(config) || config[0] != '{' {
 			return nil, errors.New("gateway config must be a bounded JSON object")
 		}

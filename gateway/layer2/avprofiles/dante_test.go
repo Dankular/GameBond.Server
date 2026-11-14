@@ -5,6 +5,11 @@ import (
 	"testing"
 )
 
+const (
+	danteNetworkAdminSource = "https://assets.audinate.com/wp-content/uploads/2022/03/dante-information-for-network-admins.pdf"
+	danteSnoopingSource     = "https://go.audinate.com/hubfs/implementing-dante-AV-over-IP_techpaper-20220314-en.pdf?hsLang=en"
+)
+
 func TestDanteMatchesAudinateNetworkAdministratorGuidance(t *testing.T) {
 	p := Dante()
 
@@ -15,34 +20,46 @@ func TestDanteMatchesAudinateNetworkAdministratorGuidance(t *testing.T) {
 		t.Fatalf("Name = %q, want %q", p.Name, "Dante")
 	}
 
-	want := map[string]string{
-		"qos.queueing":              "strict-priority",
-		"qos.dscp.ptp":              "56",
-		"qos.dscp.audio-ptpv2":      "46",
-		"qos.dscp.reserved":         "8",
-		"qos.dscp.other":            "0",
-		"igmp.snooping":             "enabled-when-needed",
-		"igmp.version":              "v2-or-v3",
-		"igmp.querier":              "one-per-vlan",
-		"energy-efficient-ethernet": "disabled",
+	type expectedSetting struct {
+		value  string
+		source string
+	}
+	want := map[string]expectedSetting{
+		"qos.queueing":              {value: "strict-priority", source: danteNetworkAdminSource},
+		"qos.queue.order":           {value: "56>46>8", source: danteNetworkAdminSource},
+		"qos.dscp.ptp":              {value: "56", source: danteNetworkAdminSource},
+		"qos.dscp.audio-ptpv2":      {value: "46", source: danteNetworkAdminSource},
+		"qos.dscp.reserved":         {value: "8", source: danteNetworkAdminSource},
+		"qos.dscp.other":            {value: "0", source: danteNetworkAdminSource},
+		"igmp.snooping":             {value: "enabled-when-needed", source: danteSnoopingSource},
+		"igmp.version":              {value: "v2-or-v3", source: danteNetworkAdminSource},
+		"igmp.querier":              {value: "one-per-vlan", source: danteNetworkAdminSource},
+		"energy-efficient-ethernet": {value: "disabled", source: danteNetworkAdminSource},
 	}
 	if len(p.Settings) != len(want) {
 		t.Fatalf("len(Settings) = %d, want %d", len(p.Settings), len(want))
 	}
+	seen := make(map[string]int, len(want))
 	for _, setting := range p.Settings {
-		value, ok := want[setting.Key]
+		expected, ok := want[setting.Key]
 		if !ok {
 			t.Errorf("unexpected setting key %q", setting.Key)
 			continue
 		}
-		if setting.Value != value {
-			t.Errorf("%s = %q, want %q", setting.Key, setting.Value, value)
+		seen[setting.Key]++
+		if setting.Value != expected.value {
+			t.Errorf("%s = %q, want %q", setting.Key, setting.Value, expected.value)
 		}
 		if setting.Rationale == "" {
 			t.Errorf("%s has an empty rationale", setting.Key)
 		}
-		if !strings.HasPrefix(setting.SourceURL, "https://assets.audinate.com/") {
-			t.Errorf("%s SourceURL = %q, want an official Audinate URL", setting.Key, setting.SourceURL)
+		if setting.SourceURL != expected.source {
+			t.Errorf("%s SourceURL = %q, want %q", setting.Key, setting.SourceURL, expected.source)
+		}
+	}
+	for key := range want {
+		if seen[key] != 1 {
+			t.Errorf("setting %q occurs %d times, want exactly once", key, seen[key])
 		}
 	}
 

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Dankular/GameBond.Server/gateway/layer2"
+	"github.com/Dankular/GameBond.Server/gateway/layer2/avprofiles"
 )
 
 // APIServer serves local configuration and status over a permission-protected Unix socket.
@@ -125,6 +126,23 @@ func (s *APIServer) handler() http.Handler {
 	mux.HandleFunc("GET /v1/config", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.Manager.Current())
 	})
+	mux.HandleFunc("GET /v1/layer2/profiles", func(w http.ResponseWriter, r *http.Request) {
+		current := s.Manager.Current()
+		selected := []map[string]any{}
+		if current.Layer2 != nil {
+			for _, selection := range current.Layer2.AVProfiles {
+				profile, ok := avprofiles.Lookup(selection.Profile)
+				if !ok {
+					continue
+				}
+				selected = append(selected, map[string]any{
+					"network": selection.Network, "profile": profile,
+					"enforcement": "advisory",
+				})
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"catalog": avprofiles.All(), "selected": selected})
+	})
 	mux.HandleFunc("POST /v1/config/validate", func(w http.ResponseWriter, r *http.Request) {
 		cfg, err := decodeRequestConfig(w, r)
 		if err != nil {
@@ -154,24 +172,69 @@ func (s *APIServer) handler() http.Handler {
 			writeError(w, http.StatusBadRequest, errors.New("host does not expose a readable conntrack table"))
 			return
 		}
+		current := s.Manager.Current()
 		response := map[string]any{"valid": true, "capabilities": caps}
 		if cfg.Layer2 != nil {
-			l2Caps, err := layer2.SnapshotCapabilities(r.Context(), *cfg.Layer2, layer2RunnerAdapter{runner: s.Runner})
+			l2Caps, err := snapshotLayer2ValidationCapabilities(r.Context(), current, *cfg.Layer2, s.Runner)
 			if err != nil {
 				writeError(w, http.StatusServiceUnavailable, err)
 				return
 			}
-			if _, err := layer2.BuildTopologyPlan(layer2.Config{Version: 1}, *cfg.Layer2, l2Caps); err != nil {
+			if err := validateLayer2PlanAgainstCurrent(current, *cfg.Layer2, l2Caps); err != nil {
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}
 			response["layer2_capabilities"] = l2Caps
 		}
-		if _, err := (LinuxApplier{Runner: s.Runner}).Prepare(r.Context(), s.Manager.Current(), cfg); err != nil {
+		if _, err := (LinuxApplier{Runner: s.Runner}).Prepare(r.Context(), current, cfg); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, response)
+	})
+	mux.HandleFunc("POST /v1/config/plan", func(w http.ResponseWriter, r *http.Request) {
+		cfg, err := decodeRequestConfig(w, r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := cfg.Validate(); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		prepared, err := (LinuxApplier{Runner: s.Runner}).Prepare(r.Context(), s.Manager.Current(), cfg)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		plan, ok := prepared.(*linuxPreparedChange)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, errors.New("gateway applier does not expose a safe plan summary"))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"valid": true, "operations": plan.Summary()})
+	})
+	mux.HandleFunc("POST /v1/config/rollback", func(w http.ResponseWriter, r *http.Request) {
+		s.applyMu.Lock()
+		defer s.applyMu.Unlock()
+		previous, ok := s.Manager.Previous()
+		if !ok {
+			writeError(w, http.StatusConflict, errors.New("no previous successful gateway configuration is available for rollback"))
+			return
+		}
+		providers, err := s.Runtime.PrepareConfig(previous)
+		if err != nil {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		if err := s.Manager.Rollback(r.Context()); err != nil {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		current := s.Manager.Current()
+		s.Runtime.Activate(providers)
+		s.Runtime.SetConfig(current)
+		writeJSON(w, http.StatusOK, map[string]any{"rolled_back": true, "transaction": s.Manager.Status(), "config": current})
 	})
 	mux.HandleFunc("PUT /v1/config", func(w http.ResponseWriter, r *http.Request) {
 		s.applyMu.Lock()
@@ -219,6 +282,23 @@ func (s *APIServer) handler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"applied": true, "transaction": s.Manager.Status(), "config": s.Manager.Current()})
 	})
 	return mux
+}
+
+func snapshotLayer2ValidationCapabilities(ctx context.Context, current Config, desired layer2.Config, runner Runner) (layer2.Capabilities, error) {
+	snapshotConfig := desired
+	if current.Layer2 != nil {
+		snapshotConfig = mergeLayer2SnapshotConfig(*current.Layer2, desired)
+	}
+	return layer2.SnapshotCapabilities(ctx, snapshotConfig, layer2RunnerAdapter{runner: runner})
+}
+
+func validateLayer2PlanAgainstCurrent(current Config, desired layer2.Config, capabilities layer2.Capabilities) error {
+	previous := layer2.Config{Version: 1}
+	if current.Layer2 != nil {
+		previous = *current.Layer2
+	}
+	_, err := layer2.BuildTopologyPlan(previous, desired, capabilities)
+	return err
 }
 
 func decodeRequestConfig(w http.ResponseWriter, r *http.Request) (Config, error) {

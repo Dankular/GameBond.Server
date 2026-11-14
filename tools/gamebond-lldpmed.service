@@ -1,0 +1,23 @@
+[Unit]
+Description=Apply GameBond managed LLDP-MED policies
+After=lldpd.service
+Wants=lldpd.service
+ConditionPathExists=/etc/gamebond/lldpmed.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/lldpcli -c /etc/gamebond/lldpmed.conf
+User=root
+Group=root
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=/etc/gamebond/lldpmed.conf
+
+[Install]
+WantedBy=multi-user.target

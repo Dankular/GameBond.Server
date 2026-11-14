@@ -63,6 +63,70 @@ membership refer to physical interfaces by stable ID:
 }
 ```
 
+Voice VLANs are represented as tagged bridge VLAN membership and advertised to
+phones through LLDP-MED. The optional `voice_network` on a bridge port must name
+one of its `tagged_networks`; it cannot replace the untagged access network. Install
+and enable the persistent LLDP-MED policy unit on hosts using this feature:
+
+```sh
+sudo install -m 0644 tools/gamebond-lldpmed.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable gamebond-lldpmed.service
+```
+
+Explicit application policies can be added per port with the `lldp_med` list. The
+provider uses `lldpcli` to load a persistent command file and reports an apply error
+if `lldpd` rejects a selected policy. LLDP neighbor advertisements are untrusted
+network input and must not be used as authorization evidence. The supported
+application values and policy field ranges follow the [lldpd LLDP-MED command
+reference](https://lldpd.github.io/usage.html); LLDP-MED power-via-MDI settings are
+not exposed until the host can verify provider and NIC support. Status includes
+configured advertised policies, received neighbor JSON (capped at 32 KiB per port),
+and effective bridge VLAN membership.
+
+Wired 802.1X uses hostapd's `wired` driver with an external RADIUS server. The
+hostapd service only authenticates; GameBond's bridge nftables table controls both
+traffic to the router and traffic forwarded through the bridge. EAPOL remains
+available before authentication, while other traffic is blocked until an EAP
+success event authorizes that source MAC on that port. Failure, disconnect, monitor
+restart, and monitor shutdown revoke authorization. This integration requires
+working `wired` support in the installed hostapd build and the packaged GameBond
+event helper. The [RHEL wired-authenticator guide](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/configuring_and_managing_networking/assembly_setting-up-an-802-1x-network-authentication-service-for-lan-clients-using-hostapd-with-freeradius-backend_configuring-and-managing-networking)
+documents `driver=wired`, external RADIUS settings, and the fact that hostapd does
+not enforce the traffic plane.
+
+Install the two per-port units and the event helper, then reload systemd:
+
+```sh
+sudo install -m 0644 tools/gamebond-hostapd@.service /etc/systemd/system/
+sudo install -m 0644 tools/gamebond-8021x-events@.service /etc/systemd/system/
+go build -o /tmp/gamebond-8021x-event ./cmd/gamebond-8021x-event
+sudo install -m 0755 /tmp/gamebond-8021x-event /usr/bin/gamebond-8021x-event
+sudo systemctl daemon-reload
+```
+
+Provision each referenced `/etc/gamebond/8021x/<interface-id>.secret` out of band
+as a root-owned regular file with mode `0600` and a 16..128 character safe ASCII
+RADIUS secret. The management API accepts no secret value. `nas_address` must be
+an address currently assigned to the managed bridge; `nas_id` must be unique in
+the RADIUS server's client scope. Example port policy:
+
+```json
+"port_auth": [{
+  "interface": "lan-a", "radius_server": "192.0.2.10", "radius_port": 1812,
+  "secret_file": "/etc/gamebond/8021x/lan-a.secret",
+  "nas_address": "192.0.2.2", "nas_id": "edge-1",
+  "reauth_seconds": 3600, "failure_policy": "closed", "exclusive_port": true
+}]
+```
+
+The daemon enables bridge EAPOL group forwarding and refuses to replace an
+unmanaged authorization table. Since EAPOL forwarding compatibility with STP/RSTP
+has not been verified across the supported kernel/provider matrix, config validation
+rejects 802.1X on bridges with STP/RSTP controls enabled. Runtime status reports the
+authenticator, fail-closed event monitor, and authorized MACs separately for each
+managed port.
+
 Customizable DHCP is provided by a dedicated Kea DHCPv4 service. Each subnet binds to
 one configured LAN interface, has a dynamic pool, router and DNS options, optional
 reservations, and raw custom option payloads encoded as lowercase hexadecimal:
@@ -94,6 +158,59 @@ The gateway validates the generated Kea configuration before applying it and ver
 the service state afterward. DHCP is stopped when disabled; leases are stored under
 `/var/lib/gamebond-kea` and survive service restarts. The service conflicts with the
 standard ISC DHCP server units to avoid two DHCP servers answering on the same host.
+When Kea is active, gateway status reads its memfile lease database and reports the
+latest unexpired, non-declined IPv4 binding per address. If the file cannot be read,
+status reports a lease-binding error. DHCP guard blocks server replies on untrusted
+ports and can rate-limit DHCP traffic. Client IP/MAC/port binding enforcement is
+currently unavailable: Kea's memfile contains address and MAC but not the ingress
+port, and the learned bridge FDB is controlled by endpoint traffic, so it is not
+trusted for authorization. Configurations that request `validate_bindings: true` are
+rejected before host mutation or persistence. Secure binding enforcement requires an
+ingress-aware DHCP snooping provider, such as authenticated relay metadata or a
+verified DHCP transaction capture provider.
+
+The gateway exposes the documented Pro AV profile catalogue at
+`GET /v1/layer2/profiles` and through the authenticated admin-portal proxy at
+`/api/gateway/layer2/profiles`. A Layer 2 config can select profiles per managed
+network with `pro_av_profiles: [{"profile":"dante","network":"media"}]`.
+Selections are saved and rolled back with the gateway config, and validation rejects
+unknown profiles, missing networks, duplicate selections, and incompatible values
+from profiles selected on the same network. Config validation also checks mandatory
+IGMP snooping/querier and MTU requirements against the selected network. The host
+checks minimum link speeds on every bridge member carrying a selected profile and,
+when QoS is active, validates numeric DSCP and queue-order requirements against the
+merged Layer 2 and adaptive QoS map. Other catalogue guidance remains advisory: the
+gateway does not configure external switches, endpoint firmware, PoE, EEE, or Linux
+controls without a verified provider. Profile selection does not imply certification
+or interoperability testing.
+
+## Optional admin-portal access to gatewayd
+
+`gatewayd` listens on the configured Unix socket (normally
+`/run/gamebond/control.sock`). It creates the socket as `root:<socket_group>` with mode
+`0660`; the parent directory is created with mode `0755`. Create a dedicated host group
+and set `socket_group` to that group in `/etc/gamebond/router.json`. The socket grants
+its holder the bounded gateway status, validate, plan, apply, and one-step rollback API,
+so membership should be limited to the admin portal container's shared group.
+
+The default Compose service does not mount this socket. To opt in, set
+`GAMEBOND_GATEWAY_GID` to the numeric host group ID and
+`GAMEBOND_GATEWAY_SOCKET_DIR` to the host socket directory (normally `/run/gamebond`),
+then start Compose with the optional overlay:
+
+```sh
+GAMEBOND_GATEWAY_GID="$(getent group gamebond-admin | cut -d: -f3)" \
+GAMEBOND_GATEWAY_SOCKET_DIR=/run/gamebond \
+docker compose -f compose.yaml -f compose.gateway.yaml up -d
+```
+
+The overlay mounts the host directory at `/run/gamebond-gateway` inside the edge
+container, matching `GAMEBOND_GATEWAY_SOCKET`; it is read-only and adds the shared group
+to the edge container. The portal still requires its existing login and CSRF token for every
+mutating operation. If the socket is missing or unreachable, gateway management is
+reported unavailable while the portal and tunnel continue to run. Rollback restores the
+last successfully applied configuration held by the running daemon; it is unavailable
+until a configuration has been successfully applied after daemon startup.
 
 Shadow-mode high availability uses Keepalived VRRP with this gateway configured as a
 non-preempting BACKUP peer. Configure the matching router ID, advertisement interval,
@@ -123,6 +240,14 @@ Example configuration:
 VRRP does not synchronize connection-tracking state. Existing sessions may reset
 when the gateway changes unless a separate conntrack state synchronization provider
 is configured and verified.
+
+Optional redundancy groups aggregate status from configured Layer 2 bonds and
+bridges, plus the single VRRP instance. They report active/standby role, mechanism
+health, degraded cause, and up to 64 observed transitions in `/v1/status`; each
+mechanism remains responsible for its own failover and recovery. Transition history
+is sampled when status is requested, so short-lived changes between observations may
+not appear. The Linux bridge nftables support required by some Layer 2 features must
+also be available on the host before those mechanisms can be considered healthy.
 
 mDNS reflection uses a dedicated Avahi instance. Select at least two configured WAN or
 LAN interfaces; VPN interfaces are rejected. Optional `reflect_filters` restrict
@@ -328,6 +453,40 @@ IP ACLs use ordered terminal allow or deny rules matching IPv4/IPv6 prefixes, pr
 and an optional TCP/UDP destination port on one managed port and VLAN-backed network.
 The bridge VLAN boundary isolates Layer 2 broadcast domains; routed traffic between
 those networks must also be constrained by the gateway's routed firewall policy.
+Bridge IGMP snooping and querier settings are bridge-wide by default. A network can
+set `igmp_snooping` to override snooping for its VLAN; this requires bridge-wide
+`igmp_snooping: true`, the host's per-VLAN bridge mode, and readable live VLAN state.
+The planner records exact previous mode and VLAN values for rollback and rejects
+changes when either value is unknown. Status reports the kernel multicast database,
+listener ports, multicast-router ports, and per-VLAN snooping values when requested.
+The bridge's querier flag reports local querier configuration; it does not claim to
+observe an external querier election. Fast Leave requires
+`igmp_shared_downstream: false` on that port, so a shared downstream segment is rejected.
+Layer 2 `dhcp_guard` policies can mark bridge ports as trusted DHCP server/relay
+paths or untrusted access ports and can rate-limit DHCP requests per ingress port.
+Untrusted DHCP server replies are dropped before local delivery or bridge forwarding;
+status reports effective rule counters and refuses to overwrite unowned nftables state.
+DHCP lease-backed IP/MAC source validation is not advertised as supported until an
+authoritative ingress-port source is integrated; `validate_bindings` requests fail
+closed before apply.
+`storm_control` and `multicast_broadcast_rate_limits` apply independent ingress
+broadcast and multicast policers with bounded bursts and drop counters. The
+multicast/broadcast policies use dedicated `tc` priorities and reject overlapping
+classes with storm control. Multicast policers are rejected on IGMP-snooping ports
+so membership and query traffic is not rate-limited. Filters request `skip_hw` and
+are reported as software `tc` policers; unknown-unicast storm classification is not
+available through this generic Linux provider.
+Port mirroring supports one dedicated monitor destination, ingress/egress/both
+directions, and optional tagged-VLAN scope on trunk members. Per-VLAN capture requires
+software `tc` flower matching; untagged access VLANs cannot be selected independently.
+An optional capture rate and burst apply a TBF egress limit to the monitor interface,
+which must have an unmanaged-free `noqueue` root qdisc. Status reports effective
+source filters and packet/byte counters; mirrored packet payloads are never retained.
+Before applying a mirror, the daemon tests software `tc mirred` support on a temporary
+veth pair inside a disposable network namespace, then removes that namespace. Mirror
+filters use `skip_hw` so the checked software path is the path used on live ports.
+QoS (DSCP) policies share the gateway's adaptive HTB root qdisc. Status includes each
+class's DSCP, guaranteed rate, ceiling, priority, and observed packet/byte counters.
 Port egress rate limits use Linux TBF only when the selected interface has a
 `noqueue` root qdisc or the exact previously saved GameBond TBF. Existing queue
 disciplines are rejected instead of replaced. Tagged VLANs on trunk ports can have
@@ -340,9 +499,9 @@ Ethernet flow control configures `ethtool` RX/TX pause and autonegotiation on a
 physical interface only after the driver reports the current values. Bond members
 cannot be managed independently. Removing a policy restores autonegotiation with
 RX/TX pause enabled; a failed transaction rolls back to the exact observed values.
-Other Layer 2 roadmap features remain unavailable until their individual providers
-and effective-state checks are integrated. A capability listing alone does not mean
-a feature is configured or active. VRRP status distinguishes MASTER by local VIP
+Layer 2 features without an integrated provider and effective-state check remain
+unavailable. A capability listing alone does not mean a feature is configured or active.
+VRRP status distinguishes MASTER by local VIP
 ownership and FAULT by service/interface/address errors; an active service without
 VIPs is reported as BACKUP.
 

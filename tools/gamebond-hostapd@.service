@@ -1,0 +1,20 @@
+[Unit]
+Description=GameBond wired 802.1X authenticator for port %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+RuntimeDirectory=gamebond-hostapd/%i
+RuntimeDirectoryMode=0750
+ExecStart=/usr/sbin/hostapd /etc/gamebond/8021x/ports/%i.conf
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_PACKET
+
+[Install]
+WantedBy=multi-user.target

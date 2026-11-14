@@ -12,7 +12,8 @@ func TestAES67ProfileDocumentsStandardTrafficClasses(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"timing.ptp-version": "ieee-1588-2008",
+		"timing.ptp-version": "ieee-1588-compatible",
+		"qos.queue.order":    "46>34",
 		"qos.dscp.ptp":       "46",
 		"qos.dscp.audio":     "34",
 		"qos.dscp.other":     "0",

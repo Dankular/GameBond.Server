@@ -28,11 +28,12 @@ type PreparedChange interface {
 
 // Manager serializes configuration transactions and owns the last known-good copy.
 type Manager struct {
-	mu      sync.RWMutex
-	path    string
-	current Config
-	applier Applier
-	status  ApplyStatus
+	mu       sync.RWMutex
+	path     string
+	current  Config
+	previous *Config
+	applier  Applier
+	status   ApplyStatus
 }
 
 // ApplyStatus describes the most recent transaction without exposing secrets.
@@ -65,6 +66,16 @@ func (m *Manager) Current() Config {
 	return cloneConfig(m.current)
 }
 
+// Previous returns the last successfully committed config before Current.
+func (m *Manager) Previous() (Config, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.previous == nil {
+		return Config{}, false
+	}
+	return cloneConfig(*m.previous), true
+}
+
 // Status returns the latest transaction state.
 func (m *Manager) Status() ApplyStatus {
 	m.mu.RLock()
@@ -76,6 +87,22 @@ func (m *Manager) Status() ApplyStatus {
 func (m *Manager) Apply(ctx context.Context, desired Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.applyLocked(ctx, desired)
+}
+
+// Rollback reapplies the previous successfully committed desired config.
+// The history is intentionally one step and in-memory; the operation is
+// unavailable after restart until another successful apply.
+func (m *Manager) Rollback(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.previous == nil {
+		return errors.New("no previous successful gateway configuration is available for rollback")
+	}
+	return m.applyLocked(ctx, cloneConfig(*m.previous))
+}
+
+func (m *Manager) applyLocked(ctx context.Context, desired Config) error {
 	m.status.ID++
 	m.status.UpdatedAt = time.Now().UTC()
 	m.status.State, m.status.Error, m.status.RollbackError = "preparing", "", ""
@@ -113,6 +140,8 @@ func (m *Manager) Apply(ctx context.Context, desired Config) error {
 	if err := writeConfigAtomic(m.path, desired); err != nil {
 		return fail("persist_failed", err, change, true)
 	}
+	previous := cloneConfig(m.current)
+	m.previous = &previous
 	m.current = cloneConfig(desired)
 	m.status.State = "applied"
 	m.status.UpdatedAt = time.Now().UTC()
@@ -195,12 +224,82 @@ func cloneConfig(cfg Config) Config {
 		layer2Copy.Interfaces = append([]layer2.Interface(nil), cfg.Layer2.Interfaces...)
 		layer2Copy.Bridges = append([]layer2.Bridge(nil), cfg.Layer2.Bridges...)
 		for i := range layer2Copy.Bridges {
+			if cfg.Layer2.Bridges[i].STPPriority != nil {
+				value := *cfg.Layer2.Bridges[i].STPPriority
+				layer2Copy.Bridges[i].STPPriority = &value
+			}
+			if cfg.Layer2.Bridges[i].STPEnabled != nil {
+				value := *cfg.Layer2.Bridges[i].STPEnabled
+				layer2Copy.Bridges[i].STPEnabled = &value
+			}
+			if cfg.Layer2.Bridges[i].IGMPSnooping != nil {
+				value := *cfg.Layer2.Bridges[i].IGMPSnooping
+				layer2Copy.Bridges[i].IGMPSnooping = &value
+			}
+			if cfg.Layer2.Bridges[i].IGMPQuerier != nil {
+				value := *cfg.Layer2.Bridges[i].IGMPQuerier
+				layer2Copy.Bridges[i].IGMPQuerier = &value
+			}
 			layer2Copy.Bridges[i].Ports = append([]layer2.BridgePort(nil), cfg.Layer2.Bridges[i].Ports...)
 			for j := range layer2Copy.Bridges[i].Ports {
+				if cfg.Layer2.Bridges[i].Ports[j].STPPriority != nil {
+					value := *cfg.Layer2.Bridges[i].Ports[j].STPPriority
+					layer2Copy.Bridges[i].Ports[j].STPPriority = &value
+				}
+				if cfg.Layer2.Bridges[i].Ports[j].STPPathCost != nil {
+					value := *cfg.Layer2.Bridges[i].Ports[j].STPPathCost
+					layer2Copy.Bridges[i].Ports[j].STPPathCost = &value
+				}
+				if cfg.Layer2.Bridges[i].Ports[j].STPRootBlock != nil {
+					value := *cfg.Layer2.Bridges[i].Ports[j].STPRootBlock
+					layer2Copy.Bridges[i].Ports[j].STPRootBlock = &value
+				}
+				if cfg.Layer2.Bridges[i].Ports[j].STPEdge != nil {
+					value := *cfg.Layer2.Bridges[i].Ports[j].STPEdge
+					layer2Copy.Bridges[i].Ports[j].STPEdge = &value
+				}
+				if cfg.Layer2.Bridges[i].Ports[j].STPBPDUGuard != nil {
+					value := *cfg.Layer2.Bridges[i].Ports[j].STPBPDUGuard
+					layer2Copy.Bridges[i].Ports[j].STPBPDUGuard = &value
+				}
+				if cfg.Layer2.Bridges[i].Ports[j].LoopProtection != nil {
+					value := *cfg.Layer2.Bridges[i].Ports[j].LoopProtection
+					layer2Copy.Bridges[i].Ports[j].LoopProtection = &value
+				}
+				if cfg.Layer2.Bridges[i].Ports[j].IGMPFastLeave != nil {
+					value := *cfg.Layer2.Bridges[i].Ports[j].IGMPFastLeave
+					layer2Copy.Bridges[i].Ports[j].IGMPFastLeave = &value
+				}
+				if cfg.Layer2.Bridges[i].Ports[j].IGMPSharedDownstream != nil {
+					value := *cfg.Layer2.Bridges[i].Ports[j].IGMPSharedDownstream
+					layer2Copy.Bridges[i].Ports[j].IGMPSharedDownstream = &value
+				}
+				if cfg.Layer2.Bridges[i].Ports[j].IGMPRouterPort != nil {
+					value := *cfg.Layer2.Bridges[i].Ports[j].IGMPRouterPort
+					layer2Copy.Bridges[i].Ports[j].IGMPRouterPort = &value
+				}
 				layer2Copy.Bridges[i].Ports[j].TaggedNetworks = append([]string(nil), cfg.Layer2.Bridges[i].Ports[j].TaggedNetworks...)
+				layer2Copy.Bridges[i].Ports[j].LLDPMED = append([]layer2.LLDPMEDPolicy(nil), cfg.Layer2.Bridges[i].Ports[j].LLDPMED...)
+				for k := range layer2Copy.Bridges[i].Ports[j].LLDPMED {
+					if cfg.Layer2.Bridges[i].Ports[j].LLDPMED[k].Priority != nil {
+						value := *cfg.Layer2.Bridges[i].Ports[j].LLDPMED[k].Priority
+						layer2Copy.Bridges[i].Ports[j].LLDPMED[k].Priority = &value
+					}
+					if cfg.Layer2.Bridges[i].Ports[j].LLDPMED[k].DSCP != nil {
+						value := *cfg.Layer2.Bridges[i].Ports[j].LLDPMED[k].DSCP
+						layer2Copy.Bridges[i].Ports[j].LLDPMED[k].DSCP = &value
+					}
+				}
 			}
 		}
 		layer2Copy.Networks = append([]layer2.Network(nil), cfg.Layer2.Networks...)
+		for i := range layer2Copy.Networks {
+			if cfg.Layer2.Networks[i].IGMPSnooping != nil {
+				value := *cfg.Layer2.Networks[i].IGMPSnooping
+				layer2Copy.Networks[i].IGMPSnooping = &value
+			}
+		}
+		layer2Copy.NetworkACL = append([]layer2.NetworkACLRule(nil), cfg.Layer2.NetworkACL...)
 		layer2Copy.Bonds = append([]layer2.Bond(nil), cfg.Layer2.Bonds...)
 		for i := range layer2Copy.Bonds {
 			layer2Copy.Bonds[i].Members = append([]string(nil), cfg.Layer2.Bonds[i].Members...)
@@ -210,12 +309,30 @@ func cloneConfig(cfg Config) Config {
 		layer2Copy.MACACL = append([]layer2.MACACLRule(nil), cfg.Layer2.MACACL...)
 		layer2Copy.IPACL = append([]layer2.IPACLRule(nil), cfg.Layer2.IPACL...)
 		layer2Copy.EgressRates = append([]layer2.EgressRateLimit(nil), cfg.Layer2.EgressRates...)
+		layer2Copy.StormControl = append([]layer2.StormControl(nil), cfg.Layer2.StormControl...)
+		layer2Copy.MulticastBroadcastLimits = append([]layer2.MulticastBroadcastRateLimit(nil), cfg.Layer2.MulticastBroadcastLimits...)
 		layer2Copy.FlowControl = append([]layer2.FlowControlPolicy(nil), cfg.Layer2.FlowControl...)
+		layer2Copy.QoS = append([]layer2.QoSPolicy(nil), cfg.Layer2.QoS...)
+		layer2Copy.PortMirrors = append([]layer2.PortMirror(nil), cfg.Layer2.PortMirrors...)
+		for i := range layer2Copy.QoS {
+			layer2Copy.QoS[i].Classes = append([]layer2.QoSClass(nil), cfg.Layer2.QoS[i].Classes...)
+			for j := range layer2Copy.QoS[i].Classes {
+				layer2Copy.QoS[i].Classes[j].DSCP = append([]uint8(nil), cfg.Layer2.QoS[i].Classes[j].DSCP...)
+			}
+		}
 		layer2Copy.MACPortRestrictions = append([]layer2.MACPortRestriction(nil), cfg.Layer2.MACPortRestrictions...)
 		for i := range layer2Copy.MACPortRestrictions {
 			layer2Copy.MACPortRestrictions[i].AllowedMACs = append([]string(nil), cfg.Layer2.MACPortRestrictions[i].AllowedMACs...)
 		}
+		layer2Copy.DHCPGuard = append([]layer2.DHCPGuardPort(nil), cfg.Layer2.DHCPGuard...)
+		layer2Copy.PortAuth = append([]layer2.PortAuth(nil), cfg.Layer2.PortAuth...)
+		layer2Copy.AVProfiles = append([]layer2.AVProfileSelection(nil), cfg.Layer2.AVProfiles...)
 		copy.Layer2 = &layer2Copy
+	}
+	copy.Redundancy.Groups = append([]RedundancyGroup(nil), cfg.Redundancy.Groups...)
+	for i := range copy.Redundancy.Groups {
+		copy.Redundancy.Groups[i].Bonds = append([]string(nil), cfg.Redundancy.Groups[i].Bonds...)
+		copy.Redundancy.Groups[i].Bridges = append([]string(nil), cfg.Redundancy.Groups[i].Bridges...)
 	}
 	return copy
 }

@@ -2,7 +2,10 @@ package avprofiles
 
 // Dante returns Audinate's documented network recommendations for Dante.
 func Dante() Profile {
-	const source = "https://assets.audinate.com/wp-content/uploads/2022/03/dante-information-for-network-admins.pdf"
+	const (
+		source         = "https://assets.audinate.com/wp-content/uploads/2022/03/dante-information-for-network-admins.pdf"
+		snoopingSource = "https://go.audinate.com/hubfs/implementing-dante-AV-over-IP_techpaper-20220314-en.pdf?hsLang=en"
+	)
 
 	return Profile{
 		ID:   "dante",
@@ -12,6 +15,12 @@ func Dante() Profile {
 				Key:       "qos.queueing",
 				Value:     "strict-priority",
 				Rationale: "Audinate requires strict-priority queueing whenever QoS is used for Dante traffic.",
+				SourceURL: source,
+			},
+			{
+				Key:       "qos.queue.order",
+				Value:     "56>46>8",
+				Rationale: "When QoS is used, time-critical PTP must remain above audio/PTPv2, which must remain above the reserved low-priority class.",
 				SourceURL: source,
 			},
 			{
@@ -41,8 +50,8 @@ func Dante() Profile {
 			{
 				Key:       "igmp.snooping",
 				Value:     "enabled-when-needed",
-				Rationale: "Use IGMP multicast management on mixed networks, networks sharing IP video, or networks carrying significant multicast audio.",
-				SourceURL: source,
+				Rationale: "IGMP snooping limits multicast to requesting devices on mixed networks, shared IP-video segments, or networks carrying significant multicast audio.",
+				SourceURL: snoopingSource,
 			},
 			{
 				Key:       "igmp.version",

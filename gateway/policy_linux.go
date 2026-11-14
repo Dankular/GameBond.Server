@@ -104,11 +104,19 @@ type QoSInterface struct {
 }
 
 type QoSClass struct {
-	ID       string `json:"id"`
-	DSCP     uint8  `json:"dscp"`
-	RateKbit uint32 `json:"rate_kbit"`
-	CeilKbit uint32 `json:"ceil_kbit"`
-	Priority uint8  `json:"priority"`
+	ID         string  `json:"id"`
+	DSCP       uint8   `json:"dscp"`
+	DSCPValues []uint8 `json:"-"`
+	RateKbit   uint32  `json:"rate_kbit"`
+	CeilKbit   uint32  `json:"ceil_kbit"`
+	Priority   uint8   `json:"priority"`
+}
+
+func (c QoSClass) dscpValues() []uint8 {
+	if len(c.DSCPValues) != 0 {
+		return c.DSCPValues
+	}
+	return []uint8{c.DSCP}
 }
 
 func (c QoSConfig) Validate(interfaces []Interface) error {
@@ -127,8 +135,8 @@ func (c QoSConfig) Validate(interfaces []Interface) error {
 			return fmt.Errorf("%s.interface_id is unknown or duplicated", field)
 		}
 		seenInterfaces[iface.InterfaceID] = true
-		if iface.TotalKbit < 8 || iface.TotalKbit > 10_000_000 {
-			return fmt.Errorf("%s.total_kbit must be 8..10000000", field)
+		if iface.TotalKbit < 8 || iface.TotalKbit > 100_000_000 {
+			return fmt.Errorf("%s.total_kbit must be 8..100000000", field)
 		}
 		if len(iface.Classes) > 63 {
 			return fmt.Errorf("%s.classes may contain at most 63 entries", field)
@@ -143,13 +151,20 @@ func (c QoSConfig) Validate(interfaces []Interface) error {
 			if !validID(class.ID) || ids[class.ID] {
 				return fmt.Errorf("%s.id is invalid or duplicated", classField)
 			}
-			if class.DSCP > 63 || dscps[class.DSCP] {
-				return fmt.Errorf("%s.dscp must be unique and in 0..63", classField)
+			values := class.dscpValues()
+			if len(values) > 64 {
+				return fmt.Errorf("%s has too many DSCP values", classField)
+			}
+			for _, dscp := range values {
+				if dscp > 63 || dscps[dscp] {
+					return fmt.Errorf("%s.dscp must be unique and in 0..63", classField)
+				}
+				dscps[dscp] = true
 			}
 			if class.RateKbit < 1 || class.CeilKbit < class.RateKbit || class.CeilKbit > iface.TotalKbit || class.Priority > 7 {
 				return fmt.Errorf("%s requires 1 <= rate <= ceil <= total_kbit and priority 0..7", classField)
 			}
-			ids[class.ID], dscps[class.DSCP] = true, true
+			ids[class.ID] = true
 			guaranteed += uint64(class.RateKbit)
 		}
 		if guaranteed+1 > uint64(iface.TotalKbit) {
