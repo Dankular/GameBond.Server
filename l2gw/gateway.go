@@ -77,6 +77,8 @@ type Stats struct {
 	DHCPAck, DHCPNak          uint64
 	Leases                    int
 	FramesIn, FramesOut       uint64
+	// Stack is the gVisor stack's own receive-side counters, nonzero entries only.
+	Stack map[string]uint64
 }
 
 // Gateway is one gVisor stack serving one bridged segment.
@@ -263,6 +265,7 @@ func (g *Gateway) Stats() Stats {
 		Blocked: g.blocked.Load(), DialFailed: g.dialFailed.Load(),
 		DHCPDiscover: d.discover, DHCPRequest: d.request, DHCPAck: d.ack, DHCPNak: d.nak, Leases: d.leases,
 		FramesIn: g.framesIn.Load(), FramesOut: g.framesOut.Load(),
+		Stack: g.stackCounters(),
 	}
 }
 
