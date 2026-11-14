@@ -40,8 +40,13 @@ STATE_REPO=${GAMEBOND_STATE_REPO:-dan/exit-state}
 STATE_TOKEN_FILE=${GAMEBOND_STATE_TOKEN_FILE:-/etc/gamebond/state.token}
 NODE_NAME=${GAMEBOND_NODE_NAME:-$(hostname)}
 NODE_RANK=${GAMEBOND_PROBE_RANK:-1}
-PEER_MAX_WAIT=${GAMEBOND_PEER_MAX_WAIT:-600}
+PEER_MAX_WAIT=${GAMEBOND_PEER_MAX_WAIT:-600}  # raise it above DRAIN_MAX when draining is on
 HEARTBEAT=${GAMEBOND_HEARTBEAT:-300}
+# Drain before an update: the exit refuses new flows (clients steer them to the peer) and waits for
+# the flows still open to finish. 0 turns it off, which is the default until clients can steer;
+# otherwise this is the longest wait in seconds, after which the update goes ahead anyway.
+DRAIN_MAX=${GAMEBOND_DRAIN_MAX:-0}
+DRAIN_QUIET=${GAMEBOND_DRAIN_QUIET:-5}
 mkdir -p "$STATE"
 
 log() { echo "$(date -Is) $*"; }
@@ -152,6 +157,7 @@ peer_blocks() {
     IFS=$'	' read -r state rank image rejected at <<<"$f"
     case "$state" in
       updating|rolling_back) [ $((now - at)) -le 600 ] && why="$peer is $state" ;;
+      draining) [ $((now - at)) -le $((DRAIN_MAX + 600)) ] && why="$peer is draining" ;;
       starting) [ $((now - at)) -le 600 ] && why="$peer is starting" ;;
       ready) [ $((now - at)) -le $((HEARTBEAT * 5)) ] && [ "$rank" -lt "$NODE_RANK" ] && [ "$image" != "$want" ] && [ "$rejected" != "$1" ] && why="$peer goes first" ;;
     esac
@@ -176,6 +182,24 @@ update_to() {
   return $rc
 }
 
+# drain_exit stops new flows and waits until the open ones are gone (DRAIN_QUIET seconds at zero) or
+# DRAIN_MAX passes. It always returns 0: a stuck flow must not block an update for ever.
+drain_exit() {
+  [ "$DRAIN_MAX" -gt 0 ] || return 0
+  docker exec "$CONTAINER" touch /tmp/gamebond-draining 2>/dev/null || return 0
+  publish_status draining
+  local t0=$SECONDS quiet=0 n
+  log "draining: waiting for open flows to finish (at most ${DRAIN_MAX} s)"
+  while [ $((SECONDS - t0)) -lt "$DRAIN_MAX" ]; do
+    n=$(docker exec "$CONTAINER" cat /tmp/gamebond-flows 2>/dev/null | tr -dc '0-9')
+    if [ "${n:-1}" = "0" ]; then quiet=$((quiet + 1)); else quiet=0; fi
+    [ "$quiet" -ge "$DRAIN_QUIET" ] && { log "drained in $((SECONDS - t0)) s"; return 0; }
+    sleep 1
+  done
+  log "drain deadline reached with ${n:-?} flows still open; updating anyway"
+  return 0
+}
+
 _update_to() {
   local sha=$1 want="$IMAGE_REPO:$1" prev
   prev=$(current_image)
@@ -184,6 +208,7 @@ _update_to() {
   publish_status updating
   local t0=$SECONDS
   if ! docker pull -q "$want" >/dev/null; then log "pull failed; nothing changed"; publish_status; return 1; fi
+  drain_exit
   # Tell connected clients first, so their UI shows "updating" rather than "down".
   docker exec "$CONTAINER" touch /tmp/gamebond-updating 2>/dev/null && sleep 1.5
   set_image "$want"

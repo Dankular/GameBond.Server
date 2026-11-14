@@ -346,3 +346,21 @@ func SetL2Draining(on bool) bool {
 	e.gw.SetDraining(on)
 	return true
 }
+
+// l2Draining reports whether the gateway is draining and how many flows it still carries.
+func l2Draining() (int, bool) {
+	e := activeL2.Load()
+	if e == nil || e.gw == nil || !e.gw.Draining() {
+		return 0, false
+	}
+	return e.gw.ActiveFlows(), true
+}
+
+// L2Flows is the number of flows the gateway carries now, for the update probe; -1 without a gateway.
+func L2Flows() int {
+	e := activeL2.Load()
+	if e == nil || e.gw == nil {
+		return -1
+	}
+	return e.gw.ActiveFlows()
+}

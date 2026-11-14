@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -64,6 +65,10 @@ func Run(ctx context.Context, c Config, options bond.SessionOptions, address net
 	options.State = func() string {
 		if _, err := os.Stat("/tmp/gamebond-updating"); err == nil {
 			return "updating"
+		}
+		// A draining exit says so, with how many flows it still carries, so clients steer new flows elsewhere.
+		if flows, draining := l2Draining(); draining {
+			return "draining:" + strconv.Itoa(flows)
 		}
 		return ""
 	}

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"strconv"
 	"context"
 	"encoding/json"
 	"flag"
@@ -195,6 +196,9 @@ func serveStreamGateway(ctx context.Context) {
 // so devices move to the other exit and the flows still open finish on this one.
 const drainFile = "/tmp/gamebond-draining"
 
+// flowsFile holds the number of flows the gateway carries, refreshed every second.
+const flowsFile = "/tmp/gamebond-flows"
+
 // controlLoop is the exit's local control surface: SIGHUP reloads the Layer 2 hosts and policy from
 // the config file, and the drain file toggles draining.
 func controlLoop(ctx context.Context, configPath string) {
@@ -219,6 +223,10 @@ func controlLoop(ctx context.Context, configPath string) {
 				fmt.Fprintln(os.Stdout, `{"status":"l2_reloaded"}`)
 			}
 		case <-tick.C:
+			// The probe reads this to know when the exit is empty.
+			if n := edge.L2Flows(); n >= 0 {
+				os.WriteFile(flowsFile, []byte(strconv.Itoa(n)+"\n"), 0o644)
+			}
 			_, err := os.Stat(drainFile)
 			if want := err == nil; want != draining && edge.SetL2Draining(want) {
 				draining = want

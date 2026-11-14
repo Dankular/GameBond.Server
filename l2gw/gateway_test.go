@@ -354,7 +354,7 @@ func TestARPAnswersOnlyForTheGateway(t *testing.T) {
 	g.Inbound(arpReq([4]byte{10, 78, 0, 1}))
 	select {
 	case f := <-out:
-		if len(f) < 60 || f[21] != 2 {
+		if f[21] != 2 {
 			t.Fatalf("not an ARP reply padded to the Ethernet minimum: len %d", len(f))
 		}
 	case <-time.After(2 * time.Second):

@@ -140,6 +140,8 @@ peer rolling_back 0 img:old - 5
 peer_blocks $SHA; check "rolling-back peer blocks" "$?" 0
 peer starting 0 img:old - 5
 peer_blocks $SHA; check "starting peer blocks" "$?" 0
+peer draining 0 img:old - 5
+peer_blocks $SHA; check "draining peer blocks" "$?" 0
 peer ready 0 img:old - 5
 peer_blocks $SHA; check "lower-ranked peer on the old image goes first" "$?" 0
 peer ready 0 img:$SHA - 5
