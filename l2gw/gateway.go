@@ -91,6 +91,8 @@ type Gateway struct {
 	draining            atomic.Bool
 	policy              atomic.Pointer[compiledPolicy]
 	devs                devices
+	nbMu                sync.Mutex
+	neighbours          map[netip.Addr][6]byte
 }
 
 // New builds and starts the gateway.
@@ -192,9 +194,36 @@ func (g *Gateway) Inbound(frame []byte) {
 	if g.foreignARPRequest(frame) {
 		return
 	}
+	g.learnNeighbour(frame)
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(frame)})
 	g.link.InjectInbound(0, pkt)
 	pkt.DecRef()
+}
+
+// learnNeighbour pins the sender of an IPv4 frame as a static neighbour. Without it the stack must
+// ARP for the device every time it answers from a new (spoofed) remote address, with that remote
+// address as the ARP sender, which costs a round trip per flow and confuses some devices.
+func (g *Gateway) learnNeighbour(f []byte) {
+	if len(f) < 34 || f[12] != 0x08 || f[13] != 0x00 || f[6]&1 == 1 {
+		return
+	}
+	ip := netip.AddrFrom4([4]byte{f[26], f[27], f[28], f[29]})
+	if ip.IsUnspecified() || ip == g.cfg.Address.Addr() || !g.cfg.Address.Contains(ip) {
+		return
+	}
+	var mac [6]byte
+	copy(mac[:], f[6:12])
+	g.nbMu.Lock()
+	if g.neighbours == nil {
+		g.neighbours = map[netip.Addr][6]byte{}
+	}
+	if g.neighbours[ip] == mac {
+		g.nbMu.Unlock()
+		return
+	}
+	g.neighbours[ip] = mac
+	g.nbMu.Unlock()
+	g.stack.AddStaticNeighbor(nicID, ipv4.ProtocolNumber, tcpip.AddrFrom4(ip.As4()), tcpip.LinkAddress(mac[:]))
 }
 
 // foreignARPRequest reports an ARP request for an address other than the gateway's. A promiscuous
