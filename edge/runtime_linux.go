@@ -3,6 +3,7 @@
 package edge
 
 import (
+	"github.com/Dankular/GameBond.Server/l2gw"
 	"context"
 	"encoding/json"
 	"errors"
@@ -54,6 +55,12 @@ func SetTap(f func(fromDevice bool, packet []byte)) {
 	}
 	tap.Store(&f)
 }
+
+// dnsFilter is the filtering resolver the userspace L2 gateway hands bridged devices' DNS to.
+var dnsFilter atomic.Pointer[l2gw.DNSHook]
+
+// SetDNSFilter installs (or, with nil, removes) the filtering resolver for bridged devices.
+func SetDNSFilter(h *l2gw.DNSHook) { dnsFilter.Store(h) }
 
 // Run owns the packet state on one epoll actor. All UDP/TUN I/O is nonblocking;
 // neither a bulk pacing wait nor device backpressure can stop control/priority.

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -544,5 +545,53 @@ func TestUDPMappingIsFullCone(t *testing.T) {
 	uc2.SetReadDeadline(time.Now().Add(700 * time.Millisecond))
 	if n, _, err := uc2.ReadFrom(buf); err == nil {
 		t.Fatalf("restricted mapping delivered %q", buf[:n])
+	}
+}
+
+func TestDNSAndTapHooksCoverBridgedDevices(t *testing.T) {
+	var up, down atomic.Int64
+	g, out := newTestGateway(t, func(c *Config) {
+		c.Tap = func(fromDevice bool, p []byte) {
+			if fromDevice {
+				up.Add(1)
+			} else {
+				down.Add(1)
+			}
+		}
+		c.DNSFilter = &DNSHook{Handle: func(client netip.Addr, req []byte, tcp bool) []byte {
+			return append([]byte("filtered:"), req...)
+		}}
+	})
+	dev := newDevice(t, g, out, "10.78.0.60")
+
+	// A device that talks to a resolver of its own choosing still gets the filtering resolver's answer.
+	dns := tcpip.FullAddress{Addr: tcpip.AddrFrom4([4]byte{203, 0, 113, 53}), Port: 53}
+	uc, err := gonet.DialUDP(dev.s, &tcpip.FullAddress{Addr: tcpip.AddrFrom4([4]byte{10, 78, 0, 60}), Port: 41000}, &dns, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer uc.Close()
+	uc.Write([]byte("q"))
+	buf := make([]byte, 64)
+	uc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := uc.Read(buf)
+	if err != nil || string(buf[:n]) != "filtered:q" {
+		t.Fatalf("udp dns: %q %v", buf[:n], err)
+	}
+
+	// The stream form: length-prefixed.
+	tc, err := gonet.DialTCP(dev.s, dns, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tc.Close()
+	tc.Write([]byte{0, 1, 'q'})
+	tc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp := make([]byte, 2+len("filtered:q"))
+	if _, err := io.ReadFull(tc, resp); err != nil || string(resp[2:]) != "filtered:q" {
+		t.Fatalf("tcp dns: %q %v", resp, err)
+	}
+	if up.Load() == 0 || down.Load() == 0 {
+		t.Fatalf("tap saw up=%d down=%d", up.Load(), down.Load())
 	}
 }

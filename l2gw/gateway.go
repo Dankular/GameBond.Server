@@ -66,6 +66,19 @@ type Config struct {
 	// RestrictedUDP drops datagrams from addresses the device has not sent to first. Off by default:
 	// full-cone mapping is what gives consoles NAT type 2 and lets PSN sign-in succeed.
 	RestrictedUDP bool
+	// Tap, when set, sees every IPv4 packet that crosses the gateway: fromDevice is the leg a device sent,
+	// false the leg the stack sent back. It runs on the frame path, so it must only parse and count, and
+	// must not keep the slice.
+	Tap func(fromDevice bool, ipPacket []byte)
+	// DNSFilter, when set and On reports true, answers every DNS query a device sends to port 53 (UDP or TCP)
+	// itself, whatever resolver the device chose, so the DNS filter and its logs cover bridged devices.
+	DNSFilter *DNSHook
+}
+
+// DNSHook is the filtering resolver the gateway hands device DNS to.
+type DNSHook struct {
+	On     func() bool
+	Handle func(client netip.Addr, req []byte, tcp bool) []byte
 }
 
 // Stats are the counters shown in the panel.
@@ -190,6 +203,7 @@ func (g *Gateway) pumpOut(ctx context.Context) {
 		view.Release()
 		pkt.DecRef()
 		g.framesOut.Add(1)
+		g.tap(false, frame)
 		g.cfg.Out(frame)
 	}
 }
@@ -200,6 +214,7 @@ func (g *Gateway) Inbound(frame []byte) {
 		return
 	}
 	g.framesIn.Add(1)
+	g.tap(true, frame)
 	if g.foreignARPRequest(frame) {
 		return
 	}

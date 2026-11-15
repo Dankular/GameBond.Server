@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"github.com/Dankular/GameBond.Server/adminportal"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/Dankular/GameBond.Core/hwmon"
 	"github.com/Dankular/GameBond.Core/stream"
 	"github.com/Dankular/GameBond.Server/edge"
+	"github.com/Dankular/GameBond.Server/l2gw"
 	"github.com/Dankular/GameBond.Server/security"
 )
 
@@ -73,6 +75,11 @@ func run() error {
 	go sec.Run(ctx)
 	edge.SetTap(sec.Tap)
 	defer edge.SetTap(nil)
+	edge.SetDNSFilter(&l2gw.DNSHook{
+		On:     func() bool { return sec.Settings().DNSFilter.Enabled },
+		Handle: func(client netip.Addr, req []byte, tcp bool) []byte { return sec.DNS.Handle(ctx, client, req, tcp) },
+	})
+	defer edge.SetDNSFilter(nil)
 	if len(c.Admin) > 0 && string(c.Admin) != "null" {
 		settings, err := adminportal.ParseSettings(c.Admin)
 		if err != nil {

@@ -80,6 +80,25 @@ func openGateway(c *L2Config) (*l2Edge, error) {
 		return nil, err
 	}
 	cfg := l2gw.Config{Address: pfx, MTU: c.FrameMTU - bond.EthHeaderLen}
+	// Bridged devices get the same observers as tunnel traffic: the IDS and traffic classifier see every packet,
+	// and the DNS filter answers every query. Both are resolved per call, so a settings change applies at once.
+	cfg.Tap = func(fromDevice bool, p []byte) {
+		if f := tap.Load(); f != nil {
+			(*f)(fromDevice, p)
+		}
+	}
+	cfg.DNSFilter = &l2gw.DNSHook{
+		On: func() bool {
+			h := dnsFilter.Load()
+			return h != nil && (h.On == nil || h.On())
+		},
+		Handle: func(client netip.Addr, req []byte, tcp bool) []byte {
+			if h := dnsFilter.Load(); h != nil {
+				return h.Handle(client, req, tcp)
+			}
+			return nil
+		},
+	}
 	cfg.DHCPStart, _ = netip.ParseAddr(b.DHCPStart)
 	cfg.DHCPEnd, _ = netip.ParseAddr(b.DHCPEnd)
 	if cfg.Lease, err = time.ParseDuration(b.Lease); err != nil {
