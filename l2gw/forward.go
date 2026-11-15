@@ -16,7 +16,8 @@ import (
 var blockedPrefixes = func() []netip.Prefix {
 	var out []netip.Prefix
 	for _, p := range []string{"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
-		"192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/3"} {
+		"192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/3",
+		"::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"} {
 		out = append(out, netip.MustParsePrefix(p))
 	}
 	return out
@@ -35,12 +36,17 @@ func (g *Gateway) allowed(dst netip.Addr) bool {
 	return true
 }
 
-func addrOf(a tcpip.Address) netip.Addr { return netip.AddrFrom4(a.As4()) }
+func addrOf(a tcpip.Address) netip.Addr {
+	addr, _ := netip.AddrFromSlice(a.AsSlice())
+	return addr
+}
 
 func (g *Gateway) installForwarders() {
 	tcpFwd := tcp.NewForwarder(g.stack, 0, 4096, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		dst := netip.AddrPortFrom(addrOf(id.LocalAddress), id.LocalPort)
+		src := netip.AddrPortFrom(addrOf(id.RemoteAddress), id.RemotePort)
+		flowKey := ECMPFlowKey("tcp", src, dst)
 		release, v := g.decide(addrOf(id.RemoteAddress), dst)
 		if g.draining.Load() || v != allow {
 			if release != nil {
@@ -52,7 +58,7 @@ func (g *Gateway) installForwarders() {
 		}
 		g.tcpFlows.Add(1)
 		g.tcpTotal.Add(1)
-		go func() { defer release(); g.tcpFlow(r, dst) }()
+		go func() { defer release(); g.tcpFlow(r, dst, flowKey) }()
 	})
 	g.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 	udpFwd := udp.NewForwarder(g.stack, func(r *udp.ForwarderRequest) {
@@ -74,9 +80,9 @@ func (g *Gateway) installForwarders() {
 
 // tcpFlow dials the real destination first, so an unreachable host answers the device with a reset
 // instead of a connection that then dies, and only then accepts the device's connection.
-func (g *Gateway) tcpFlow(r *tcp.ForwarderRequest, dst netip.AddrPort) {
+func (g *Gateway) tcpFlow(r *tcp.ForwarderRequest, dst netip.AddrPort, flowKey []byte) {
 	defer g.tcpFlows.Add(-1)
-	out, err := g.cfg.Dial("tcp", dst.String(), g.cfg.DialTimeout)
+	out, _, err := DialWithECMP(g.cfg.Dial, "tcp", dst.String(), g.cfg.DialTimeout, g.cfg.ECMPPaths, flowKey)
 	if err != nil {
 		g.dialFailed.Add(1)
 		r.Complete(true)

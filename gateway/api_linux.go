@@ -120,6 +120,7 @@ func listenUnix(path, group string) (net.Listener, error) {
 
 func (s *APIServer) handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/layer2/port-auth/events", s.handlePortAuthEvent)
 	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "apply": s.Manager.Status(), "runtime": s.Runtime.Snapshot(r.Context())})
 	})

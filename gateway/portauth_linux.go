@@ -25,6 +25,10 @@ const (
 	portAuthMarker    = "# GameBond managed wired 802.1X port "
 )
 
+func has8021XProfiles(cfg layer2.Config) bool {
+	return len(cfg.PortAuth) > 0 || len(cfg.WiredSupplicants) > 0
+}
+
 type PortAuthSnapshot struct {
 	Enabled bool                   `json:"enabled"`
 	Active  bool                   `json:"active"`
@@ -33,11 +37,14 @@ type PortAuthSnapshot struct {
 }
 
 type PortAuthPortSnapshot struct {
-	Interface           string   `json:"interface"`
-	AuthenticatorActive bool     `json:"authenticator_active"`
-	EventMonitorActive  bool     `json:"event_monitor_active"`
-	AuthorizedClients   []string `json:"authorized_clients,omitempty"`
-	Error               string   `json:"error,omitempty"`
+	Interface               string   `json:"interface"`
+	AuthenticatorActive     bool     `json:"authenticator_active"`
+	EventMonitorActive      bool     `json:"event_monitor_active"`
+	SupplicantServiceActive *bool    `json:"supplicant_service_active,omitempty"`
+	SupplicantState         string   `json:"supplicant_state,omitempty"`
+	SupplicantAuthenticated *bool    `json:"supplicant_authenticated,omitempty"`
+	AuthorizedClients       []string `json:"authorized_clients,omitempty"`
+	Error                   string   `json:"error,omitempty"`
 }
 
 func renderPortAuthFiles(cfg layer2.Config) (map[string][]byte, error) {
@@ -62,28 +69,35 @@ func renderPortAuthFiles(cfg layer2.Config) (map[string][]byte, error) {
 }
 
 func validatePortAuthHost(ctx context.Context, runner Runner, cfg layer2.Config) error {
-	if len(cfg.PortAuth) == 0 {
+	if len(cfg.PortAuth) == 0 && len(cfg.WiredSupplicants) == 0 {
 		return nil
 	}
-	for _, tool := range []string{"hostapd", "hostapd_cli", "nft", "systemctl"} {
-		if !runner.Available(tool) {
-			return fmt.Errorf("802.1X control requires %s", tool)
+	if len(cfg.PortAuth) > 0 {
+		for _, tool := range []string{"hostapd", "hostapd_cli", "nft", "systemctl"} {
+			if !runner.Available(tool) {
+				return fmt.Errorf("802.1X authenticator requires %s", tool)
+			}
+		}
+		for _, unit := range []string{"gamebond-hostapd@.service", "gamebond-8021x-events@.service"} {
+			result, err := runner.Run(ctx, "systemctl", "show", "--property=LoadState", "--value", unit)
+			if err != nil {
+				return fmt.Errorf("inspect %s: %w", unit, err)
+			}
+			if strings.TrimSpace(string(result.Stdout)) != "loaded" {
+				return fmt.Errorf("%s is not installed; install the GameBond wired 802.1X units and reload systemd", unit)
+			}
+		}
+		if err := validatePortAuthNASAddresses(ctx, runner, cfg); err != nil {
+			return err
+		}
+		if _, err := renderPortAuthFiles(cfg); err != nil {
+			return err
 		}
 	}
-	for _, unit := range []string{"gamebond-hostapd@.service", "gamebond-8021x-events@.service"} {
-		result, err := runner.Run(ctx, "systemctl", "show", "--property=LoadState", "--value", unit)
-		if err != nil {
-			return fmt.Errorf("inspect %s: %w", unit, err)
+	if len(cfg.WiredSupplicants) > 0 {
+		if err := validateWiredSupplicantHost(ctx, runner, cfg); err != nil {
+			return err
 		}
-		if strings.TrimSpace(string(result.Stdout)) != "loaded" {
-			return fmt.Errorf("%s is not installed; install the GameBond wired 802.1X units and reload systemd", unit)
-		}
-	}
-	if err := validatePortAuthNASAddresses(ctx, runner, cfg); err != nil {
-		return err
-	}
-	if _, err := renderPortAuthFiles(cfg); err != nil {
-		return err
 	}
 	return nil
 }
@@ -107,24 +121,36 @@ func validatePortAuthNASAddresses(ctx context.Context, runner Runner, cfg layer2
 			}
 		}
 		bridge := bridges[bridgeID]
-		result, err := runner.Run(ctx, "ip", "-j", "address", "show", "dev", bridge.Name)
-		if err != nil {
-			return fmt.Errorf("inspect 802.1X NAS address on bridge %s: %w", bridge.Name, err)
-		}
-		var links []struct {
-			Addresses []struct {
-				Local string `json:"local"`
-			} `json:"addr_info"`
-		}
-		if err := json.Unmarshal(result.Stdout, &links); err != nil {
-			return fmt.Errorf("decode addresses on 802.1X bridge %s: %w", bridge.Name, err)
-		}
 		wanted, _ := netip.ParseAddr(policy.NASAddress)
 		found := false
-		for _, link := range links {
-			for _, address := range link.Addresses {
-				if got, err := netip.ParseAddr(address.Local); err == nil && got == wanted {
+		if native, ok := runner.(rtnetlinkLinkAddressReader); ok {
+			addresses, err := native.LinkAddresses(ctx, bridge.Name)
+			if err != nil {
+				return fmt.Errorf("inspect 802.1X NAS address on bridge %s over rtnetlink: %w", bridge.Name, err)
+			}
+			for _, address := range addresses {
+				if address == wanted {
 					found = true
+				}
+			}
+		} else {
+			result, err := runner.Run(ctx, "ip", "-j", "address", "show", "dev", bridge.Name)
+			if err != nil {
+				return fmt.Errorf("inspect 802.1X NAS address on bridge %s: %w", bridge.Name, err)
+			}
+			var links []struct {
+				Addresses []struct {
+					Local string `json:"local"`
+				} `json:"addr_info"`
+			}
+			if err := json.Unmarshal(result.Stdout, &links); err != nil {
+				return fmt.Errorf("decode addresses on 802.1X bridge %s: %w", bridge.Name, err)
+			}
+			for _, link := range links {
+				for _, address := range link.Addresses {
+					if got, err := netip.ParseAddr(address.Local); err == nil && got == wanted {
+						found = true
+					}
 				}
 			}
 		}
@@ -228,7 +254,7 @@ func writePortAuthFiles(files map[string][]byte) error {
 }
 
 func applyPortAuthTransition(ctx context.Context, runner Runner, previous, desired layer2.Config) error {
-	if len(previous.PortAuth) == 0 && len(desired.PortAuth) == 0 {
+	if !has8021XProfiles(previous) && !has8021XProfiles(desired) {
 		return nil
 	}
 	files, err := renderPortAuthFiles(desired)
@@ -238,7 +264,21 @@ func applyPortAuthTransition(ctx context.Context, runner Runner, previous, desir
 	if err := writePortAuthFiles(files); err != nil {
 		return err
 	}
-	return reconcilePortAuthServices(ctx, runner, previous, desired)
+	if len(previous.WiredSupplicants) > 0 || len(desired.WiredSupplicants) > 0 {
+		supplicantFiles, err := renderWiredSupplicantFiles(desired)
+		if err != nil {
+			return err
+		}
+		if err := writeWiredSupplicantFiles(supplicantFiles); err != nil {
+			return err
+		}
+	}
+	if len(previous.PortAuth) > 0 || len(desired.PortAuth) > 0 {
+		if err := reconcilePortAuthServices(ctx, runner, previous, desired); err != nil {
+			return err
+		}
+	}
+	return reconcileWiredSupplicantServices(ctx, runner, previous, desired)
 }
 
 func pausePortAuthServices(ctx context.Context, runner Runner, cfg layer2.Config) error {
@@ -255,7 +295,7 @@ func pausePortAuthServices(ctx context.Context, runner Runner, cfg layer2.Config
 			return fmt.Errorf("stop wired 802.1X authenticator for %s: %w", id, err)
 		}
 	}
-	return nil
+	return pauseWiredSupplicantServices(ctx, runner, cfg)
 }
 
 func reconcilePortAuthServices(ctx context.Context, runner Runner, previous, desired layer2.Config) error {
@@ -309,23 +349,27 @@ func verifyPortAuth(ctx context.Context, runner Runner, cfg layer2.Config) error
 			}
 		}
 	}
-	return nil
+	return verifyWiredSupplicantServices(ctx, runner, cfg)
 }
 
 func snapshotPortAuth(ctx context.Context, runner Runner, cfg layer2.Config) PortAuthSnapshot {
-	status := PortAuthSnapshot{Enabled: len(cfg.PortAuth) > 0}
+	status := PortAuthSnapshot{Enabled: has8021XProfiles(cfg)}
 	if !status.Enabled {
 		return status
 	}
-	setResult, setErr := runner.Run(ctx, "nft", "-j", "list", "set", "bridge", "gamebond_8021x", "authenticated_clients")
+	var setErr error
 	clientsByPort := map[string][]string{}
-	if setErr == nil {
-		clientsByPort, setErr = parsePortAuthClients(setResult.Stdout, cfg)
-	}
-	if setErr != nil {
-		status.Error = "cannot inspect active 802.1X authorizations: " + setErr.Error()
-	}
 	status.Active = true
+	if len(cfg.PortAuth) > 0 {
+		setResult, err := runner.Run(ctx, "nft", "-j", "list", "set", "bridge", "gamebond_8021x", "authenticated_clients")
+		setErr = err
+		if setErr == nil {
+			clientsByPort, setErr = parsePortAuthClients(setResult.Stdout, cfg)
+		}
+		if setErr != nil {
+			status.Error = "cannot inspect active 802.1X authorizations: " + setErr.Error()
+		}
+	}
 	if setErr != nil {
 		status.Active = false
 	}
@@ -350,8 +394,33 @@ func snapshotPortAuth(ctx context.Context, runner Runner, cfg layer2.Config) Por
 		}
 		status.Ports = append(status.Ports, port)
 	}
+	for _, policy := range cfg.WiredSupplicants {
+		iface, _ := findLayer2Interface(cfg, policy.Interface)
+		port := PortAuthPortSnapshot{Interface: iface.Name}
+		_, supplicantErr := runner.Run(ctx, "systemctl", "is-active", "--quiet", wiredSupplicantUnit+policy.Interface+".service")
+		supplicantActive := supplicantErr == nil
+		port.SupplicantServiceActive = &supplicantActive
+		if supplicantErr != nil {
+			port.Error = "supplicant service is inactive"
+			status.Active = false
+		} else {
+			controlPath := "/run/gamebond-wpa_supplicant/" + policy.Interface
+			result, err := runner.Run(ctx, "wpa_cli", "-p", controlPath, "-i", iface.Name, "status")
+			if err == nil {
+				state, authenticated, stateErr := parseWiredSupplicantStatus(result.Stdout)
+				port.SupplicantState = state
+				port.SupplicantAuthenticated = &authenticated
+				err = stateErr
+			}
+			if err != nil {
+				port.Error = "cannot inspect supplicant EAP state: " + err.Error()
+				status.Active = false
+			}
+		}
+		status.Ports = append(status.Ports, port)
+	}
 	if !status.Active {
-		status.Error = "one or more 802.1X per-port services are inactive"
+		status.Error = "one or more 802.1X services or runtime status checks failed"
 	}
 	return status
 }
@@ -444,6 +513,32 @@ func parsePortAuthClients(data []byte, cfg layer2.Config) (map[string][]string, 
 		sort.Strings(clients[iface])
 	}
 	return clients, nil
+}
+
+func parseWiredSupplicantStatus(data []byte) (string, bool, error) {
+	if len(data) == 0 || len(data) > 16*1024 {
+		return "", false, errors.New("supplicant status output is empty or exceeds 16 KiB")
+	}
+	state := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		value, ok := strings.CutPrefix(strings.TrimSpace(line), "wpa_state=")
+		if !ok {
+			continue
+		}
+		if state != "" || value == "" {
+			return "", false, errors.New("supplicant status has a duplicate or empty EAP state")
+		}
+		for _, ch := range value {
+			if !(ch >= 'A' && ch <= 'Z' || ch == '_') {
+				return "", false, errors.New("supplicant status has an invalid EAP state")
+			}
+		}
+		state = value
+	}
+	if state == "" {
+		return "", false, errors.New("supplicant status does not include wpa_state")
+	}
+	return state, state == "COMPLETED", nil
 }
 
 // HandlePortAuthEvent applies only known hostapd authorization events. Unknown

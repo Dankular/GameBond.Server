@@ -8,7 +8,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"path/filepath"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -24,10 +24,12 @@ const MaxMACACLRules = 256
 const MaxIPACLRules = 256
 
 var (
-	stableIDPattern   = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
-	ifNamePattern     = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,15}$`)
-	radiusHostPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$`)
-	nasIDPattern      = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,253}$`)
+	stableIDPattern    = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
+	segmentIDPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`)
+	ifNamePattern      = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,15}$`)
+	radiusHostPattern  = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$`)
+	nasIDPattern       = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,253}$`)
+	eapIdentityPattern = regexp.MustCompile(`^[A-Za-z0-9._@:-]{1,253}$`)
 )
 
 func enabled(value *bool) bool { return value != nil && *value }
@@ -43,6 +45,10 @@ func validLLDPMEDApplication(value string) bool {
 	default:
 		return false
 	}
+}
+
+func validSupplicantPath(value string) bool {
+	return path.IsAbs(value) && !strings.ContainsAny(value, "\\\r\n\x00\"")
 }
 
 // Config is the versioned Layer 2 desired topology. References use stable IDs;
@@ -65,8 +71,10 @@ type Config struct {
 	QoS                      []QoSPolicy                   `json:"qos,omitempty"`
 	PortMirrors              []PortMirror                  `json:"port_mirrors,omitempty"`
 	Bonds                    []Bond                        `json:"bonds,omitempty"`
+	VXLANDevices             []VXLANDevice                 `json:"vxlan_devices,omitempty"`
 	DHCPGuard                []DHCPGuardPort               `json:"dhcp_guard,omitempty"`
 	PortAuth                 []PortAuth                    `json:"port_auth,omitempty"`
+	WiredSupplicants         []WiredSupplicant             `json:"wired_supplicants,omitempty"`
 	AVProfiles               []AVProfileSelection          `json:"pro_av_profiles,omitempty"`
 }
 
@@ -94,6 +102,20 @@ type Bond struct {
 	LACPRate   string   `json:"lacp_rate"`
 	HashPolicy string   `json:"hash_policy"`
 	SystemMAC  string   `json:"system_mac,omitempty"`
+}
+
+// VXLANDevice attaches one persistent broker TAP and one kernel VXLAN netdevice
+// to the same bridge network. The VNI and local VTEP address are discovered by
+// FRR/Zebra; EVPN peer routes are not synthesized by the Layer 2 provider.
+type VXLANDevice struct {
+	ID                string `json:"id"`
+	VNI               uint32 `json:"vni"`
+	TapInterface      string `json:"tap_interface"`   // managed Interface ID opened by the edge broker
+	VxlanInterface    string `json:"vxlan_interface"` // managed Interface ID created as a kernel VXLAN device
+	UnderlayInterface string `json:"underlay_interface"`
+	Network           string `json:"network"`
+	LocalAddress      string `json:"local_address"`
+	UDPPort           uint16 `json:"udp_port,omitempty"` // default 4789
 }
 
 type Bridge struct {
@@ -158,6 +180,30 @@ type PortAuth struct {
 	NASID         string `json:"nas_id"`
 	ReauthSeconds uint32 `json:"reauth_seconds,omitempty"`
 	FailurePolicy string `json:"failure_policy"`
+	// Segment fields bind this hostapd interface's station events to one
+	// broker-authenticated session attachment. The separate admin credential is
+	// read from its protected file at event time, never copied into config.
+	SegmentID             string `json:"segment_id,omitempty"`
+	SegmentIdentity       string `json:"segment_identity,omitempty"`
+	SegmentSocketPath     string `json:"segment_socket_path,omitempty"`
+	SegmentAdminTokenFile string `json:"segment_admin_token_file,omitempty"`
+	EAPOLTapName          string `json:"eapol_tap_name,omitempty"`
+}
+
+// WiredSupplicant configures a managed Linux uplink to authenticate to an
+// upstream wired 802.1X network. Password and private-key passphrase material
+// stays in a root-owned credential file and is never embedded in API config.
+type WiredSupplicant struct {
+	Interface              string `json:"interface"`
+	EAPMethod              string `json:"eap_method"` // PEAP, TTLS, or TLS
+	Identity               string `json:"identity"`
+	AnonymousIdentity      string `json:"anonymous_identity,omitempty"`
+	Phase2                 string `json:"phase2,omitempty"` // auth=PAP, auth=CHAP, auth=MSCHAP, or auth=MSCHAPV2
+	PasswordFile           string `json:"password_file,omitempty"`
+	CAFile                 string `json:"ca_file"`
+	ClientCertFile         string `json:"client_cert_file,omitempty"`
+	PrivateKeyFile         string `json:"private_key_file,omitempty"`
+	PrivateKeyPasswordFile string `json:"private_key_password_file,omitempty"`
 }
 
 // Network represents one VLAN-backed virtual network on a managed bridge.
@@ -612,6 +658,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("port_auth exceeds limit 128")
 	}
 	seenPortAuth := make(map[string]bool, len(c.PortAuth))
+	seenSegmentAuth := make(map[string]bool, len(c.PortAuth))
+	seenSegmentTap := make(map[string]bool, len(c.PortAuth))
 	for i, policy := range c.PortAuth {
 		field := fmt.Sprintf("port_auth[%d]", i)
 		if _, exists := interfaceIDs[policy.Interface]; !exists || interfaceBridge[policy.Interface] == "" {
@@ -635,7 +683,7 @@ func (c Config) Validate() error {
 		if address, err := netip.ParseAddr(policy.NASAddress); err != nil || address.Zone() != "" {
 			return fmt.Errorf("%s.nas_address must be a local IPv4 or IPv6 address", field)
 		}
-		if policy.SecretFile != filepath.Join("/etc/gamebond/8021x", policy.Interface+".secret") {
+		if policy.SecretFile != path.Join("/etc/gamebond/8021x", policy.Interface+".secret") {
 			return fmt.Errorf("%s.secret_file must be the managed per-port secret path", field)
 		}
 		if !nasIDPattern.MatchString(policy.NASID) {
@@ -650,6 +698,29 @@ func (c Config) Validate() error {
 		if !policy.ExclusivePort {
 			return fmt.Errorf("%s.exclusive_port must be true; shared downstream 802.1X ports cannot safely receive broadcast or multicast traffic", field)
 		}
+		segmentMapping := policy.SegmentID != "" || policy.SegmentIdentity != "" || policy.SegmentSocketPath != "" || policy.SegmentAdminTokenFile != "" || policy.EAPOLTapName != ""
+		if segmentMapping {
+			if !segmentIDPattern.MatchString(policy.SegmentID) || len(policy.SegmentIdentity) > 128 || !eapIdentityPattern.MatchString(policy.SegmentIdentity) {
+				return fmt.Errorf("%s.segment_id and segment_identity must be valid when broker authorization is enabled", field)
+			}
+			if !path.IsAbs(policy.SegmentSocketPath) || len(policy.SegmentSocketPath) >= 104 || strings.ContainsAny(policy.SegmentSocketPath, "\\\r\n\x00") {
+				return fmt.Errorf("%s.segment_socket_path must be absolute and shorter than 104 bytes", field)
+			}
+			if !validSupplicantPath(policy.SegmentAdminTokenFile) {
+				return fmt.Errorf("%s.segment_admin_token_file must be an absolute safe path", field)
+			}
+			iface, _ := findInterface(c.Interfaces, policy.Interface)
+			if !ifNamePattern.MatchString(policy.EAPOLTapName) || iface.Name != policy.EAPOLTapName {
+				return fmt.Errorf("%s.eapol_tap_name must match the managed interface name used by the edge broker TAP", field)
+			}
+			segmentKey := policy.SegmentID + "\x00" + policy.SegmentSocketPath
+			identityKey := segmentKey + "\x00" + policy.SegmentIdentity
+			tapKey := segmentKey + "\x00" + policy.EAPOLTapName
+			if seenSegmentAuth[identityKey] || seenSegmentTap[tapKey] {
+				return fmt.Errorf("%s duplicates a segment identity or EAPOL TAP mapping", field)
+			}
+			seenSegmentAuth[identityKey], seenSegmentTap[tapKey] = true, true
+		}
 		bridgeID := interfaceBridge[policy.Interface]
 		for _, bridge := range c.Bridges {
 			if bridge.ID != bridgeID {
@@ -662,6 +733,57 @@ func (c Config) Validate() error {
 				if port.Interface == policy.Interface && (port.STPPriority != nil || port.STPPathCost != nil || enabled(port.STPRootBlock) || enabled(port.STPEdge) || enabled(port.STPBPDUGuard)) {
 					return fmt.Errorf("%s cannot be enabled on port %q while STP controls are configured; EAPOL forwarding compatibility is unverified", field, policy.Interface)
 				}
+			}
+		}
+	}
+	if len(c.WiredSupplicants) > 128 {
+		return fmt.Errorf("wired_supplicants exceeds limit 128")
+	}
+	seenSupplicants := make(map[string]bool, len(c.WiredSupplicants))
+	for i := range c.WiredSupplicants {
+		policy := &c.WiredSupplicants[i]
+		field := fmt.Sprintf("wired_supplicants[%d]", i)
+		if _, exists := interfaceIDs[policy.Interface]; !exists || interfaceBridge[policy.Interface] != "" {
+			return fmt.Errorf("%s.interface %q must reference a managed non-bridge interface", field, policy.Interface)
+		}
+		if seenSupplicants[policy.Interface] {
+			return fmt.Errorf("%s duplicates interface %q", field, policy.Interface)
+		}
+		seenSupplicants[policy.Interface] = true
+		if seenPortAuth[policy.Interface] {
+			return fmt.Errorf("%s.interface %q cannot be both a wired authenticator and supplicant", field, policy.Interface)
+		}
+		policy.EAPMethod = strings.ToUpper(policy.EAPMethod)
+		if policy.EAPMethod != "PEAP" && policy.EAPMethod != "TTLS" && policy.EAPMethod != "TLS" {
+			return fmt.Errorf("%s.eap_method must be PEAP, TTLS, or TLS", field)
+		}
+		if !eapIdentityPattern.MatchString(policy.Identity) || (policy.AnonymousIdentity != "" && !eapIdentityPattern.MatchString(policy.AnonymousIdentity)) {
+			return fmt.Errorf("%s identity values must use letters, digits, dot, underscore, at-sign, colon, or dash", field)
+		}
+		if policy.CAFile == "" || !validSupplicantPath(policy.CAFile) {
+			return fmt.Errorf("%s.ca_file must be an absolute certificate path", field)
+		}
+		if policy.EAPMethod == "TLS" {
+			if policy.ClientCertFile == "" || policy.PrivateKeyFile == "" || !validSupplicantPath(policy.ClientCertFile) || !validSupplicantPath(policy.PrivateKeyFile) || policy.PasswordFile != "" || policy.Phase2 != "" {
+				return fmt.Errorf("%s EAP-TLS requires absolute client_cert_file and private_key_file and forbids password_file", field)
+			}
+			if policy.PrivateKeyPasswordFile != "" && policy.PrivateKeyPasswordFile != path.Join("/etc/gamebond/8021x/supplicants", policy.Interface+".keypass") {
+				return fmt.Errorf("%s.private_key_password_file must be the managed per-interface credential path", field)
+			}
+		} else {
+			if policy.PasswordFile != path.Join("/etc/gamebond/8021x/supplicants", policy.Interface+".secret") {
+				return fmt.Errorf("%s.password_file must be the managed per-interface credential path", field)
+			}
+			if policy.ClientCertFile != "" || policy.PrivateKeyFile != "" || policy.PrivateKeyPasswordFile != "" {
+				return fmt.Errorf("%s certificate and private-key fields require EAP-TLS", field)
+			}
+			if policy.Phase2 == "" {
+				policy.Phase2 = "auth=MSCHAPV2"
+			}
+			switch policy.Phase2 {
+			case "auth=PAP", "auth=CHAP", "auth=MSCHAP", "auth=MSCHAPV2":
+			default:
+				return fmt.Errorf("%s.phase2 must be auth=PAP, auth=CHAP, auth=MSCHAP, or auth=MSCHAPV2", field)
 			}
 		}
 	}
@@ -704,6 +826,66 @@ func (c Config) Validate() error {
 			return fmt.Errorf("bridge %q VLAN is duplicated: %d", network.Bridge, network.VLAN)
 		}
 		bridgeVLANs[network.Bridge][network.VLAN] = struct{}{}
+	}
+	if len(c.VXLANDevices) > 64 {
+		return fmt.Errorf("vxlan_devices exceeds limit 64")
+	}
+	seenVXLANIDs, seenVXLANVNIs, seenVXLANInterfaces := map[string]bool{}, map[uint32]bool{}, map[string]bool{}
+	for i, device := range c.VXLANDevices {
+		field := fmt.Sprintf("vxlan_devices[%d]", i)
+		if !stableIDPattern.MatchString(device.ID) || seenVXLANIDs[device.ID] {
+			return fmt.Errorf("%s.id must be a unique lowercase stable ID", field)
+		}
+		seenVXLANIDs[device.ID] = true
+		if device.VNI == 0 || device.VNI > 16777215 || seenVXLANVNIs[device.VNI] {
+			return fmt.Errorf("%s.vni must be a unique value in 1..16777215", field)
+		}
+		seenVXLANVNIs[device.VNI] = true
+		if device.UDPPort == 0 {
+			device.UDPPort = 4789
+		}
+		if !stableIDPattern.MatchString(device.TapInterface) || !stableIDPattern.MatchString(device.VxlanInterface) || device.TapInterface == device.VxlanInterface {
+			return fmt.Errorf("%s.tap_interface and vxlan_interface must be distinct interface IDs", field)
+		}
+		if !stableIDPattern.MatchString(device.UnderlayInterface) {
+			return fmt.Errorf("%s.underlay_interface must reference a managed underlay interface", field)
+		}
+		if seenVXLANInterfaces[device.TapInterface] || seenVXLANInterfaces[device.VxlanInterface] {
+			return fmt.Errorf("%s reuses an interface owned by another VXLAN device", field)
+		}
+		seenVXLANInterfaces[device.TapInterface], seenVXLANInterfaces[device.VxlanInterface] = true, true
+		if _, isBond := bondInterfaces[device.TapInterface]; isBond || bondMembers[device.TapInterface] {
+			return fmt.Errorf("%s.tap_interface cannot be a bond or bond member", field)
+		}
+		if _, isBond := bondInterfaces[device.VxlanInterface]; isBond || bondMembers[device.VxlanInterface] {
+			return fmt.Errorf("%s.vxlan_interface cannot be a bond or bond member", field)
+		}
+		tap, tapOK := findInterface(c.Interfaces, device.TapInterface)
+		vxlan, vxlanOK := findInterface(c.Interfaces, device.VxlanInterface)
+		underlay, underlayOK := findInterface(c.Interfaces, device.UnderlayInterface)
+		if !tapOK || !vxlanOK || !underlayOK {
+			return fmt.Errorf("%s references unknown TAP, VXLAN, or underlay interface", field)
+		}
+		localAddress, err := netip.ParseAddr(device.LocalAddress)
+		if err != nil || localAddress.Is4In6() || localAddress.IsUnspecified() || localAddress.IsMulticast() || localAddress.IsLinkLocalUnicast() || localAddress.String() != device.LocalAddress {
+			return fmt.Errorf("%s.local_address must be a canonical unicast underlay address", field)
+		}
+		network, networkOK := networkConfigs[device.Network]
+		if !networkOK {
+			return fmt.Errorf("%s references unknown network %q", field, device.Network)
+		}
+		if !portCarriesNetwork(interfacePorts[device.TapInterface], device.Network) || !portCarriesNetwork(interfacePorts[device.VxlanInterface], device.Network) {
+			return fmt.Errorf("%s TAP and VXLAN interfaces must be bridge ports carrying network %q", field, device.Network)
+		}
+		if interfaceBridge[device.TapInterface] != network.Bridge || interfaceBridge[device.VxlanInterface] != network.Bridge {
+			return fmt.Errorf("%s TAP and VXLAN interfaces must be attached to network %q's bridge", field, device.Network)
+		}
+		if _, attached := interfaceBridge[device.UnderlayInterface]; attached || seenVXLANInterfaces[device.UnderlayInterface] {
+			return fmt.Errorf("%s.underlay_interface cannot be a bridge port or another VXLAN attachment interface", field)
+		}
+		if tap.Name == vxlan.Name || tap.Name == underlay.Name || vxlan.Name == underlay.Name {
+			return fmt.Errorf("%s TAP, VXLAN, and underlay interface names must be distinct", field)
+		}
 	}
 	if len(c.AVProfiles) > 64 {
 		return fmt.Errorf("pro_av_profiles exceeds limit 64")

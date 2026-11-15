@@ -54,7 +54,7 @@ func main() {
 	if len(os.Args) < 4 {
 		fatal("expected hostapd_cli arguments: interface event station-mac")
 	}
-	if err := gateway.HandlePortAuthEvent(ctx, runner, *cfg.Layer2, os.Args[1], os.Args[2], os.Args[3]); err != nil {
+	if err := gateway.SendPortAuthEventViaAPI(ctx, cfg.SocketPath, os.Args[1], os.Args[2], os.Args[3]); err != nil {
 		// An event that cannot be trusted invalidates every authorization. This
 		// trades availability for the configured fail-closed policy.
 		for _, policy := range cfg.Layer2.PortAuth {

@@ -8,13 +8,24 @@ import (
 
 // VRRPConfig configures this gateway as the non-preempting shadow/standby peer.
 type VRRPConfig struct {
-	Enabled                   bool     `json:"enabled"`
-	InterfaceID               string   `json:"interface_id,omitempty"`
-	VirtualRouterID           uint8    `json:"virtual_router_id,omitempty"`
-	Priority                  uint8    `json:"priority,omitempty"`
-	AdvertisementIntervalSecs uint8    `json:"advertisement_interval_seconds,omitempty"`
-	Peers                     []string `json:"peers,omitempty"`
-	VirtualAddresses          []string `json:"virtual_addresses,omitempty"`
+	Enabled                   bool           `json:"enabled"`
+	InterfaceID               string         `json:"interface_id,omitempty"`
+	VirtualRouterID           uint8          `json:"virtual_router_id,omitempty"`
+	Priority                  uint8          `json:"priority,omitempty"`
+	AdvertisementIntervalSecs uint8          `json:"advertisement_interval_seconds,omitempty"`
+	Peers                     []string       `json:"peers,omitempty"`
+	VirtualAddresses          []string       `json:"virtual_addresses,omitempty"`
+	BFD                       *VRRPBFDConfig `json:"bfd,omitempty"`
+}
+
+// VRRPBFDConfig tracks an independent upstream health target. The target must
+// not be the VRRP peer: tracking the backup itself could prevent takeover when
+// that peer is unavailable.
+type VRRPBFDConfig struct {
+	Enabled       bool   `json:"enabled"`
+	Neighbor      string `json:"neighbor"`
+	MinIntervalMS uint16 `json:"min_interval_ms"`
+	Multiplier    uint8  `json:"multiplier"`
 }
 
 func (c VRRPConfig) Validate(interfaces []Interface) error {
@@ -62,6 +73,22 @@ func (c VRRPConfig) Validate(interfaces []Interface) error {
 			return fmt.Errorf("peers[%d] is duplicated", i)
 		}
 		seenPeers[addr] = true
+	}
+	if c.BFD != nil && c.BFD.Enabled {
+		bfd := c.BFD
+		neighbor, err := netip.ParseAddr(bfd.Neighbor)
+		if err != nil || !neighbor.IsValid() || neighbor.IsUnspecified() || neighbor.IsMulticast() || neighbor.IsLoopback() || neighbor.IsLinkLocalUnicast() || (neighbor.Is4() != (family == 4)) {
+			return errors.New("bfd.neighbor must be a unicast address matching the virtual address family")
+		}
+		if seenPeers[neighbor] {
+			return errors.New("bfd.neighbor must be independent of the VRRP peers")
+		}
+		if bfd.MinIntervalMS < 50 || bfd.MinIntervalMS > 10000 {
+			return errors.New("bfd.min_interval_ms must be 50..10000")
+		}
+		if bfd.Multiplier < 3 || bfd.Multiplier > 20 {
+			return errors.New("bfd.multiplier must be 3..20")
+		}
 	}
 	seenVIPs := make(map[netip.Prefix]bool, len(c.VirtualAddresses))
 	for i, value := range c.VirtualAddresses {

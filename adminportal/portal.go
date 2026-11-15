@@ -6,10 +6,12 @@ import (
 	"crypto/tls"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -19,6 +21,8 @@ import (
 	"time"
 
 	"github.com/Dankular/GameBond.Server/adminauth"
+	"github.com/Dankular/GameBond.Server/lab"
+	"golang.org/x/net/websocket"
 )
 
 //go:embed static/*
@@ -27,7 +31,7 @@ var staticFiles embed.FS
 // RestartExitCode is the status the container entrypoint treats as "restart".
 const RestartExitCode = 75
 
-const maxBody = 256 * 1024
+const maxBody = 1 << 20
 
 // maxHashing is how many password hashes may run at the same time.
 const maxHashing = 2
@@ -35,7 +39,7 @@ const maxHashing = 2
 var contentTypes = map[string]string{".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
 
 var securityHeaders = [][2]string{
-	{"Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"},
+	{"Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"},
 	{"X-Content-Type-Options", "nosniff"}, {"X-Frame-Options", "DENY"}, {"Referrer-Policy", "no-referrer"},
 	{"Cache-Control", "no-store"}, {"Strict-Transport-Security", "max-age=31536000"},
 }
@@ -61,6 +65,11 @@ type Options struct {
 	Security SecurityAPI
 	// GatewaySocketPath is optional; when configured, only the gateway's allowlisted Unix API is used.
 	GatewaySocketPath string
+	// LabManager is nil when this process has no configured single-host sandbox backend.
+	LabManager *lab.Manager
+	// LabManagerFactory creates an isolated in-memory orchestrator for a team.
+	LabManagerFactory func(team string) (*lab.Manager, error)
+	LabDirectory      string
 }
 
 // SecurityAPI is what the portal needs from the security manager.
@@ -83,6 +92,8 @@ type Portal struct {
 	// all run at once and exhaust the container's memory.
 	hashing      chan struct{}
 	mu           sync.Mutex // configuration writes and the password hash
+	labMu        sync.Mutex
+	labManagers  map[string]*lab.Manager
 	passwordHash string
 	gateway      *GatewayClient
 	logMu        sync.Mutex
@@ -99,11 +110,40 @@ func New(o Options) *Portal {
 	if o.RequestRestart == nil {
 		o.RequestRestart = func() {}
 	}
-	p := &Portal{o: o, hashing: make(chan struct{}, maxHashing), Sessions: adminauth.NewSessions(o.Clock), Throttle: adminauth.NewThrottle(o.Clock), passwordHash: o.Settings.PasswordHash}
+	p := &Portal{o: o, hashing: make(chan struct{}, maxHashing), Sessions: adminauth.NewSessions(o.Clock), Throttle: adminauth.NewThrottle(o.Clock), passwordHash: o.Settings.PasswordHash, labManagers: make(map[string]*lab.Manager)}
 	if o.GatewaySocketPath != "" {
 		p.gateway, _ = NewGatewayClient(o.GatewaySocketPath)
 	}
 	return p
+}
+
+func (p *Portal) labManager(team string) (*lab.Manager, error) {
+	if p.o.LabManager != nil {
+		return p.o.LabManager, nil
+	}
+	if p.o.LabManagerFactory == nil {
+		return nil, nil
+	}
+	if team == "" {
+		return nil, errors.New("session has no team scope")
+	}
+	p.labMu.Lock()
+	defer p.labMu.Unlock()
+	if manager := p.labManagers[team]; manager != nil {
+		return manager, nil
+	}
+	manager, err := p.o.LabManagerFactory(team)
+	if err != nil {
+		return nil, err
+	}
+	p.labManagers[team] = manager
+	return manager, nil
+}
+
+func (p *Portal) legacyAdmin() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.o.Settings.Users) == 0
 }
 
 // Note appends a timestamped line to the portal's log ring.
@@ -147,6 +187,20 @@ func (p *Portal) Start() error {
 func (p *Portal) Close() {
 	if p.server != nil {
 		p.server.Close()
+	}
+	p.labMu.Lock()
+	managers := make([]*lab.Manager, 0, len(p.labManagers))
+	for _, manager := range p.labManagers {
+		managers = append(managers, manager)
+	}
+	p.labManagers = make(map[string]*lab.Manager)
+	p.labMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, manager := range managers {
+		if err := manager.Close(ctx); err != nil {
+			p.Note("lab runtime cleanup failed: " + err.Error())
+		}
 	}
 }
 
@@ -390,6 +444,14 @@ func (p *Portal) serve(w http.ResponseWriter, r *http.Request) {
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		path = path[:i]
 	}
+	if path == "/api/labs/console" {
+		if r.Method != http.MethodGet {
+			p.json(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		p.labConsole(w, r)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		p.get(w, r, path)
@@ -398,6 +460,57 @@ func (p *Portal) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		p.json(w, 501, map[string]any{"error": "unsupported method"})
 	}
+}
+
+func (p *Portal) labConsole(w http.ResponseWriter, r *http.Request) {
+	session := p.Sessions.Get(sessionToken(r))
+	if session == nil {
+		p.json(w, http.StatusUnauthorized, map[string]any{"error": "login required"})
+		return
+	}
+	origin, err := url.Parse(r.Header.Get("Origin"))
+	if err != nil || origin.Host != r.Host || origin.User != nil || (origin.Scheme != "http" && origin.Scheme != "https") {
+		p.json(w, http.StatusForbidden, map[string]any{"error": "same-origin console connection required"})
+		return
+	}
+	if session.Role == "viewer" {
+		p.json(w, http.StatusForbidden, map[string]any{"error": "editor role is required for node consoles"})
+		return
+	}
+	team := session.Team
+	if session.Role == "system-admin" && r.URL.Query().Get("team") != "" {
+		team = r.URL.Query().Get("team")
+	}
+	if !teamPattern.MatchString(team) {
+		p.json(w, 400, map[string]any{"error": "invalid team scope"})
+		return
+	}
+	manager, managerErr := p.labManager(team)
+	if managerErr != nil || manager == nil {
+		p.json(w, http.StatusServiceUnavailable, map[string]any{"error": "lab runtime is not configured"})
+		return
+	}
+	node := r.URL.Query().Get("node")
+	if node == "" || len(node) > 32 {
+		p.json(w, http.StatusBadRequest, map[string]any{"error": "node id is required"})
+		return
+	}
+	console, err := manager.NodeConsole(r.Context(), node)
+	if err != nil {
+		p.json(w, http.StatusNotFound, map[string]any{"error": err.Error()})
+		return
+	}
+	handler := websocket.Handler(func(ws *websocket.Conn) {
+		defer console.Close()
+		defer ws.Close()
+		ws.MaxPayloadBytes = 64 * 1024
+		done := make(chan struct{}, 2)
+		go func() { _, _ = io.Copy(console, ws); done <- struct{}{} }()
+		go func() { _, _ = io.Copy(ws, console); done <- struct{}{} }()
+		<-done
+	})
+	handler.ServeHTTP(w, r)
+	_ = console.Close()
 }
 
 func (p *Portal) get(w http.ResponseWriter, r *http.Request, path string) {
@@ -427,14 +540,68 @@ func (p *Portal) apiGet(w http.ResponseWriter, r *http.Request, path string) {
 	s := p.Sessions.Get(sessionToken(r))
 	if path == "/api/session" {
 		var csrf any
+		var identity any
 		if s != nil {
 			csrf = s.CSRF
+			identity = map[string]any{"username": s.Username, "team": s.Team, "role": s.Role, "legacy_admin": p.legacyAdmin()}
 		}
-		p.json(w, 200, map[string]any{"authenticated": s != nil, "csrf": csrf})
+		p.json(w, 200, map[string]any{"authenticated": s != nil, "csrf": csrf, "identity": identity})
 		return
 	}
 	if s == nil {
 		p.json(w, 401, map[string]any{"error": "login required"})
+		return
+	}
+	if s.Role != "system-admin" && !strings.HasPrefix(path, "/api/labs/") {
+		p.json(w, http.StatusForbidden, map[string]any{"error": "team role cannot access this endpoint"})
+		return
+	}
+	team := s.Team
+	if s.Role == "system-admin" && r.URL.Query().Get("team") != "" {
+		team = r.URL.Query().Get("team")
+	}
+	if !teamPattern.MatchString(team) {
+		p.json(w, 400, map[string]any{"error": "invalid team scope"})
+		return
+	}
+	if path == "/api/labs/users" {
+		if s.Role != "system-admin" && s.Role != "team-admin" {
+			p.json(w, http.StatusForbidden, map[string]any{"error": "team admin role required"})
+			return
+		}
+		if s.Role != "system-admin" && team != s.Team {
+			p.json(w, 403, map[string]any{"error": "team admins may only manage their own team"})
+			return
+		}
+		p.json(w, http.StatusOK, map[string]any{"team": team, "users": p.teamUsers(team)})
+		return
+	}
+	if path == "/api/labs/topologies" {
+		topologies, err := p.listLabTopologies(team)
+		if err != nil {
+			p.json(w, 500, map[string]any{"error": "could not read saved lab topologies"})
+			return
+		}
+		p.json(w, 200, map[string]any{"version": lab.TopologyVersion, "topologies": topologies})
+		return
+	}
+	if path == "/api/labs/status" {
+		manager, managerErr := p.labManager(team)
+		if managerErr != nil {
+			p.json(w, 503, map[string]any{"error": managerErr.Error()})
+			return
+		}
+		if manager == nil {
+			p.json(w, 200, map[string]any{"available": false})
+			return
+		}
+		status, err := manager.Observe(r.Context())
+		if err != nil {
+			p.json(w, 503, map[string]any{"error": err.Error()})
+			return
+		}
+		status["available"] = true
+		p.json(w, 200, status)
 		return
 	}
 	if p.o.Security != nil && (path == "/api/security" || path == "/api/security/catalog") {
@@ -574,6 +741,38 @@ func (p *Portal) post(w http.ResponseWriter, r *http.Request, path string) {
 		p.json(w, 403, map[string]any{"error": "bad CSRF token"})
 		return
 	}
+	isLabPath := strings.HasPrefix(path, "/api/labs/")
+	if s.Role != "system-admin" && !isLabPath && path != "/api/logout" && path != "/api/account/password" {
+		p.json(w, http.StatusForbidden, map[string]any{"error": "team role cannot modify this endpoint"})
+		return
+	}
+	if s.Role == "viewer" && path != "/api/logout" && path != "/api/labs/check" && path != "/api/labs/capture" && path != "/api/account/password" {
+		p.json(w, http.StatusForbidden, map[string]any{"error": "editor role is required for lab changes"})
+		return
+	}
+	if path == "/api/labs/users" && s.Role != "system-admin" && s.Role != "team-admin" {
+		p.json(w, http.StatusForbidden, map[string]any{"error": "team admin role required"})
+		return
+	}
+	team := s.Team
+	if s.Role == "system-admin" {
+		if requested := text(b, "team"); requested != "" {
+			team = requested
+		}
+	}
+	if !teamPattern.MatchString(team) {
+		p.json(w, 400, map[string]any{"error": "invalid team scope"})
+		return
+	}
+	var labManager *lab.Manager
+	if isLabPath {
+		var managerErr error
+		labManager, managerErr = p.labManager(team)
+		if managerErr != nil {
+			p.json(w, http.StatusServiceUnavailable, map[string]any{"error": managerErr.Error()})
+			return
+		}
+	}
 	result := func(e string) {
 		code := 200
 		var msg any
@@ -583,6 +782,166 @@ func (p *Portal) post(w http.ResponseWriter, r *http.Request, path string) {
 		p.json(w, code, map[string]any{"ok": e == "", "error": msg})
 	}
 	switch path {
+	case "/api/account/password":
+		if p.legacyAdmin() {
+			result(p.SetPassword(text(b, "current"), text(b, "new")))
+			return
+		}
+		_, err := p.changeTeamUser(s.Team, "password", s.Username, text(b, "current"), text(b, "new"), s.Role)
+		if err != nil {
+			p.json(w, 422, map[string]any{"error": err.Error()})
+			return
+		}
+		p.Sessions.DropUser(s.Team, s.Username)
+		p.json(w, 200, map[string]any{"ok": true})
+	case "/api/labs/users":
+		newRole := text(b, "role")
+		if s.Role == "system-admin" && newRole == "team-admin" {
+			// A system admin can bootstrap another team's first scoped administrator;
+			// ordinary team admins can only add editors and viewers to their own team.
+		} else if newRole == "team-admin" {
+			p.json(w, 403, map[string]any{"error": "only a system admin can provision team admins"})
+			return
+		}
+		users, err := p.changeTeamUser(team, text(b, "action"), text(b, "username"), "", text(b, "password"), newRole)
+		if err != nil {
+			p.json(w, 422, map[string]any{"error": err.Error()})
+			return
+		}
+		p.json(w, 200, map[string]any{"ok": true, "users": users})
+	case "/api/labs/topologies":
+		topologyValue, ok := b["topology"]
+		if !ok {
+			p.json(w, 400, map[string]any{"error": "topology required"})
+			return
+		}
+		raw, err := json.Marshal(topologyValue)
+		if err != nil {
+			p.json(w, 400, map[string]any{"error": "invalid topology"})
+			return
+		}
+		if err := p.saveLabTopology(team, raw); err != nil {
+			p.json(w, 422, map[string]any{"error": err.Error()})
+			return
+		}
+		p.Note("lab topology saved")
+		p.json(w, 200, map[string]any{"ok": true})
+	case "/api/labs/apply":
+		if labManager == nil {
+			p.json(w, 503, map[string]any{"ok": false, "error": "lab runtime is not configured"})
+			return
+		}
+		topologyValue, ok := b["topology"]
+		if !ok {
+			p.json(w, 400, map[string]any{"error": "topology required"})
+			return
+		}
+		raw, err := json.Marshal(topologyValue)
+		if err != nil {
+			p.json(w, 400, map[string]any{"error": "invalid topology"})
+			return
+		}
+		topology, err := lab.DecodeTopology(raw)
+		if err != nil {
+			p.json(w, 422, map[string]any{"error": err.Error()})
+			return
+		}
+		state, err := labManager.Apply(r.Context(), topology)
+		if err != nil {
+			p.json(w, 422, map[string]any{"error": err.Error()})
+			return
+		}
+		p.Note("lab topology applied: " + topology.ID)
+		p.json(w, 200, map[string]any{"ok": true, "state": state})
+	case "/api/labs/action":
+		if labManager == nil {
+			p.json(w, 503, map[string]any{"error": "lab runtime is not configured"})
+			return
+		}
+		var err error
+		switch text(b, "action") {
+		case "pause":
+			err = labManager.Pause(r.Context())
+		case "resume":
+			err = labManager.Resume(r.Context())
+		case "rollback":
+			var state lab.State
+			state, err = labManager.Rollback(r.Context())
+			if err == nil {
+				p.json(w, 200, map[string]any{"ok": true, "state": state})
+				return
+			}
+		case "restart-node":
+			err = labManager.RestartNode(r.Context(), text(b, "node"))
+		case "link-down":
+			err = labManager.SetLinkUp(r.Context(), text(b, "link"), false)
+		case "link-up":
+			err = labManager.SetLinkUp(r.Context(), text(b, "link"), true)
+		case "link-flap":
+			ms, parseErr := strconv.Atoi(text(b, "duration_ms"))
+			if parseErr != nil {
+				p.json(w, 400, map[string]any{"error": "duration_ms must be an integer"})
+				return
+			}
+			err = labManager.FlapLink(r.Context(), text(b, "link"), time.Duration(ms)*time.Millisecond)
+		case "set-impairment":
+			var impairment lab.Impairment
+			raw, marshalErr := json.Marshal(b["impairment"])
+			if marshalErr != nil || json.Unmarshal(raw, &impairment) != nil {
+				p.json(w, 400, map[string]any{"error": "invalid impairment"})
+				return
+			}
+			err = labManager.SetImpairment(r.Context(), text(b, "link"), impairment)
+		case "interface-errors":
+			var fault lab.Impairment
+			raw, marshalErr := json.Marshal(b["impairment"])
+			if marshalErr != nil || json.Unmarshal(raw, &fault) != nil {
+				p.json(w, 400, map[string]any{"error": "invalid interface fault"})
+				return
+			}
+			err = labManager.SetInterfaceFault(r.Context(), text(b, "node"), text(b, "interface"), fault)
+		default:
+			p.json(w, 400, map[string]any{"error": "unsupported lab action"})
+			return
+		}
+		if err != nil {
+			p.json(w, 422, map[string]any{"error": err.Error()})
+			return
+		}
+		p.json(w, 200, map[string]any{"ok": true})
+	case "/api/labs/check":
+		if labManager == nil {
+			p.json(w, 503, map[string]any{"error": "lab runtime is not configured"})
+			return
+		}
+		results, err := labManager.RunAssertions(r.Context())
+		if err != nil {
+			p.json(w, 422, map[string]any{"error": err.Error(), "results": results})
+			return
+		}
+		passed := 0
+		for _, result := range results {
+			if result.Passed {
+				passed++
+			}
+		}
+		p.json(w, 200, map[string]any{"ok": passed == len(results), "passed": passed, "total": len(results), "results": results})
+	case "/api/labs/capture":
+		if labManager == nil {
+			p.json(w, 503, map[string]any{"error": "lab runtime is not configured"})
+			return
+		}
+		ms, parseErr := strconv.Atoi(text(b, "duration_ms"))
+		if parseErr != nil {
+			p.json(w, 400, map[string]any{"error": "duration_ms must be an integer"})
+			return
+		}
+		data, err := labManager.CaptureLink(r.Context(), text(b, "link"), time.Duration(ms)*time.Millisecond)
+		if err != nil {
+			p.json(w, 422, map[string]any{"error": err.Error()})
+			return
+		}
+		p.json(w, 200, map[string]any{"link": text(b, "link"), "pcap_base64": data})
 	case "/api/logout":
 		p.Sessions.Drop(token)
 		p.json(w, 200, map[string]any{"ok": true}, [2]string{"Set-Cookie", "gb_session=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict"})
@@ -668,6 +1027,10 @@ func (p *Portal) post(w http.ResponseWriter, r *http.Request, path string) {
 		}
 		p.send(w, 200, out, "application/json; charset=utf-8")
 	case "/api/password":
+		if !p.legacyAdmin() {
+			result("Use Account password on the Labs page to change this account's password.")
+			return
+		}
 		result(p.SetPassword(text(b, "current"), text(b, "new")))
 	case "/api/restart":
 		if v, _ := b["confirm"].(bool); !v {
@@ -693,14 +1056,31 @@ func (p *Portal) login(w http.ResponseWriter, r *http.Request, b map[string]any)
 		return
 	}
 	password, ok := b["password"].(string)
+	username, _ := b["username"].(string)
+	if username == "" {
+		username = "admin"
+	}
 	p.mu.Lock()
+	users := append([]AdminUser(nil), p.o.Settings.Users...)
 	hash := p.passwordHash
 	p.mu.Unlock()
+	team, role := "", ""
+	if len(users) > 0 {
+		for _, user := range users {
+			if strings.EqualFold(user.Username, username) {
+				hash, team, role = user.PasswordHash, user.Team, user.Role
+				username = user.Username
+				break
+			}
+		}
+	} else if username == "admin" {
+		team, role = "default", "system-admin"
+	}
 	if !p.acquireHash() {
 		p.json(w, 503, map[string]any{"error": "server busy; retry shortly"}, [2]string{"Retry-After", "1"})
 		return
 	}
-	verified := ok && adminauth.VerifyPassword(password, hash)
+	verified := ok && hash != "" && adminauth.VerifyPassword(password, hash)
 	p.releaseHash()
 	if !verified {
 		p.Throttle.Fail(addr)
@@ -709,8 +1089,8 @@ func (p *Portal) login(w http.ResponseWriter, r *http.Request, b map[string]any)
 		return
 	}
 	p.Throttle.Success(addr)
-	token, csrf := p.Sessions.Create()
-	p.Note("login from " + addr)
-	p.json(w, 200, map[string]any{"ok": true, "csrf": csrf},
+	token, csrf := p.Sessions.CreateFor(username, team, role)
+	p.Note("login from " + addr + " as " + username + " (team " + team + ")")
+	p.json(w, 200, map[string]any{"ok": true, "csrf": csrf, "identity": map[string]any{"username": username, "team": team, "role": role, "legacy_admin": len(users) == 0}},
 		[2]string{"Set-Cookie", "gb_session=" + token + "; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=28800"})
 }

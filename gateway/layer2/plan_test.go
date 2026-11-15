@@ -9,6 +9,11 @@ import (
 	"testing"
 )
 
+func withTCStats(filter TCFilterState, packets, bytes, drops uint64) TCFilterState {
+	filter.Packets, filter.Bytes, filter.Drops = packets, bytes, drops
+	return filter
+}
+
 func TestBuildTopologyPlanCreatesVLANBridgeInDependencyOrder(t *testing.T) {
 	cfg, err := DecodeConfig([]byte(validConfig))
 	if err != nil {

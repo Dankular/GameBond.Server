@@ -195,6 +195,8 @@ var hardBlocked = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("127.0.0.0/8"),
 	netip.MustParsePrefix("169.254.0.0/16"), netip.MustParsePrefix("172.16.0.0/12"),
 	netip.MustParsePrefix("224.0.0.0/3"),
+	netip.MustParsePrefix("::/128"), netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("fe80::/10"), netip.MustParsePrefix("ff00::/8"),
 }
 
 // DeviceStats lists every device the gateway has seen.

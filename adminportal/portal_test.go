@@ -23,7 +23,7 @@ func TestGatewayMutationRequiresAuthAndCSRF(t *testing.T) {
 	if got := r.do(http.MethodPost, "/api/gateway/rollback", map[string]any{}, "", ""); got.code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated gateway rollback status = %d, body=%v", got.code, got.body)
 	}
-	token, csrf := r.portal.Sessions.Create()
+	token, csrf := r.portal.Sessions.CreateFor("testadmin", "default", "system-admin")
 	if got := r.do(http.MethodPost, "/api/gateway/rollback", map[string]any{}, token, "wrong"); got.code != http.StatusForbidden {
 		t.Fatalf("gateway rollback with bad CSRF status = %d, body=%v", got.code, got.body)
 	}

@@ -21,10 +21,70 @@ Environment variables read by the edge (all optional):
 | `GAMEBOND_STREAM_ALLOW_PRIVATE=1` | let the gateway connect to private/loopback/reserved addresses (refused by default) |
 | `GAMEBOND_STREAM_LOG_INTERVAL` | how often an active stream logs its counters (Go duration, default `10s`, minimum `1s`) |
 | `GAMEBOND_METRICS_ADDR` | serve Prometheus metrics on this **loopback IPv4** `host:port` (e.g. `127.0.0.1:9100`); reach it with `docker exec` or publish it deliberately |
+| `GAMEBOND_SYSLOG_ADDR` | export standard-library log records as RFC 5424 over UDP to `host:port`, or over TLS with RFC 5425 octet counting to `tls://host:port`; bounded queue drops are counted |
+| `GAMEBOND_SYSLOG_CA_FILE` | optional PEM CA bundle added to system roots for verifying a private TLS syslog collector; requires `GAMEBOND_SYSLOG_ADDR=tls://host:port` |
+
+V1 scope is generic Linux nodes (FRR, mstpd, Keepalived, hostapd and wpa_supplicant), one host, and
+real-time emulation. Vendor control planes, clustered execution and accelerated simulation are outside
+this version. Set `lab_mode: true` in the edge JSON config when studying deliberately impaired paths;
+it disables adaptive loss protection and jitter-based reorder smoothing for GameBond sessions.
+
+### Single-host network labs
+
+The Admin portal's **Labs → Topology Designer** page and the Speedify dashboard editor save and apply
+versioned topology definitions. The Linux Docker backend starts one isolated container per node and
+one internal Docker bridge network per point-to-point link. Build the generic node image with
+`docker build -f Dockerfile.lab-node -t gamebond-lab-node:0.1 .`. The Docker host must have the `runsc`
+runtime installed and registered with Docker. Configure the edge process with
+`GAMEBOND_LAB_DOCKER_SOCKET`, `GAMEBOND_LAB_RUNTIME=runsc`, and `GAMEBOND_LAB_NODE_IMAGE=gamebond-lab-node:0.1`.
+The opt-in `compose.lab.yaml` override mounts the socket and sets these values; use it with
+`docker compose -f compose.yaml -f compose.lab.yaml up -d`. The engine applies
+per-node memory, PID, and CPU-share limits; per-link delay, jitter, loss, corruption, and bandwidth;
+and provides pause/resume, node restart, link fault actions, counters, packet capture, and allowlisted
+assertions. Node CPU and memory use Docker stats, while link counters feed the topology flow display.
+The node image includes FRR, mstpd, Keepalived, hostapd, wpa_supplicant, and Net-SNMP. Nodes may enable
+`snmpd` with an explicit `daemon_config.snmpd` access policy, or `sflow` with
+`daemon_config.sflow` JSON such as `{"collector":"192.0.2.10:6343","agent_ip":"192.0.2.1","polling_seconds":30}`.
+The built-in sFlow v5 exporter sends generic interface counter samples; its collector must be reachable
+over the lab topology. The designer shows live per-link counters and offers bounded packet captures.
+The override also starts the `labd` host-shaper sidecar. It needs the Docker network namespace
+directory mounted read-only and `SYS_ADMIN`/`NET_ADMIN` capabilities to apply qdiscs inside only
+containers labeled as GameBond lab nodes. The node containers themselves run under `runsc` with a
+read-only root filesystem, dropped capabilities, and per-node resource limits.
+
+The admin portal supports `system-admin`, `team-admin`, `editor`, and `viewer` roles through the
+protected `admin.users` setting. Each user record has `username`, `team` (lowercase team ID), `role`,
+and a scrypt `password_hash`. Every configured team must have at least one system-admin or team-admin.
+Team admins can add and remove editors/viewers from their team; system admins can provision teams.
+Saved topologies and active runtime managers are separated by team. Editors can author, apply,
+configure, and open node consoles; viewers can inspect, capture, and run declared checks. The legacy
+`admin.password_hash` login remains a system-admin in team `default` when `admin.users` is absent.
+
+The authenticated JSON API is the v1 automation hook for Ansible and Python. It uses the portal login
+endpoint to issue an HttpOnly session cookie plus CSRF token; see [Lab API](docs/lab-api.md) for the
+topology, status, action, capture, check, and team-user endpoints. Dedicated NETCONF and gNMI services
+are not part of the generic Linux v1 runtime.
+
+The Docker Engine socket is a host-control interface, so keep this opt-in and restrict access to the
+trusted host. With no socket/runtime/image configuration, topology save and editing remain available,
+but the portal reports that no lab runtime is connected.
 
 Container entrypoint: `GAMEBOND_ALLOW_PRIVATE_FORWARD=1` disables the forward filter that stops tunnel
 clients reaching private ranges (the container bridge, the Docker host, RFC 1918, ...) through the server.
 Traffic between tunnel addresses is still forwarded.
+
+Layer 2 RA Guard is opt-in per ingress port. Set `l2.ra_guard_tunnel` for the bond/tunnel port, or
+`ra_guard: true` on an authorized session in the broker members file. Keep gateway service ports unguarded;
+the config validator rejects `l2.ra_guard_exit` when the gVisor gateway owns that port.
+
+The gVisor gateway can also police control frames delivered to its service port. Set
+`l2.control_plane_pps` to an aggregate rate from 1 to 1,000,000 frames per second; zero leaves it off.
+For independent protocol limits, set `l2.control_plane_rates` with class rates such as `arp_pps`,
+`dhcpv4_pps`, `dhcpv6_pps`, `neighbor_discovery_pps`, `router_advertisement_pps`,
+`multicast_control_pps`, `mdns_pps`, `lldp_pps`, `eapol_pps`, and `other_pps`; zero leaves a class
+unlimited by its class bucket. `burst_seconds` sets the shared class-bucket burst window (default 1 s).
+For example, `{"control_plane_rates":{"arp_pps":20,"dhcpv4_pps":100,"burst_seconds":2}}`.
+The switch preserves ordinary IP data traffic and counts control-plane drops as `drop_copp`.
 
 Probe watchdog: while watching, `tools/server-probe.sh` recreates the container after
 `GAMEBOND_WATCHDOG_STRIKES` (3) consecutive polls where it is exited, missing or unhealthy, at most

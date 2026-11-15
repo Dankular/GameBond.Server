@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
@@ -57,27 +58,30 @@ func newExecRunner(paths map[string]string, timeout time.Duration) *execRunner {
 // values can never select an executable or be interpreted by a shell.
 func NewLinuxRunner() (Runner, error) {
 	allowed := map[string][]string{
-		"ip":           {"/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"},
-		"bridge":       {"/usr/sbin/bridge", "/sbin/bridge", "/usr/bin/bridge", "/bin/bridge"},
-		"tc":           {"/usr/sbin/tc", "/sbin/tc", "/usr/bin/tc", "/bin/tc"},
-		"nft":          {"/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/bin/nft"},
-		"ethtool":      {"/usr/sbin/ethtool", "/sbin/ethtool", "/usr/bin/ethtool", "/bin/ethtool"},
-		"conntrack":    {"/usr/sbin/conntrack", "/sbin/conntrack", "/usr/bin/conntrack", "/bin/conntrack"},
-		"lldpd":        {"/usr/sbin/lldpd", "/sbin/lldpd", "/usr/bin/lldpd", "/bin/lldpd"},
-		"lldpcli":      {"/usr/sbin/lldpcli", "/sbin/lldpcli", "/usr/bin/lldpcli", "/bin/lldpcli"},
-		"hostapd":      {"/usr/sbin/hostapd", "/sbin/hostapd", "/usr/bin/hostapd", "/bin/hostapd"},
-		"hostapd_cli":  {"/usr/sbin/hostapd_cli", "/sbin/hostapd_cli", "/usr/bin/hostapd_cli", "/bin/hostapd_cli"},
-		"mstpd":        {"/usr/sbin/mstpd", "/sbin/mstpd", "/usr/bin/mstpd", "/bin/mstpd"},
-		"kea-dhcp4":    {"/usr/sbin/kea-dhcp4", "/usr/local/sbin/kea-dhcp4", "/usr/bin/kea-dhcp4"},
-		"systemctl":    {"/usr/bin/systemctl", "/bin/systemctl"},
-		"igmpproxy":    {"/usr/sbin/igmpproxy", "/sbin/igmpproxy", "/usr/bin/igmpproxy"},
-		"keepalived":   {"/usr/sbin/keepalived", "/sbin/keepalived", "/usr/bin/keepalived", "/bin/keepalived"},
-		"zebra":        {"/usr/lib/frr/zebra", "/usr/libexec/frr/zebra"},
-		"ospfd":        {"/usr/lib/frr/ospfd", "/usr/libexec/frr/ospfd"},
-		"bgpd":         {"/usr/lib/frr/bgpd", "/usr/libexec/frr/bgpd"},
-		"vtysh":        {"/usr/bin/vtysh", "/usr/sbin/vtysh"},
-		"avahi-daemon": {"/usr/sbin/avahi-daemon", "/usr/bin/avahi-daemon"},
-		"freeradius":   {"/usr/sbin/freeradius", "/usr/sbin/radiusd", "/usr/bin/freeradius", "/usr/bin/radiusd"},
+		"ip":             {"/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"},
+		"bridge":         {"/usr/sbin/bridge", "/sbin/bridge", "/usr/bin/bridge", "/bin/bridge"},
+		"tc":             {"/usr/sbin/tc", "/sbin/tc", "/usr/bin/tc", "/bin/tc"},
+		"nft":            {"/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/bin/nft"},
+		"ethtool":        {"/usr/sbin/ethtool", "/sbin/ethtool", "/usr/bin/ethtool", "/bin/ethtool"},
+		"conntrack":      {"/usr/sbin/conntrack", "/sbin/conntrack", "/usr/bin/conntrack", "/bin/conntrack"},
+		"lldpd":          {"/usr/sbin/lldpd", "/sbin/lldpd", "/usr/bin/lldpd", "/bin/lldpd"},
+		"lldpcli":        {"/usr/sbin/lldpcli", "/sbin/lldpcli", "/usr/bin/lldpcli", "/bin/lldpcli"},
+		"hostapd":        {"/usr/sbin/hostapd", "/sbin/hostapd", "/usr/bin/hostapd", "/bin/hostapd"},
+		"hostapd_cli":    {"/usr/sbin/hostapd_cli", "/sbin/hostapd_cli", "/usr/bin/hostapd_cli", "/bin/hostapd_cli"},
+		"wpa_supplicant": {"/usr/sbin/wpa_supplicant", "/sbin/wpa_supplicant", "/usr/bin/wpa_supplicant", "/bin/wpa_supplicant"},
+		"wpa_cli":        {"/usr/sbin/wpa_cli", "/sbin/wpa_cli", "/usr/bin/wpa_cli", "/bin/wpa_cli"},
+		"mstpd":          {"/usr/sbin/mstpd", "/sbin/mstpd", "/usr/bin/mstpd", "/bin/mstpd"},
+		"kea-dhcp4":      {"/usr/sbin/kea-dhcp4", "/usr/local/sbin/kea-dhcp4", "/usr/bin/kea-dhcp4"},
+		"systemctl":      {"/usr/bin/systemctl", "/bin/systemctl"},
+		"timedatectl":     {"/usr/bin/timedatectl", "/bin/timedatectl"},
+		"igmpproxy":      {"/usr/sbin/igmpproxy", "/sbin/igmpproxy", "/usr/bin/igmpproxy"},
+		"keepalived":     {"/usr/sbin/keepalived", "/sbin/keepalived", "/usr/bin/keepalived", "/bin/keepalived"},
+		"zebra":          {"/usr/lib/frr/zebra", "/usr/libexec/frr/zebra"},
+		"ospfd":          {"/usr/lib/frr/ospfd", "/usr/libexec/frr/ospfd"},
+		"bgpd":           {"/usr/lib/frr/bgpd", "/usr/libexec/frr/bgpd"},
+		"vtysh":          {"/usr/bin/vtysh", "/usr/sbin/vtysh"},
+		"avahi-daemon":   {"/usr/sbin/avahi-daemon", "/usr/bin/avahi-daemon"},
+		"freeradius":     {"/usr/sbin/freeradius", "/usr/sbin/radiusd", "/usr/bin/freeradius", "/usr/bin/radiusd"},
 	}
 	paths := make(map[string]string, len(allowed))
 	for tool, candidates := range allowed {
@@ -93,6 +97,22 @@ func NewLinuxRunner() (Runner, error) {
 }
 
 func (r *execRunner) Available(tool string) bool { return r.paths[tool] != "" }
+
+func (r *execRunner) LinkAddresses(ctx context.Context, interfaceName string) ([]netip.Addr, error) {
+	return rtnetlinkInterfaceAddresses(ctx, interfaceName)
+}
+
+func (r *execRunner) SetLinkUp(ctx context.Context, interfaceName string, up bool) error {
+	return (Rtnetlink{}).SetLinkUp(ctx, interfaceName, up)
+}
+
+func (r *execRunner) SetMaster(ctx context.Context, interfaceName, masterName string) error {
+	return (Rtnetlink{}).SetMaster(ctx, interfaceName, masterName)
+}
+
+func (r *execRunner) SetMTU(ctx context.Context, interfaceName string, mtu int) error {
+	return (Rtnetlink{}).SetMTU(ctx, interfaceName, mtu)
+}
 
 func (r *execRunner) Run(ctx context.Context, tool string, args ...string) (CommandResult, error) {
 	return r.RunInput(ctx, tool, nil, args...)

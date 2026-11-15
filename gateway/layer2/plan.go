@@ -254,6 +254,11 @@ func BuildTopologyPlan(previous, desired Config, host Capabilities) (Plan, error
 			return Plan{}, fmt.Errorf("bridge VLAN capability is unavailable: %s", capability.Reason)
 		}
 	}
+	if len(desired.VXLANDevices) > 0 || len(previous.VXLANDevices) > 0 {
+		if capability, ok := host.Features[FeatureVXLAN]; !ok || capability.State == CapabilityUnavailable || capability.State == CapabilityUnsupported {
+			return Plan{}, fmt.Errorf("VXLAN bridge/TAP capability is unavailable: %s", capability.Reason)
+		}
+	}
 	interfaces := make(map[string]HostInterface, len(host.Interfaces))
 	for _, in := range host.Interfaces {
 		interfaces[in.Name] = in
@@ -382,6 +387,14 @@ func BuildTopologyPlan(previous, desired Config, host Capabilities) (Plan, error
 	}
 	plan.Changes = append(plan.Changes, bondChanges...)
 	for name, iface := range synthetic {
+		interfaces[name] = iface
+	}
+	vxlanChanges, vxlanDeletes, syntheticVXLAN, err := buildVXLANChanges(previous, desired, interfaces)
+	if err != nil {
+		return Plan{}, err
+	}
+	plan.Changes = append(plan.Changes, vxlanChanges...)
+	for name, iface := range syntheticVXLAN {
 		interfaces[name] = iface
 	}
 	currentVLANs := make(map[string]BridgeVLANState, len(host.BridgeVLANs))
@@ -796,6 +809,7 @@ func BuildTopologyPlan(previous, desired Config, host Capabilities) (Plan, error
 		return Plan{}, err
 	}
 	plan.Changes = append(plan.Changes, bridgeTeardown...)
+	plan.Changes = append(plan.Changes, vxlanDeletes...)
 	filterChanges, err := buildOverrideFilterChanges(previous, desired, interfaces)
 	if err != nil {
 		return Plan{}, err

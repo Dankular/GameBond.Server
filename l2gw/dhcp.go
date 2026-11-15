@@ -37,6 +37,7 @@ type lease struct {
 	mac     [6]byte
 	expires time.Time
 	offered bool // only offered so far, held briefly
+	ingress string
 }
 
 type dhcpCounters struct {
@@ -54,6 +55,7 @@ type dhcpServer struct {
 	byIP    map[netip.Addr]*lease
 	static  map[[6]byte]netip.Addr
 	staticI map[netip.Addr]bool
+	ingress map[[6]byte]string
 	banned  map[netip.Addr]time.Time // declined addresses
 	count   dhcpCounters
 }
@@ -62,17 +64,27 @@ func (d *dhcpServer) init(cfg *Config) error {
 	d.cfg = cfg
 	pfx := cfg.Address
 	gw := pfx.Addr()
+	network := pfx.Masked().Addr()
+	broadcast := network.As4()
+	mask := net.CIDRMask(pfx.Bits(), 32)
+	for i := range broadcast {
+		broadcast[i] |= ^mask[i]
+	}
+	broadcastIP := netip.AddrFrom4(broadcast)
 	if !cfg.DHCPStart.IsValid() || !cfg.DHCPEnd.IsValid() {
 		return errors.New("l2gw: DHCP range required")
 	}
 	if !pfx.Contains(cfg.DHCPStart) || !pfx.Contains(cfg.DHCPEnd) || cfg.DHCPEnd.Less(cfg.DHCPStart) ||
-		(cfg.DHCPStart.Compare(gw) <= 0 && gw.Compare(cfg.DHCPEnd) <= 0) {
-		return errors.New("l2gw: DHCP range must lie inside the subnet and not include the gateway")
+		(cfg.DHCPStart.Compare(gw) <= 0 && gw.Compare(cfg.DHCPEnd) <= 0) ||
+		(cfg.DHCPStart.Compare(network) <= 0 && network.Compare(cfg.DHCPEnd) <= 0) ||
+		(cfg.DHCPStart.Compare(broadcastIP) <= 0 && broadcastIP.Compare(cfg.DHCPEnd) <= 0) {
+		return errors.New("l2gw: DHCP range must contain only usable host addresses in the subnet")
 	}
 	d.byMAC = map[[6]byte]*lease{}
 	d.byIP = map[netip.Addr]*lease{}
 	d.static = map[[6]byte]netip.Addr{}
 	d.staticI = map[netip.Addr]bool{}
+	d.ingress = map[[6]byte]string{}
 	d.banned = map[netip.Addr]time.Time{}
 	if err := d.setHosts(cfg.Hosts); err != nil {
 		return err
@@ -91,6 +103,32 @@ func (d *dhcpServer) stats() dhcpCounters {
 		}
 	}
 	return c
+}
+
+func (d *dhcpServer) setIngress(mac [6]byte, identity string) {
+	d.mu.Lock()
+	d.ingress[mac] = identity
+	d.mu.Unlock()
+}
+
+func (d *dhcpServer) ingressFor(mac [6]byte) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.ingress[mac]
+}
+
+func (d *dhcpServer) bindings() []DHCPBinding {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	bindings := make([]DHCPBinding, 0, len(d.byMAC))
+	for mac, lease := range d.byMAC {
+		if lease.offered || !now.Before(lease.expires) || lease.ingress == "" {
+			continue
+		}
+		bindings = append(bindings, DHCPBinding{MAC: net.HardwareAddr(mac[:]).String(), IP: lease.ip, SessionPort: lease.ingress, Expires: lease.expires})
+	}
+	return bindings
 }
 
 // dhcpMessage is the part of a BOOTP/DHCP packet the server needs.
@@ -120,14 +158,19 @@ func parseDHCP(p []byte) (dhcpMessage, bool) {
 	copy(m.chaddr[:], p[28:34])
 	m.rawHeader = p[:dhcpFixedSize]
 	opts := p[dhcpFixedSize+4:]
+	ended := false
 	for len(opts) > 0 {
 		code := opts[0]
 		if code == 0 {
 			opts = opts[1:]
 			continue
 		}
-		if code == 255 || len(opts) < 2 || len(opts) < 2+int(opts[1]) {
+		if code == 255 {
+			ended = true
 			break
+		}
+		if len(opts) < 2 || len(opts) < 2+int(opts[1]) {
+			return m, false
 		}
 		val := opts[2 : 2+int(opts[1])]
 		switch code {
@@ -148,7 +191,10 @@ func parseDHCP(p []byte) (dhcpMessage, bool) {
 		}
 		opts = opts[2+int(opts[1]):]
 	}
-	return m, m.msgType != 0
+	// This server only supports Ethernet clients. Refuse malformed or missing end markers
+	// instead of acting on a partially parsed request.
+	zeroMAC := m.chaddr == [6]byte{}
+	return m, ended && m.msgType != 0 && !zeroMAC && m.chaddr[0]&1 == 0
 }
 
 // handle returns the reply for one client message, or nil.
@@ -180,6 +226,9 @@ func (d *dhcpServer) handle(m dhcpMessage, now time.Time) []byte {
 			return d.reply(m, dhcpNak, netip.Addr{}, 0)
 		}
 		d.hold(m.chaddr, ip, now.Add(d.cfg.Lease), false)
+		if lease := d.byMAC[m.chaddr]; lease != nil {
+			lease.ingress = d.ingress[m.chaddr]
+		}
 		d.count.ack++
 		return d.reply(m, dhcpAck, ip, d.cfg.Lease)
 	case dhcpDecline:
@@ -333,6 +382,9 @@ func (g *Gateway) startDHCP(ctx context.Context) error {
 		recv.Close()
 		return err
 	}
+	if g.cfg.DHCPRelay4.IsValid() {
+		return g.startDHCPRelay(ctx, recv, send)
+	}
 	bcast := &net.UDPAddr{IP: net.IPv4bcast.To4(), Port: 68}
 	serve := func(conn *gonet.UDPConn) {
 		defer g.done.Done()
@@ -361,18 +413,276 @@ func (g *Gateway) startDHCP(ctx context.Context) error {
 	return nil
 }
 
+func (g *Gateway) startDHCPRelay(ctx context.Context, recv, send *gonet.UDPConn) error {
+	upstream := net.UDPAddrFromAddrPort(g.cfg.DHCPRelay4)
+	broadcast := &net.UDPAddr{IP: net.IPv4bcast.To4(), Port: 68}
+	type relayState struct {
+		circuitID string
+		expires   time.Time
+	}
+	var pendingMu sync.Mutex
+	pending := make(map[dhcpv4RelayKey]relayState)
+	g.done.Add(2)
+	go func() {
+		defer g.done.Done()
+		defer recv.Close()
+		go func() { <-ctx.Done(); recv.Close() }()
+		buf := make([]byte, 4096)
+		for {
+			n, _, err := recv.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			message, ok := parseDHCP(buf[:n])
+			if !ok || message.msgType == dhcpOffer || message.msgType == dhcpAck || message.msgType == dhcpNak {
+				continue
+			}
+			identity := g.dhcp.ingressFor(message.chaddr)
+			if identity == "" {
+				identity = "l2gw"
+			}
+			forward, ok := makeDHCPv4RelayForward(buf[:n], g.cfg.Address.Addr(), identity)
+			if !ok {
+				continue
+			}
+			key := dhcpv4RelayKey{xid: message.xid, chaddr: message.chaddr}
+			pendingMu.Lock()
+			now := time.Now()
+			for current, state := range pending {
+				if !now.Before(state.expires) {
+					delete(pending, current)
+				}
+			}
+			if len(pending) >= 4096 && pending[key].expires.IsZero() {
+				pendingMu.Unlock()
+				continue
+			}
+			pending[key] = relayState{circuitID: identity, expires: now.Add(2 * time.Minute)}
+			pendingMu.Unlock()
+			if _, err := send.WriteTo(forward, upstream); err != nil {
+				pendingMu.Lock()
+				delete(pending, key)
+				pendingMu.Unlock()
+				if ctx.Err() != nil {
+					return
+				}
+			}
+		}
+	}()
+	go func() {
+		defer g.done.Done()
+		defer send.Close()
+		go func() { <-ctx.Done(); send.Close() }()
+		buf := make([]byte, 4096)
+		for {
+			n, peerAddr, err := send.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			peer, ok := peerAddr.(*net.UDPAddr)
+			if !ok || peer.Port != int(g.cfg.DHCPRelay4.Port()) || !peer.IP.Equal(net.IP(g.cfg.DHCPRelay4.Addr().AsSlice())) {
+				continue
+			}
+			key, ok := dhcpv4RelayReplyKey(buf[:n], g.cfg.Address.Addr())
+			if !ok {
+				continue
+			}
+			pendingMu.Lock()
+			state, exists := pending[key]
+			if exists && !time.Now().Before(state.expires) {
+				delete(pending, key)
+				exists = false
+			}
+			pendingMu.Unlock()
+			if !exists {
+				continue
+			}
+			reply, ok := parseDHCPv4RelayReply(buf[:n], g.cfg.Address.Addr(), state.circuitID)
+			if !ok {
+				continue
+			}
+			if _, err := send.WriteTo(reply, broadcast); err != nil && ctx.Err() != nil {
+				return
+			}
+		}
+	}()
+	return nil
+}
+
+func makeDHCPv4RelayForward(payload []byte, giaddr netip.Addr, circuitID string) ([]byte, bool) {
+	if len(payload) < dhcpFixedSize+4 || !giaddr.Is4() || giaddr.IsUnspecified() || len(circuitID) == 0 || len(circuitID) > 128 {
+		return nil, false
+	}
+	message, ok := parseDHCP(payload)
+	if !ok || message.msgType < dhcpDiscover || message.msgType > dhcpInform || payload[3] >= 16 || payload[24] != 0 || payload[25] != 0 || payload[26] != 0 || payload[27] != 0 {
+		return nil, false
+	}
+	end, ok := dhcpOptionEnd(payload)
+	if !ok {
+		return nil, false
+	}
+	for off := dhcpFixedSize + 4; off < end; {
+		code := payload[off]
+		if code == 0 {
+			off++
+			continue
+		}
+		if code == 82 {
+			return nil, false // never trust a client-supplied relay-agent identity
+		}
+		off += 2 + int(payload[off+1])
+	}
+	value := make([]byte, 2+len(circuitID))
+	value[0], value[1] = 1, byte(len(circuitID)) // Circuit-ID suboption.
+	copy(value[2:], circuitID)
+	out := make([]byte, 0, end+2+len(value))
+	out = append(out, payload[:end]...)
+	out = append(out, 82, byte(len(value)))
+	out = append(out, value...)
+	out = append(out, 255)
+	out[3]++
+	copy(out[24:28], giaddr.AsSlice())
+	return out, true
+}
+
+type dhcpv4RelayKey struct {
+	xid    uint32
+	chaddr [6]byte
+}
+
+func dhcpv4RelayReplyKey(payload []byte, giaddr netip.Addr) (dhcpv4RelayKey, bool) {
+	var key dhcpv4RelayKey
+	if len(payload) < dhcpFixedSize+4 || payload[0] != 2 || payload[1] != 1 || payload[2] != 6 || binary.BigEndian.Uint32(payload[dhcpFixedSize:]) != dhcpMagic || !giaddr.Is4() || !bytes.Equal(payload[24:28], giaddr.AsSlice()) {
+		return key, false
+	}
+	copy(key.chaddr[:], payload[28:34])
+	if key.chaddr == [6]byte{} || key.chaddr[0]&1 != 0 {
+		return dhcpv4RelayKey{}, false
+	}
+	key.xid = binary.BigEndian.Uint32(payload[4:8])
+	return key, true
+}
+
+func parseDHCPv4RelayReply(payload []byte, giaddr netip.Addr, circuitID string) ([]byte, bool) {
+	if _, ok := dhcpv4RelayReplyKey(payload, giaddr); !ok || circuitID == "" {
+		return nil, false
+	}
+	end, ok := dhcpOptionEnd(payload)
+	if !ok {
+		return nil, false
+	}
+	var found bool
+	var optionType byte
+	out := append([]byte(nil), payload[:dhcpFixedSize+4]...)
+	for off := dhcpFixedSize + 4; off < end; {
+		code := payload[off]
+		if code == 0 {
+			out = append(out, 0)
+			off++
+			continue
+		}
+		n := int(payload[off+1])
+		value := payload[off+2 : off+2+n]
+		if code == 53 && n == 1 {
+			optionType = value[0]
+		}
+		if code == 82 {
+			if found || !dhcpRelayCircuitIDMatches(value, circuitID) {
+				return nil, false
+			}
+			found = true
+		} else {
+			out = append(out, code, byte(n))
+			out = append(out, value...)
+		}
+		off += 2 + n
+	}
+	if !found || (optionType != dhcpOffer && optionType != dhcpAck && optionType != dhcpNak) {
+		return nil, false
+	}
+	out = append(out, 255)
+	out[3] = 0
+	clear(out[24:28]) // Relay-agent hop address is not forwarded to the client.
+	return out, true
+}
+
+func dhcpRelayCircuitIDMatches(option []byte, circuitID string) bool {
+	var found bool
+	for off := 0; off < len(option); {
+		if len(option)-off < 2 {
+			return false
+		}
+		code, n := option[off], int(option[off+1])
+		off += 2
+		if n > len(option)-off {
+			return false
+		}
+		if code == 1 {
+			if found || string(option[off:off+n]) != circuitID {
+				return false
+			}
+			found = true
+		}
+		off += n
+	}
+	return found
+}
+
+func dhcpOptionEnd(payload []byte) (int, bool) {
+	if len(payload) < dhcpFixedSize+4 || binary.BigEndian.Uint32(payload[dhcpFixedSize:]) != dhcpMagic {
+		return 0, false
+	}
+	for off := dhcpFixedSize + 4; off < len(payload); {
+		code := payload[off]
+		if code == 0 {
+			off++
+			continue
+		}
+		if code == 255 {
+			return off, true
+		}
+		if len(payload)-off < 2 || int(payload[off+1]) > len(payload)-off-2 {
+			return 0, false
+		}
+		off += 2 + int(payload[off+1])
+	}
+	return 0, false
+}
+
+func validDHCPRelayGateway(prefix netip.Prefix, gateway netip.Addr) bool {
+	if !prefix.IsValid() || !prefix.Addr().Is4() || !gateway.Is4() || gateway.IsUnspecified() || gateway.IsMulticast() || !prefix.Contains(gateway) || gateway == prefix.Addr() {
+		return false
+	}
+	network := prefix.Masked().Addr().As4()
+	broadcast := network
+	mask := net.CIDRMask(prefix.Bits(), 32)
+	for i := range broadcast {
+		broadcast[i] |= ^mask[i]
+	}
+	return gateway.As4() != network && gateway.As4() != broadcast
+}
+
 // setHosts replaces the fixed leases. A held lease that now conflicts with a fixed address is dropped,
 // so the device that owned it re-requests and is told to use the right one.
 func (d *dhcpServer) setHosts(hosts []Host) error {
 	pfx, gw := d.cfg.Address, d.cfg.Address.Addr()
+	broadcast := pfx.Masked().Addr().As4()
+	mask := net.CIDRMask(pfx.Bits(), 32)
+	for i := range broadcast {
+		broadcast[i] |= ^mask[i]
+	}
+	broadcastIP := netip.AddrFrom4(broadcast)
 	static := map[[6]byte]netip.Addr{}
 	staticI := map[netip.Addr]bool{}
 	for _, h := range hosts {
-		if len(h.MAC) != 6 || !pfx.Contains(h.IP) || h.IP == gw {
+		if len(h.MAC) != 6 || h.MAC[0]&1 != 0 || !pfx.Contains(h.IP) || h.IP == gw || h.IP == pfx.Masked().Addr() || h.IP == broadcastIP {
 			return errors.New("l2gw: fixed host outside the subnet")
 		}
 		var m [6]byte
 		copy(m[:], h.MAC)
+		if previous, exists := static[m]; exists && previous != h.IP {
+			return errors.New("l2gw: one fixed host has multiple addresses")
+		}
 		if staticI[h.IP] {
 			return errors.New("l2gw: two fixed hosts share an address")
 		}

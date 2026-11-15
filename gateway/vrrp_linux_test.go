@@ -64,6 +64,40 @@ func TestVRRPConfigValidatesShadowPeerAndSubnets(t *testing.T) {
 	}
 }
 
+func TestVRRPBFDRequiresIndependentReachableTargetAndValidTimers(t *testing.T) {
+	cfg := sampleVRRPConfig()
+	cfg.VRRP.BFD = &VRRPBFDConfig{Enabled: true, Neighbor: "192.0.2.254", MinIntervalMS: 100, Multiplier: 3}
+	if err := cfg.VRRP.Validate(cfg.Interfaces); err != nil {
+		t.Fatalf("valid upstream BFD target rejected: %v", err)
+	}
+	if err := validateVRRPAddressesOnSubnet(cfg.VRRP, netip.MustParsePrefix("192.0.2.0/24")); err != nil {
+		t.Fatalf("on-link BFD target rejected: %v", err)
+	}
+	for _, mutate := range []func(*VRRPBFDConfig){
+		func(b *VRRPBFDConfig) { b.Neighbor = "192.0.2.2" },
+		func(b *VRRPBFDConfig) { b.Neighbor = "198.51.100.2" },
+		func(b *VRRPBFDConfig) { b.MinIntervalMS = 49 },
+		func(b *VRRPBFDConfig) { b.Multiplier = 2 },
+	} {
+		bad := sampleVRRPConfig()
+		bad.VRRP.BFD = &VRRPBFDConfig{Enabled: true, Neighbor: "192.0.2.254", MinIntervalMS: 100, Multiplier: 3}
+		mutate(bad.VRRP.BFD)
+		if err := bad.VRRP.Validate(bad.Interfaces); err == nil {
+			t.Fatalf("invalid BFD configuration accepted: %#v", bad.VRRP.BFD)
+		}
+	}
+}
+
+func TestCloneConfigCopiesVRRPBFDPolicy(t *testing.T) {
+	cfg := sampleVRRPConfig()
+	cfg.VRRP.BFD = &VRRPBFDConfig{Enabled: true, Neighbor: "192.0.2.254", MinIntervalMS: 100, Multiplier: 3}
+	cloned := cloneConfig(cfg)
+	cloned.VRRP.BFD.Neighbor = "192.0.2.253"
+	if cfg.VRRP.BFD.Neighbor != "192.0.2.254" {
+		t.Fatalf("mutating cloned BFD config changed source: %#v", cfg.VRRP.BFD)
+	}
+}
+
 func TestRenderKeepalivedConfigUsesNonPreemptingShadowSettings(t *testing.T) {
 	cfg := sampleVRRPConfig()
 	data, err := renderKeepalivedConfig(cfg.VRRP, cfg.Interfaces, "192.0.2.10")
@@ -73,6 +107,20 @@ func TestRenderKeepalivedConfigUsesNonPreemptingShadowSettings(t *testing.T) {
 	for _, expected := range []string{"state BACKUP", "interface br-lan", "version 3", "virtual_router_id 42", "priority 100", "advert_int 1", "nopreempt", "unicast_src_ip 192.0.2.10", "192.0.2.2", "192.0.2.1/24 dev br-lan"} {
 		if !strings.Contains(string(data), expected) {
 			t.Errorf("Keepalived config lacks %q:\n%s", expected, data)
+		}
+	}
+}
+
+func TestRenderKeepalivedConfigTracksIndependentBFDNeighbor(t *testing.T) {
+	cfg := sampleVRRPConfig()
+	cfg.VRRP.BFD = &VRRPBFDConfig{Enabled: true, Neighbor: "192.0.2.254", MinIntervalMS: 100, Multiplier: 3}
+	data, err := renderKeepalivedConfig(cfg.VRRP, cfg.Interfaces, "192.0.2.10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"bfd_instance GB_UPLINK_BFD", "neighbor_ip 192.0.2.254", "source_ip 192.0.2.10", "min_rx 100", "min_tx 100", "multiplier 3", "track_bfd { GB_UPLINK_BFD }"} {
+		if !strings.Contains(string(data), expected) {
+			t.Errorf("Keepalived BFD config lacks %q:\n%s", expected, data)
 		}
 	}
 }

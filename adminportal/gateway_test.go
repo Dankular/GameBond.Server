@@ -5,17 +5,21 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
-func TestGatewayClientUsesOnlyAllowlistedUnixAPI(t *testing.T) {
-	shortDir, err := os.MkdirTemp("/tmp", "gb-")
-	if err != nil {
-		t.Fatal(err)
+func requireUnixSocketTest(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("gateway control socket tests require Linux Unix-domain socket paths")
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
+}
+
+func TestGatewayClientUsesOnlyAllowlistedUnixAPI(t *testing.T) {
+	requireUnixSocketTest(t)
+	shortDir := t.TempDir()
 	socket := filepath.Join(shortDir, "c.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
@@ -45,11 +49,8 @@ func TestGatewayClientUsesOnlyAllowlistedUnixAPI(t *testing.T) {
 }
 
 func TestGatewayClientAllowsBoundedPlanAndBodylessRollback(t *testing.T) {
-	shortDir, err := os.MkdirTemp("/tmp", "gb-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
+	requireUnixSocketTest(t)
+	shortDir := t.TempDir()
 	socket := filepath.Join(shortDir, "c.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
@@ -83,11 +84,8 @@ func TestGatewayClientAllowsBoundedPlanAndBodylessRollback(t *testing.T) {
 }
 
 func TestGatewayClientAllowsProAVProfileCatalogueRead(t *testing.T) {
-	shortDir, err := os.MkdirTemp("/tmp", "gb-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
+	requireUnixSocketTest(t)
+	shortDir := t.TempDir()
 	socket := filepath.Join(shortDir, "c.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {

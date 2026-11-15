@@ -123,11 +123,17 @@ func (a LinuxApplier) Prepare(ctx context.Context, current, desired Config) (Pre
 			prepared.lldpMEDCurrent = previous
 			prepared.lldpMEDDesired = desiredL2
 		}
-		if len(previous.PortAuth) > 0 || len(desiredL2.PortAuth) > 0 {
+		if has8021XProfiles(previous) || has8021XProfiles(desiredL2) {
 			if err := validatePortAuthHost(ctx, a.Runner, previous); err != nil {
 				return nil, fmt.Errorf("validate current 802.1X state: %w", err)
 			}
 			if err := validatePortAuthHost(ctx, a.Runner, desiredL2); err != nil {
+				return nil, err
+			}
+			if err := validateWiredSupplicantHost(ctx, a.Runner, previous); err != nil {
+				return nil, fmt.Errorf("validate current wired supplicant state: %w", err)
+			}
+			if err := validateWiredSupplicantHost(ctx, a.Runner, desiredL2); err != nil {
 				return nil, err
 			}
 			prepared.portAuthCurrent = previous
@@ -468,8 +474,8 @@ func (p *linuxPreparedChange) Summary() []string {
 	if hasLLDPMEDPolicies(p.lldpMEDCurrent) || hasLLDPMEDPolicies(p.lldpMEDDesired) {
 		operations = append(operations, "reconcile LLDP-MED and voice VLAN advertisements")
 	}
-	if len(p.portAuthCurrent.PortAuth) > 0 || len(p.portAuthDesired.PortAuth) > 0 {
-		operations = append(operations, "reconcile wired 802.1X RADIUS authenticators and fail-closed port authorization")
+	if has8021XProfiles(p.portAuthCurrent) || has8021XProfiles(p.portAuthDesired) {
+		operations = append(operations, "reconcile wired 802.1X authenticators, supplicants, and port authorization")
 	}
 	if strings.TrimSpace(p.natScript) != "" {
 		operations = append(operations, "reconcile GameBond NAT rules")
@@ -495,7 +501,7 @@ func (p *linuxPreparedChange) Summary() []string {
 }
 
 func (p *linuxPreparedChange) Apply(ctx context.Context) error {
-	if len(p.portAuthCurrent.PortAuth) > 0 || len(p.portAuthDesired.PortAuth) > 0 {
+	if has8021XProfiles(p.portAuthCurrent) || has8021XProfiles(p.portAuthDesired) {
 		p.portAuthPaused = true
 		if err := pausePortAuthServices(ctx, p.runner, p.portAuthCurrent); err != nil {
 			return err
@@ -513,7 +519,7 @@ func (p *linuxPreparedChange) Apply(ctx context.Context) error {
 		}
 		p.layer2Applied = true
 	}
-	if len(p.portAuthCurrent.PortAuth) > 0 || len(p.portAuthDesired.PortAuth) > 0 {
+	if has8021XProfiles(p.portAuthCurrent) || has8021XProfiles(p.portAuthDesired) {
 		p.portAuthApplied = true
 		if err := applyPortAuthTransition(ctx, p.runner, p.portAuthCurrent, p.portAuthDesired); err != nil {
 			return err

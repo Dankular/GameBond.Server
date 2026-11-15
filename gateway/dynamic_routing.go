@@ -28,9 +28,29 @@ type OSPFInterface struct {
 }
 
 type BGPConfig struct {
-	Enabled   bool          `json:"enabled"`
-	LocalAS   uint32        `json:"local_as"`
-	Neighbors []BGPNeighbor `json:"neighbors"`
+	Enabled   bool              `json:"enabled"`
+	LocalAS   uint32            `json:"local_as"`
+	Neighbors []BGPNeighbor     `json:"neighbors"`
+	EVPN      BGPFlowEVPNConfig `json:"evpn,omitempty"`
+}
+
+// BGPFlowEVPNConfig enables L2VPN EVPN in the existing bgpd instance. FRR
+// discovers advertised VNIs from Linux VXLAN interfaces managed by the
+// independent Layer 2 provider; VNI state is not synthesized from the static
+// userspace VXLAN overlay.
+type BGPFlowEVPNConfig struct {
+	Enabled          bool                         `json:"enabled"`
+	Neighbors        []string                     `json:"neighbors,omitempty"`
+	EthernetSegments []BGPFlowEVPNEthernetSegment `json:"ethernet_segments,omitempty"`
+}
+
+// BGPFlowEVPNEthernetSegment binds FRR EVPN-MH identity to a managed Linux
+// 802.3ad bond. The same ESID and bond system MAC must be configured on every
+// PE attached to the segment; GameBond validates only this PE's desired state.
+type BGPFlowEVPNEthernetSegment struct {
+	BondID       string `json:"bond_id"`
+	ESID         uint32 `json:"es_id"`
+	DFPreference uint32 `json:"df_preference,omitempty"`
 }
 
 type BGPNeighbor struct {
@@ -44,7 +64,7 @@ type BGPNeighbor struct {
 
 func (c DynamicRoutingConfig) Validate(interfaces []Interface) error {
 	if !c.Enabled {
-		if c.OSPF.Enabled || c.BGP.Enabled {
+		if c.OSPF.Enabled || c.BGP.Enabled || c.BGP.EVPN.Enabled || len(c.BGP.EVPN.Neighbors) != 0 || len(c.BGP.EVPN.EthernetSegments) != 0 {
 			return errors.New("OSPF and BGP require dynamic_routing.enabled")
 		}
 		return nil
@@ -59,6 +79,15 @@ func (c DynamicRoutingConfig) Validate(interfaces []Interface) error {
 	}
 	if !c.OSPF.Enabled && !c.BGP.Enabled {
 		return errors.New("dynamic_routing.enabled requires OSPF or BGP")
+	}
+	if c.BGP.EVPN.Enabled && !c.BGP.Enabled {
+		return errors.New("bgp.evpn requires bgp.enabled")
+	}
+	if !c.BGP.EVPN.Enabled && len(c.BGP.EVPN.Neighbors) != 0 {
+		return errors.New("bgp.evpn.neighbors requires bgp.evpn.enabled")
+	}
+	if !c.BGP.EVPN.Enabled && len(c.BGP.EVPN.EthernetSegments) != 0 {
+		return errors.New("bgp.evpn.ethernet_segments requires bgp.evpn.enabled")
 	}
 	if c.OSPF.Enabled {
 		if len(c.OSPF.Interfaces) == 0 || len(c.OSPF.Interfaces) > 64 {
@@ -117,6 +146,40 @@ func (c DynamicRoutingConfig) Validate(interfaces []Interface) error {
 						return fmt.Errorf("%s filters require unique canonical prefixes matching peer address family", field)
 					}
 					seen[p] = true
+				}
+			}
+		}
+		if c.BGP.EVPN.Enabled {
+			if len(c.BGP.EVPN.Neighbors) == 0 || len(c.BGP.EVPN.Neighbors) > len(c.BGP.Neighbors) {
+				return errors.New("bgp.evpn.neighbors must select 1..all configured BGP peers")
+			}
+			peerIDs := make(map[string]bool, len(c.BGP.Neighbors))
+			for _, peer := range c.BGP.Neighbors {
+				peerIDs[peer.ID] = true
+			}
+			seen := make(map[string]bool, len(c.BGP.EVPN.Neighbors))
+			for i, id := range c.BGP.EVPN.Neighbors {
+				if !validID(id) || !peerIDs[id] || seen[id] {
+					return fmt.Errorf("bgp.evpn.neighbors[%d] must name a unique configured BGP peer", i)
+				}
+				seen[id] = true
+			}
+			if len(c.BGP.EVPN.EthernetSegments) > 32 {
+				return errors.New("bgp.evpn.ethernet_segments exceeds limit 32")
+			}
+			seenBonds, seenESIDs := map[string]bool{}, map[uint32]bool{}
+			for i, segment := range c.BGP.EVPN.EthernetSegments {
+				field := fmt.Sprintf("bgp.evpn.ethernet_segments[%d]", i)
+				if !validID(segment.BondID) || seenBonds[segment.BondID] {
+					return fmt.Errorf("%s.bond_id must be a unique valid bond ID", field)
+				}
+				seenBonds[segment.BondID] = true
+				if segment.ESID == 0 || segment.ESID > 16777215 || seenESIDs[segment.ESID] {
+					return fmt.Errorf("%s.es_id must be unique and in 1..16777215", field)
+				}
+				seenESIDs[segment.ESID] = true
+				if segment.DFPreference > 16777215 {
+					return fmt.Errorf("%s.df_preference must be 0 or in 1..16777215", field)
 				}
 			}
 		}

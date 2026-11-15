@@ -1,0 +1,21 @@
+[Unit]
+Description=GameBond wired 802.1X supplicant for interface %i
+After=network-pre.target
+Before=network-online.target
+Wants=network-pre.target
+
+[Service]
+Type=simple
+RuntimeDirectory=gamebond-wpa_supplicant/%i
+RuntimeDirectoryMode=0750
+ExecStart=/usr/sbin/wpa_supplicant -D wired -c /etc/gamebond/8021x/supplicants/%i.conf
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_PACKET
+
+[Install]
+WantedBy=multi-user.target

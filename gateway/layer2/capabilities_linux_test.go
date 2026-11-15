@@ -271,11 +271,6 @@ func TestParseTCFiltersCapturesStormControlFlowerAndPolice(t *testing.T) {
 	}
 }
 
-func withTCStats(filter TCFilterState, packets, bytes, drops uint64) TCFilterState {
-	filter.Packets, filter.Bytes, filter.Drops = packets, bytes, drops
-	return filter
-}
-
 func TestApplyStormControlStatusRequiresBothConfiguredClasses(t *testing.T) {
 	cfg, err := DecodeConfig([]byte(validConfig))
 	if err != nil {
@@ -395,6 +390,16 @@ func TestEvaluateCapabilitiesReportsMissingTools(t *testing.T) {
 	withTools := EvaluateCapabilities(Detection{Tools: map[string]bool{"tc": true, "ethtool": true}})
 	if got := withTools.Features[FeatureQoSDSCP]; got.State != CapabilityConditional {
 		t.Fatalf("DSCP QoS with tc/ethtool must be conditionally available, got %#v", got)
+	}
+}
+
+func TestEvaluateCapabilitiesSeparatesWiredSupplicantFromAuthenticator(t *testing.T) {
+	got := EvaluateCapabilities(Detection{Tools: map[string]bool{"wpa_supplicant": true, "wpa_cli": true, "systemctl": true}})
+	if cap := got.Features[FeatureWiredSupplicant]; cap.State != CapabilityConditional {
+		t.Fatalf("wired supplicant capability = %#v", cap)
+	}
+	if cap := got.Features[Feature8021X]; cap.State != CapabilityUnavailable {
+		t.Fatalf("client supplicant tools must not claim hostapd authentication support: %#v", cap)
 	}
 }
 

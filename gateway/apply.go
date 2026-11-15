@@ -207,6 +207,10 @@ func cloneConfig(cfg Config) Config {
 	}
 	copy.VRRP.Peers = append([]string(nil), cfg.VRRP.Peers...)
 	copy.VRRP.VirtualAddresses = append([]string(nil), cfg.VRRP.VirtualAddresses...)
+	if cfg.VRRP.BFD != nil {
+		bfdCopy := *cfg.VRRP.BFD
+		copy.VRRP.BFD = &bfdCopy
+	}
 	copy.IGMPProxy.DownstreamInterfaceIDs = append([]string(nil), cfg.IGMPProxy.DownstreamInterfaceIDs...)
 	copy.IGMPProxy.AllowedSources = append([]string(nil), cfg.IGMPProxy.AllowedSources...)
 	copy.DynamicRouting.OSPF.Interfaces = append([]OSPFInterface(nil), cfg.DynamicRouting.OSPF.Interfaces...)
@@ -215,6 +219,8 @@ func cloneConfig(cfg Config) Config {
 	copy.RADIUS.Clients = append([]RADIUSClient(nil), cfg.RADIUS.Clients...)
 	copy.RADIUS.Users = append([]RADIUSUser(nil), cfg.RADIUS.Users...)
 	copy.DynamicRouting.BGP.Neighbors = append([]BGPNeighbor(nil), cfg.DynamicRouting.BGP.Neighbors...)
+	copy.DynamicRouting.BGP.EVPN.Neighbors = append([]string(nil), cfg.DynamicRouting.BGP.EVPN.Neighbors...)
+	copy.DynamicRouting.BGP.EVPN.EthernetSegments = append([]BGPFlowEVPNEthernetSegment(nil), cfg.DynamicRouting.BGP.EVPN.EthernetSegments...)
 	for i := range copy.DynamicRouting.BGP.Neighbors {
 		copy.DynamicRouting.BGP.Neighbors[i].Import = append([]string(nil), cfg.DynamicRouting.BGP.Neighbors[i].Import...)
 		copy.DynamicRouting.BGP.Neighbors[i].Export = append([]string(nil), cfg.DynamicRouting.BGP.Neighbors[i].Export...)

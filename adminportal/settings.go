@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -23,9 +24,21 @@ type Settings struct {
 	TLSCert      string
 	TLSKey       string
 	LogLines     int
+	Users        []AdminUser
 }
 
-var adminKeys = map[string]bool{"enabled": true, "bind": true, "password_hash": true, "tls_cert": true, "tls_key": true, "log_lines": true}
+// AdminUser is a team-scoped portal identity. Passwords are stored only as
+// the same scrypt hashes used by the legacy single-admin login.
+type AdminUser struct {
+	Username     string `json:"username"`
+	Team         string `json:"team"`
+	Role         string `json:"role"`
+	PasswordHash string `json:"password_hash"`
+}
+
+var adminKeys = map[string]bool{"enabled": true, "bind": true, "password_hash": true, "tls_cert": true, "tls_key": true, "log_lines": true, "users": true}
+var usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
+var teamPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 
 // pyInt reports whether v is a JSON integer in Python's sense (type(v) is int:
 // no bools, no floats, even 1.0).
@@ -132,11 +145,46 @@ func ParseSettings(raw json.RawMessage) (*Settings, error) {
 		}
 		s.LogLines = n
 	}
+	if x, present := m["users"]; present {
+		rows, ok := x.([]any)
+		if !ok || len(rows) > 256 {
+			return nil, errors.New("admin.users must be an array of at most 256 users")
+		}
+		seen := map[string]bool{}
+		admins := map[string]bool{}
+		systemAdmin := false
+		for i, raw := range rows {
+			row, ok := raw.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("admin.users[%d] must be an object", i)
+			}
+			for key := range row {
+				if key != "username" && key != "team" && key != "role" && key != "password_hash" {
+					return nil, fmt.Errorf("admin.users[%d] has unknown field %q", i, key)
+				}
+			}
+			user := AdminUser{}
+			user.Username, _ = row["username"].(string)
+			user.Team, _ = row["team"].(string)
+			user.Role, _ = row["role"].(string)
+			user.PasswordHash, _ = row["password_hash"].(string)
+			key := strings.ToLower(user.Username)
+			if !usernamePattern.MatchString(user.Username) || !teamPattern.MatchString(user.Team) || (user.Role != "system-admin" && user.Role != "team-admin" && user.Role != "editor" && user.Role != "viewer") || !strings.HasPrefix(user.PasswordHash, "scrypt$") || seen[key] {
+				return nil, fmt.Errorf("admin.users[%d] has an invalid or duplicate username, team, role, or password_hash", i)
+			}
+			seen[key] = true
+			if user.Role == "system-admin" || user.Role == "team-admin" { admins[user.Team] = true }
+			if user.Role == "system-admin" { systemAdmin = true }
+			s.Users = append(s.Users, user)
+		}
+		for _, user := range s.Users { if !admins[user.Team] { return nil,fmt.Errorf("team %q must have a system-admin or team-admin account",user.Team) } }
+		if len(s.Users)>0 && !systemAdmin { return nil,errors.New("admin.users must include at least one system-admin") }
+	}
 	if s.LogLines < 10 || s.LogLines > 2000 {
 		return nil, errors.New("invalid admin settings")
 	}
 	if s.Enabled {
-		if !strings.HasPrefix(s.PasswordHash, "scrypt$") {
+		if len(s.Users) == 0 && !strings.HasPrefix(s.PasswordHash, "scrypt$") {
 			return nil, errors.New("admin.password_hash is required (python -m gamebond admin-passwd)")
 		}
 		host, _ := validIPv4(s.Host)

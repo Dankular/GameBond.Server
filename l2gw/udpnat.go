@@ -9,6 +9,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -31,11 +32,22 @@ type udpMapping struct {
 	closed bool
 }
 
-func (g *Gateway) listenUDP() (net.PacketConn, error) {
+func (g *Gateway) listenUDP(src netip.AddrPort) (net.PacketConn, error) {
+	network, local := "udp4", "0.0.0.0:0"
+	if src.Addr().Is6() && !src.Addr().Is4In6() {
+		network, local = "udp6", "[::]:0"
+	}
+	if len(g.cfg.ECMPPaths) > 0 {
+		path, err := SelectECMPPath(g.cfg.ECMPPaths, []byte(src.String()))
+		if err != nil {
+			return nil, err
+		}
+		return ListenPacketOnECMP(path, network)
+	}
 	if g.cfg.Listen != nil {
 		return g.cfg.Listen()
 	}
-	return net.ListenPacket("udp4", "0.0.0.0:0")
+	return net.ListenPacket(network, local)
 }
 
 // mappingFor returns the live mapping for a device endpoint, creating it on the first datagram.
@@ -45,7 +57,7 @@ func (g *Gateway) mappingFor(src netip.AddrPort) (*udpMapping, error) {
 	if m := g.udpMaps[src]; m != nil {
 		return m, nil
 	}
-	pc, err := g.listenUDP()
+	pc, err := g.listenUDP(src)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +196,7 @@ func (m *udpMapping) readLoop() {
 		}
 		ap := ua.AddrPort()
 		remote := netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
-		if !remote.Addr().Is4() {
+		if remote.Addr().Is4() != m.src.Addr().Is4() {
 			continue
 		}
 		m.mu.Lock()
@@ -216,16 +228,27 @@ func (m *udpMapping) readLoop() {
 // deviceEndpoint makes a stack endpoint that speaks to the device as remote: bound to the remote's
 // address (the NIC accepts any address in spoofing mode) and connected to the device endpoint.
 func (g *Gateway) deviceEndpoint(remote, dev netip.AddrPort) (*gonet.UDPConn, error) {
+	if !remote.IsValid() || !dev.IsValid() || remote.Addr().Is4() != dev.Addr().Is4() {
+		return nil, &net.OpError{Op: "endpoint", Err: net.UnknownNetworkError("remote and device address families differ")}
+	}
+	protocol := ipv4.ProtocolNumber
+	var remoteAddr, devAddr tcpip.Address
+	if remote.Addr().Is6() && !remote.Addr().Is4In6() {
+		protocol = ipv6.ProtocolNumber
+		remoteAddr, devAddr = tcpip.AddrFrom16(remote.Addr().As16()), tcpip.AddrFrom16(dev.Addr().As16())
+	} else {
+		remoteAddr, devAddr = tcpip.AddrFrom4(remote.Addr().As4()), tcpip.AddrFrom4(dev.Addr().As4())
+	}
 	var wq waiter.Queue
-	ep, terr := g.stack.NewEndpoint(udp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
+	ep, terr := g.stack.NewEndpoint(udp.ProtocolNumber, protocol, &wq)
 	if terr != nil {
 		return nil, &net.OpError{Op: "endpoint", Err: net.UnknownNetworkError(terr.String())}
 	}
-	if terr := ep.Bind(tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom4(remote.Addr().As4()), Port: remote.Port()}); terr != nil {
+	if terr := ep.Bind(tcpip.FullAddress{NIC: nicID, Addr: remoteAddr, Port: remote.Port()}); terr != nil {
 		ep.Close()
 		return nil, &net.OpError{Op: "bind", Err: net.UnknownNetworkError(terr.String())}
 	}
-	if terr := ep.Connect(tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom4(dev.Addr().As4()), Port: dev.Port()}); terr != nil {
+	if terr := ep.Connect(tcpip.FullAddress{NIC: nicID, Addr: devAddr, Port: dev.Port()}); terr != nil {
 		ep.Close()
 		return nil, &net.OpError{Op: "connect", Err: net.UnknownNetworkError(terr.String())}
 	}

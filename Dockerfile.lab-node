@@ -1,0 +1,14 @@
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/gamebond-labnode ./cmd/labnode
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash frr mstpd keepalived hostapd wpasupplicant snmp snmpd iproute2 iputils-ping traceroute tcpdump procps \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/gamebond-labnode /usr/local/bin/gamebond-labnode
+ENTRYPOINT ["/usr/local/bin/gamebond-labnode"]
+CMD ["init"]

@@ -33,6 +33,7 @@ type RuntimeSnapshot struct {
 	Redundancy     []RedundancyGroupStatus `json:"redundancy,omitempty"`
 	LLDPMED        LLDPMEDSnapshot         `json:"lldp_med"`
 	PortAuth       PortAuthSnapshot        `json:"port_auth"`
+	Clock          ClockSnapshot           `json:"clock"`
 }
 
 type DHCPGuardSyncSnapshot struct {
@@ -153,6 +154,7 @@ func (r *Runtime) Snapshot(ctx context.Context) RuntimeSnapshot {
 		caps = Capabilities{Tools: map[string]bool{}, Error: err.Error()}
 	}
 	out := RuntimeSnapshot{Capabilities: caps, Bridges: (BridgeInventory{Runner: r.runner}).Snapshot(ctx, cfg)}
+	out.Clock = snapshotClock(ctx, r.runner)
 	out.NAT = snapshotNAT(ctx, r.runner, cfg.NAT.Enabled)
 	out.Routing = snapshotRouting(ctx, r.runner, cfg)
 	effectiveQoS, qosErr := effectiveQoSConfig(cfg)
@@ -165,7 +167,8 @@ func (r *Runtime) Snapshot(ctx context.Context) RuntimeSnapshot {
 	out.DHCPGuardSync = dhcpGuardSync
 	out.VRRP = snapshotVRRP(ctx, r.runner, cfg)
 	out.IGMPProxy = snapshotIGMP(ctx, r.runner, cfg.IGMPProxy.Enabled)
-	out.DynamicRouting = snapshotDynamicRouting(ctx, r.runner, cfg.DynamicRouting)
+	managedVXLANConfigured := cfg.Layer2 != nil && len(cfg.Layer2.VXLANDevices) > 0
+	out.DynamicRouting = snapshotDynamicRouting(ctx, r.runner, cfg.DynamicRouting, managedVXLANConfigured)
 	out.MDNS = snapshotMDNS(ctx, r.runner, cfg.MDNS.Enabled)
 	out.RADIUS = snapshotRADIUS(ctx, r.runner, cfg.RADIUS)
 	if cfg.Layer2 != nil {

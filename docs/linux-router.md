@@ -100,6 +100,7 @@ Install the two per-port units and the event helper, then reload systemd:
 ```sh
 sudo install -m 0644 tools/gamebond-hostapd@.service /etc/systemd/system/
 sudo install -m 0644 tools/gamebond-8021x-events@.service /etc/systemd/system/
+sudo install -m 0644 tools/gamebond-wpa_supplicant@.service /etc/systemd/system/
 go build -o /tmp/gamebond-8021x-event ./cmd/gamebond-8021x-event
 sudo install -m 0755 /tmp/gamebond-8021x-event /usr/bin/gamebond-8021x-event
 sudo systemctl daemon-reload
@@ -113,19 +114,83 @@ the RADIUS server's client scope. Example port policy:
 
 ```json
 "port_auth": [{
-  "interface": "lan-a", "radius_server": "192.0.2.10", "radius_port": 1812,
-  "secret_file": "/etc/gamebond/8021x/lan-a.secret",
+  "interface": "auth0", "radius_server": "192.0.2.10", "radius_port": 1812,
+  "secret_file": "/etc/gamebond/8021x/auth0.secret",
   "nas_address": "192.0.2.2", "nas_id": "edge-1",
-  "reauth_seconds": 3600, "failure_policy": "closed", "exclusive_port": true
+  "reauth_seconds": 3600, "failure_policy": "closed", "exclusive_port": true,
+  "segment_id": "venue-a", "segment_identity": "session-<32-hex-session-id>",
+  "segment_socket_path": "/run/gamebond-segment/fabric.sock",
+  "segment_admin_token_file": "/etc/gamebond/segments/admin.token",
+  "eapol_tap_name": "gb-auth0"
 }]
 ```
+
+The `auth0` managed interface must resolve to Linux name `gb-auth0` in the
+gateway's `interfaces` list and bridge topology.
+
+For tunneled session authorization, set the same `eapol_tap_name` on the
+matching edge `segment_members_file` record and this `port_auth` entry. The
+member record must also set `mac_auth: true`. The edge creates one TAP and
+authenticator port per session identity; Core pairs EAPOL only between that
+session and its own hostapd TAP. Multiple such TAPs can serve one segment. Each
+hostapd interface permits one authenticated station, matching
+`exclusive_port: true`. Hostapd and the edge TAP must share a network namespace;
+the gateway API rejects events if the TAP is invisible there. Provision
+`segment_admin_token_file` as a separate root-owned mode-0600 32..128-byte hex
+credential and reference it from both the edge broker and host gateway config.
+It is distinct from session attachment tokens and RADIUS secrets. The event
+helper sends only interface, event, and station MAC through the gateway API;
+the API reads the admin credential and forwards authorization to the broker.
+
+MAC Authentication Bypass is unsupported. The managed configuration enables only
+hostapd's wired EAP authenticator and the event handler recognizes EAP success,
+failure, start, and disconnect. It does not issue a MAC-derived RADIUS request.
+Some hostapd-based switch distributions add a non-upstream `mac_auth=1` wired
+extension; that option and its RADIUS identity format are not assumed here. To add
+MAB safely, GameBond must pin a hostapd build that documents this behavior, validate
+the setting is supported, and receive a distinct MAB accept/reject result through
+the event/API path. EAP success events must never be treated as MAB results.
 
 The daemon enables bridge EAPOL group forwarding and refuses to replace an
 unmanaged authorization table. Since EAPOL forwarding compatibility with STP/RSTP
 has not been verified across the supported kernel/provider matrix, config validation
 rejects 802.1X on bridges with STP/RSTP controls enabled. Runtime status reports the
 authenticator, fail-closed event monitor, and authorized MACs separately for each
-managed port.
+managed port. Wired supplicant profiles are reported separately as service state;
+runtime status also reads `wpa_state` from the supplicant control socket and marks
+authentication complete only when that state is `COMPLETED`.
+
+Configure upstream wired authentication with `wired_supplicants`. The interface
+must be managed by the host provider and must not already be a bridge port. PEAP
+and TTLS use a root-owned password file; EAP-TLS uses CA, client certificate, and
+private key paths. Configuration stores credential paths, not credential values.
+For example:
+
+```json
+"wired_supplicants": [{
+  "interface": "wan-auth", "eap_method": "PEAP",
+  "identity": "edge-uplink@example.net",
+  "anonymous_identity": "anonymous@example.net",
+  "password_file": "/etc/gamebond/8021x/supplicants/wan-auth.secret",
+  "ca_file": "/etc/ssl/certs/provider-radius-ca.pem",
+  "phase2": "auth=MSCHAPV2"
+}]
+```
+
+Provision the password file out of band as a root-owned regular file with mode
+`0600` and 16..128 safe ASCII characters. The provider writes a mode-`0600`
+supplicant profile, stops the service before topology changes, restarts it after
+apply, and restores the previous service state on rollback. Status reports both
+the per-interface systemd service state and the current supplicant EAP state.
+An EAP-TLS private key must also be root-owned with mode `0600` or stricter.
+
+The local Linux runner uses rtnetlink for NAS bridge-address inspection and for
+the topology planner's link-up/down, MTU, and master attachment changes. These
+typed operations wait for kernel acknowledgements. Bridge creation, bridge/VLAN
+attributes, VLAN membership, qdisc, and other specialized operations still use
+the fixed command adapter; remote host providers keep using their command
+transport. This lets the local GameBond-owned gateway move toward native link
+management without changing the remote provider contract.
 
 Customizable DHCP is provided by a dedicated Kea DHCPv4 service. Each subnet binds to
 one configured LAN interface, has a dynamic pool, router and DNS options, optional
@@ -217,6 +282,10 @@ non-preempting BACKUP peer. Configure the matching router ID, advertisement inte
 peer address, and shared VIPs on both gateways, with the other peer given the higher
 priority. The local VIP ownership and service state appear in `/v1/status`; an absent
 VIP means this node is acting as BACKUP, while a partial VIP set is reported as FAULT.
+Optional BFD tracking monitors an independent on-link upstream target and moves this
+instance to FAULT when that path fails; do not set the target to the VRRP peer, because
+peer loss must still allow takeover. Keepalived must be built with BFD support and the
+upstream target must run a compatible BFD implementation.
 Install the dedicated service unit before enabling VRRP:
 
 ```sh
@@ -232,6 +301,10 @@ Example configuration:
     "enabled": true, "interface_id": "lan-main", "virtual_router_id": 42,
     "priority": 100, "advertisement_interval_seconds": 1,
     "peers": ["192.168.10.2"],
+    "bfd": {
+      "enabled": true, "neighbor": "192.168.10.254",
+      "min_interval_ms": 100, "multiplier": 3
+    },
     "virtual_addresses": ["192.168.10.1/24"]
   }
 }
@@ -305,7 +378,8 @@ Example OSPF and BGP configuration:
       "neighbors": [
         {"id": "upstream", "address": "198.51.100.1", "remote_as": 64496,
          "import_prefixes": ["0.0.0.0/0"], "export_prefixes": ["203.0.113.0/24"]}
-      ]
+      ],
+      "evpn": {"enabled": true, "neighbors": ["upstream"]}
     }
   }
 }
@@ -314,6 +388,35 @@ Example OSPF and BGP configuration:
 Daemon activity and FRR neighbor summaries are included in `/v1/status`. Peer
 adjacency is not required for configuration apply to succeed; a down peer appears in
 the reported protocol summary.
+
+`bgp.evpn` enables the L2VPN EVPN address family inside this same GameBond `bgpd`
+instance and only activates it for the named configured BGP peers. FRR's
+`advertise-all-vni` discovers VNIs from Linux VXLAN interfaces reported by Zebra;
+it does not create those interfaces. The managed `layer2.vxlan_devices` config
+creates a traditional kernel VXLAN device per VNI, maps it to a bridge VLAN, and
+creates a persistent TAP on the same bridge network. The edge broker pumps
+frames between that TAP and its VLAN-scoped segment switch. The underlay
+interface and local VTEP address must be configured and reachable; FRR learns
+the VNI from the kernel device. Broker runtime status reports the TAP attachment
+state and counters, while FRR status reports BGP/EVPN peer summaries separately.
+This is the Linux EVPN data path, distinct from the edge's static-peer
+`l2.vxlan` user-space transport, which does not consume EVPN MAC/IP routes.
+VNI/VLAN policy must match across the kernel bridge, broker, and EVPN peers.
+
+EVPN Ethernet-segment multihoming remains unsupported. FRR documents EVPN-MH for
+servers connected to multiple PEs through bonded LACP links, with the ESI and
+system MAC configured against the Linux bond interface. A broker TAP is one
+logical userspace-fabric port; it is neither that CE-facing bond nor an LACP
+endpoint. Putting an ESI or system MAC on the TAP would not provide LACP
+negotiation, link-state coordination, MAC-ECMP, DF filtering, or split-horizon
+behavior for a dual-homed endpoint. The managed VXLAN netdevice is the overlay
+side and cannot stand in for that endpoint either. Supporting EVPN-MH needs a
+real CE-facing Linux bond attached to the bridged segment, with LACP to the same
+dual-homed device on each PE and the matching FRR/Zebra ESI configuration and
+status lifecycle. Until that endpoint exists, MC-LAG and EVPN-MH stay
+unsupported. See the [FRR EVPN multihoming documentation](https://docs.frrouting.org/en/latest/bgp.html#evpn-multihoming)
+for the bond attachment, type-1/type-4 routes, DF handling, and split-horizon
+behavior.
 
 Integrated RADIUS uses FreeRADIUS 3 with locally defined PAP users and address-scoped
 RADIUS clients. Client shared secrets and user passwords are provisioned as root-only

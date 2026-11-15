@@ -127,6 +127,65 @@ func TestConfigRejects8021XOnBridgeWithUnverifiedSTPCombination(t *testing.T) {
 	}
 }
 
+func TestWiredSupplicantConfigValidatesEAPCredentialsAndRendersPEAP(t *testing.T) {
+	cfg, err := DecodeConfig([]byte(validConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Interfaces = append(cfg.Interfaces, Interface{ID: "wan", Name: "enp4s0"})
+	cfg.WiredSupplicants = []WiredSupplicant{{
+		Interface: "wan", EAPMethod: "peap", Identity: "console-uplink", AnonymousIdentity: "anonymous@example.net",
+		PasswordFile: "/etc/gamebond/8021x/supplicants/wan.secret", CAFile: "/etc/ssl/certs/radius-ca.pem",
+	}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid wired supplicant config rejected: %v", err)
+	}
+	rendered, err := RenderWiredSupplicantConfig(cfg, "wan", "safe-password-1234", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(rendered)
+	for _, expected := range []string{"ap_scan=0", "interface=enp4s0", "eap=PEAP", `identity="console-uplink"`, `anonymous_identity="anonymous@example.net"`, `phase2="auth=MSCHAPV2"`, `password="safe-password-1234"`} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("supplicant config missing %q: %s", expected, text)
+		}
+	}
+	if strings.Contains(text, "password_file") {
+		t.Fatalf("supplicant config leaked credential-file path: %s", text)
+	}
+
+	cfg.WiredSupplicants[0].Interface = "lan-a"
+	cfg.WiredSupplicants[0].PasswordFile = "/etc/gamebond/8021x/supplicants/lan-a.secret"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "non-bridge interface") {
+		t.Fatalf("bridge-port supplicant was accepted: %v", err)
+	}
+}
+
+func TestWiredSupplicantTLSRequiresCertificatesAndNoPassword(t *testing.T) {
+	cfg, err := DecodeConfig([]byte(validConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Interfaces = append(cfg.Interfaces, Interface{ID: "wan", Name: "enp4s0"})
+	cfg.WiredSupplicants = []WiredSupplicant{{Interface: "wan", EAPMethod: "TLS", Identity: "device-1", CAFile: "/etc/ssl/certs/ca.pem", ClientCertFile: "/etc/gamebond/certs/client.pem", PrivateKeyFile: "/etc/gamebond/private/client.key"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid EAP-TLS config rejected: %v", err)
+	}
+	rendered, err := RenderWiredSupplicantConfig(cfg, "wan", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"eap=TLS", `ca_cert="/etc/ssl/certs/ca.pem"`, `client_cert="/etc/gamebond/certs/client.pem"`, `private_key="/etc/gamebond/private/client.key"`} {
+		if !strings.Contains(string(rendered), expected) {
+			t.Fatalf("EAP-TLS profile missing %q: %s", expected, rendered)
+		}
+	}
+	cfg.WiredSupplicants[0].PasswordFile = "/etc/gamebond/8021x/supplicants/wan.secret"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("EAP-TLS password credential was accepted")
+	}
+}
+
 func TestVoiceVLANRequiresTaggedPortMembershipAndLLDPPolicyIsValid(t *testing.T) {
 	cfg, err := DecodeConfig([]byte(validConfig))
 	if err != nil {

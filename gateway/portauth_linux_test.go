@@ -5,23 +5,34 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dankular/GameBond.Server/gateway/layer2"
 )
 
 type portAuthTestRunner struct {
-	commands  []string
-	inputs    [][]byte
-	failInput bool
-	addresses []byte
-	setJSON   []byte
+	commands         []string
+	inputs           [][]byte
+	failInput        bool
+	addresses        []byte
+	setJSON          []byte
+	supplicantStatus []byte
 }
 
 func (r *portAuthTestRunner) Available(string) bool { return true }
 func (r *portAuthTestRunner) Run(_ context.Context, tool string, args ...string) (CommandResult, error) {
 	r.commands = append(r.commands, tool+" "+strings.Join(args, " "))
+	if tool == "wpa_cli" {
+		return CommandResult{Stdout: r.supplicantStatus}, nil
+	}
 	if tool == "ip" {
 		return CommandResult{Stdout: r.addresses}, nil
 	}
@@ -70,6 +81,75 @@ func TestHandlePortAuthEventAllowsOnlySuccessfulEAPAndKnownPorts(t *testing.T) {
 	}
 }
 
+func TestPortAuthBrokerMappingRequiresMatchingTapName(t *testing.T) {
+	cfg := gatewayPortAuthConfig()
+	cfg.PortAuth[0].SegmentID = "venue-a"
+	cfg.PortAuth[0].SegmentIdentity = "session-000102030405060708090a0b0c0d0e0f"
+	cfg.PortAuth[0].SegmentSocketPath = "/run/gamebond/fabric.sock"
+	cfg.PortAuth[0].SegmentAdminTokenFile = "/etc/gamebond/segments/admin.token"
+	cfg.PortAuth[0].EAPOLTapName = "enp2s0"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid broker mapping rejected: %v", err)
+	}
+	cfg.PortAuth[0].EAPOLTapName = "gb-auth0"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("broker mapping with a different TAP name was accepted")
+	}
+}
+
+func TestLoadPortAuthAdminTokenRequiresOwnerOnlyFile(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root-owned token validation requires root")
+	}
+	path := filepath.Join(t.TempDir(), "admin.token")
+	value := strings.Repeat("ab", 32)
+	if err := os.WriteFile(path, []byte(value+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	token, err := loadPortAuthAdminToken(path)
+	if err != nil || len(token) != 32 || token[0] != 0xab {
+		t.Fatalf("valid admin token rejected: len=%d err=%v", len(token), err)
+	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPortAuthAdminToken(path); err == nil {
+		t.Fatal("group-readable broker admin token accepted")
+	}
+}
+
+func TestSendPortAuthEventViaGatewayUnixAPI(t *testing.T) {
+	path := filepath.Join(t.TempDir(), fmt.Sprintf("api-%d.sock", time.Now().UnixNano()))
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	seen := make(chan string, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/layer2/port-auth/events" || r.Method != http.MethodPost {
+			http.Error(w, "unexpected route", http.StatusNotFound)
+			return
+		}
+		data, _ := io.ReadAll(r.Body)
+		seen <- string(data)
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	go func() { _ = server.Serve(listener) }()
+	defer server.Close()
+	if err := SendPortAuthEventViaAPI(context.Background(), path, "enp2s0", "CTRL-EVENT-EAP-SUCCESS", "02:00:00:00:00:01"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case body := <-seen:
+		if !strings.Contains(body, `"event":"CTRL-EVENT-EAP-SUCCESS"`) || strings.Contains(body, "token") || strings.Contains(body, "secret") {
+			t.Fatalf("event API payload has wrong fields: %s", body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway API did not receive event")
+	}
+}
+
 func TestHandlePortAuthEventRevokesOnFailureAndRejectsInvalidMAC(t *testing.T) {
 	runner := &portAuthTestRunner{setJSON: []byte(`{"nftables":[{"set":{"family":"bridge","table":"gamebond_8021x","name":"authenticated_clients","elem":[{"concat":[{"string":"enp2s0"},{"ether_addr":"02:00:00:00:00:02"}]}]}}]}`)}
 	cfg := gatewayPortAuthConfig()
@@ -113,6 +193,41 @@ func TestPausePortAuthStopsEventMonitorBeforeAuthenticator(t *testing.T) {
 	}
 	if len(runner.commands) != 2 || !strings.Contains(runner.commands[0], "stop gamebond-8021x-events@lan-a.service") || !strings.Contains(runner.commands[1], "stop gamebond-hostapd@lan-a.service") {
 		t.Fatalf("service pause order = %#v", runner.commands)
+	}
+}
+
+func TestWiredSupplicantServicesAreOrchestratedAndReported(t *testing.T) {
+	cfg := layer2.Config{Version: 1,
+		Interfaces:       []layer2.Interface{{ID: "wan", Name: "enp4s0"}},
+		WiredSupplicants: []layer2.WiredSupplicant{{Interface: "wan", EAPMethod: "PEAP", Identity: "device-1", PasswordFile: "/etc/gamebond/8021x/supplicants/wan.secret", CAFile: "/etc/ssl/certs/ca.pem"}},
+	}
+	runner := &portAuthTestRunner{supplicantStatus: []byte("wpa_state=COMPLETED\n")}
+	if err := reconcileWiredSupplicantServices(context.Background(), runner, layer2.Config{}, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.commands) != 1 || !strings.Contains(runner.commands[0], "restart gamebond-wpa_supplicant@wan.service") {
+		t.Fatalf("supplicant service transition = %#v", runner.commands)
+	}
+	status := snapshotPortAuth(context.Background(), runner, cfg)
+	if !status.Enabled || !status.Active || len(status.Ports) != 1 || status.Ports[0].SupplicantServiceActive == nil || !*status.Ports[0].SupplicantServiceActive || status.Ports[0].SupplicantState != "COMPLETED" || status.Ports[0].SupplicantAuthenticated == nil || !*status.Ports[0].SupplicantAuthenticated {
+		t.Fatalf("supplicant runtime status = %+v", status)
+	}
+	runner.commands = nil
+	if err := pausePortAuthServices(context.Background(), runner, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.commands) != 1 || !strings.Contains(runner.commands[0], "stop gamebond-wpa_supplicant@wan.service") {
+		t.Fatalf("supplicant pause = %#v", runner.commands)
+	}
+}
+
+func TestParseWiredSupplicantStatusDoesNotInferAuthenticationFromProcessState(t *testing.T) {
+	state, authenticated, err := parseWiredSupplicantStatus([]byte("wpa_state=ASSOCIATING\n"))
+	if err != nil || state != "ASSOCIATING" || authenticated {
+		t.Fatalf("associating status = %q authenticated=%v err=%v", state, authenticated, err)
+	}
+	if _, _, err := parseWiredSupplicantStatus([]byte("wpa_state=COMPLETED\nwpa_state=COMPLETED\n")); err == nil {
+		t.Fatal("duplicate EAP state was accepted")
 	}
 }
 

@@ -231,6 +231,9 @@ func (t *Throttle) Success(addr string) {
 type Session struct {
 	CSRF       string
 	Born, Seen float64
+	Username   string
+	Team       string
+	Role       string
 }
 
 // Sessions holds at most MaxSessions logins with idle and absolute expiry.
@@ -259,6 +262,11 @@ func (s *Sessions) expire(now float64) {
 
 // Create returns a new session token and CSRF token.
 func (s *Sessions) Create() (token, csrf string) {
+	return s.CreateFor("admin", "default", "admin")
+}
+
+// CreateFor creates a session carrying the authenticated user's scoped role.
+func (s *Sessions) CreateFor(username, team, role string) (token, csrf string) {
 	now := s.Clock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -273,7 +281,7 @@ func (s *Sessions) Create() (token, csrf string) {
 		delete(s.items, oldest)
 	}
 	token, csrf = urlsafe(32), urlsafe(24)
-	s.items[token] = &Session{CSRF: csrf, Born: now, Seen: now}
+	s.items[token] = &Session{CSRF: csrf, Born: now, Seen: now, Username: username, Team: team, Role: role}
 	return
 }
 
@@ -305,6 +313,17 @@ func (s *Sessions) DropAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.items = map[string]*Session{}
+}
+
+// DropUser revokes every live session for one account in its team.
+func (s *Sessions) DropUser(team, username string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for token, session := range s.items {
+		if session.Team == team && strings.EqualFold(session.Username, username) {
+			delete(s.items, token)
+		}
+	}
 }
 
 // Len is the number of live sessions (test helper).

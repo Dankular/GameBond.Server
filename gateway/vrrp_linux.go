@@ -43,6 +43,13 @@ func renderKeepalivedConfig(cfg VRRPConfig, interfaces []Interface, source strin
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "global_defs {\n  router_id GAMEBOND_SHADOW\n}\n\n")
+	if cfg.BFD != nil && cfg.BFD.Enabled {
+		neighbor, err := netip.ParseAddr(cfg.BFD.Neighbor)
+		if err != nil || neighbor.Is4() != netip.MustParseAddr(source).Is4() {
+			return nil, errors.New("BFD neighbor must match the VRRP source address family")
+		}
+		fmt.Fprintf(&b, "bfd_instance GB_UPLINK_BFD {\n  neighbor_ip %s\n  source_ip %s\n  min_rx %d\n  min_tx %d\n  multiplier %d\n  vrrp\n}\n\n", neighbor, source, cfg.BFD.MinIntervalMS, cfg.BFD.MinIntervalMS, cfg.BFD.Multiplier)
+	}
 	fmt.Fprintf(&b, "vrrp_instance GB_%d {\n  state BACKUP\n  interface %s\n  version 3\n  virtual_router_id %d\n  priority %d\n  advert_int %d\n  nopreempt\n  unicast_src_ip %s\n  unicast_peer {\n",
 		cfg.VirtualRouterID, name, cfg.VirtualRouterID, cfg.Priority, cfg.AdvertisementIntervalSecs, source)
 	for _, peer := range cfg.Peers {
@@ -52,7 +59,11 @@ func renderKeepalivedConfig(cfg VRRPConfig, interfaces []Interface, source strin
 	for _, address := range cfg.VirtualAddresses {
 		fmt.Fprintf(&b, "    %s dev %s\n", address, name)
 	}
-	b.WriteString("  }\n}\n")
+	b.WriteString("  }\n")
+	if cfg.BFD != nil && cfg.BFD.Enabled {
+		b.WriteString("  track_bfd { GB_UPLINK_BFD }\n")
+	}
+	b.WriteString("}\n")
 	return []byte(b.String()), nil
 }
 
@@ -142,6 +153,12 @@ func validateVRRPAddressesOnSubnet(cfg VRRPConfig, subnet netip.Prefix) error {
 		addr, err := netip.ParseAddr(peer)
 		if err != nil || !subnet.Contains(addr) {
 			return fmt.Errorf("VRRP peer %s is outside interface subnet %s", peer, subnet)
+		}
+	}
+	if cfg.BFD != nil && cfg.BFD.Enabled {
+		neighbor, err := netip.ParseAddr(cfg.BFD.Neighbor)
+		if err != nil || !subnet.Contains(neighbor) {
+			return fmt.Errorf("BFD neighbor %s is outside interface subnet %s", cfg.BFD.Neighbor, subnet)
 		}
 	}
 	for _, value := range cfg.VirtualAddresses {

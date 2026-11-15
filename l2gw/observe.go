@@ -11,15 +11,25 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 )
 
-// tap hands an IPv4 frame's packet to the observer, the same view the tunnel path gives the IDS and the
+// tap hands an IP frame's packet to the observer, the same view the tunnel path gives the IDS and the
 // traffic classifier.
 func (g *Gateway) tap(fromDevice bool, frame []byte) {
-	if g.cfg.Tap == nil || len(frame) < header.EthernetMinimumSize+header.IPv4MinimumSize || binary.BigEndian.Uint16(frame[12:]) != 0x0800 {
+	if g.cfg.Tap == nil || len(frame) < header.EthernetMinimumSize {
 		return
 	}
-	g.cfg.Tap(fromDevice, frame[header.EthernetMinimumSize:])
+	switch header.Ethernet(frame).Type() {
+	case header.IPv4ProtocolNumber:
+		if len(frame) >= header.EthernetMinimumSize+header.IPv4MinimumSize {
+			g.cfg.Tap(fromDevice, frame[header.EthernetMinimumSize:])
+		}
+	case header.IPv6ProtocolNumber:
+		if len(frame) >= header.EthernetMinimumSize+header.IPv6MinimumSize {
+			g.cfg.Tap(fromDevice, frame[header.EthernetMinimumSize:])
+		}
+	}
 }
 
 func (g *Gateway) dnsOn() bool {
@@ -34,19 +44,31 @@ func (g *Gateway) startDNSFilter() error {
 	if g.cfg.DNSFilter == nil || g.cfg.DNSFilter.Handle == nil {
 		return nil
 	}
-	la := tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom4(g.cfg.Address.Addr().As4()), Port: 53}
-	pc, err := gonet.DialUDP(g.stack, &la, nil, ipv4.ProtocolNumber)
-	if err != nil {
-		return err
+	servers := []struct {
+		address tcpip.Address
+		proto   tcpip.NetworkProtocolNumber
+	}{{tcpip.AddrFrom4(g.cfg.Address.Addr().As4()), ipv4.ProtocolNumber}}
+	if g.cfg.IPv6Address.IsValid() {
+		servers = append(servers, struct {
+			address tcpip.Address
+			proto   tcpip.NetworkProtocolNumber
+		}{tcpip.AddrFrom16(g.cfg.IPv6Address.Addr().As16()), ipv6.ProtocolNumber})
 	}
-	ln, err := gonet.ListenTCP(g.stack, la, ipv4.ProtocolNumber)
-	if err != nil {
-		pc.Close()
-		return err
+	for _, server := range servers {
+		la := tcpip.FullAddress{NIC: nicID, Addr: server.address, Port: 53}
+		pc, err := gonet.DialUDP(g.stack, &la, nil, server.proto)
+		if err != nil {
+			return err
+		}
+		ln, err := gonet.ListenTCP(g.stack, la, server.proto)
+		if err != nil {
+			pc.Close()
+			return err
+		}
+		g.dnsClosers = append(g.dnsClosers, pc, ln)
+		go g.dnsUDPLoop(pc)
+		go g.dnsAccept(ln)
 	}
-	g.dnsClosers = append(g.dnsClosers, pc, ln)
-	go g.dnsUDPLoop(pc)
-	go g.dnsAccept(ln)
 	return nil
 }
 

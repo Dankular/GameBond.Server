@@ -160,6 +160,12 @@ func (c Config) Validate() error {
 	if err := c.DynamicRouting.Validate(c.Interfaces); err != nil {
 		return fmt.Errorf("dynamic_routing: %w", err)
 	}
+	if c.Layer2 != nil && len(c.Layer2.VXLANDevices) > 0 && (!c.DynamicRouting.Enabled || !c.DynamicRouting.BGP.Enabled || !c.DynamicRouting.BGP.EVPN.Enabled) {
+		return errors.New("layer2.vxlan_devices require dynamic_routing.bgp.evpn on the existing GameBond bgpd instance")
+	}
+	if err := validateEVPNMHEthernetSegments(c.DynamicRouting.BGP.EVPN.EthernetSegments, c.Layer2); err != nil {
+		return fmt.Errorf("dynamic_routing.bgp.evpn: %w", err)
+	}
 	if err := c.MDNS.Validate(c.Interfaces); err != nil {
 		return fmt.Errorf("mdns: %w", err)
 	}
@@ -278,6 +284,71 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func validateEVPNMHEthernetSegments(segments []BGPFlowEVPNEthernetSegment, l2 *layer2.Config) error {
+	if len(segments) == 0 {
+		return nil
+	}
+	if l2 == nil {
+		return errors.New("ethernet_segments require layer2 managed LACP bonds and VXLAN devices")
+	}
+	bonds := make(map[string]layer2.Bond, len(l2.Bonds))
+	interfaces := make(map[string]layer2.Interface, len(l2.Interfaces))
+	for _, item := range l2.Bonds {
+		bonds[item.ID] = item
+	}
+	for _, item := range l2.Interfaces {
+		interfaces[item.ID] = item
+	}
+	for i, segment := range segments {
+		field := fmt.Sprintf("ethernet_segments[%d]", i)
+		bond, ok := bonds[segment.BondID]
+		if !ok {
+			return fmt.Errorf("%s.bond_id %q does not reference a managed 802.3ad bond", field, segment.BondID)
+		}
+		if bond.SystemMAC == "" {
+			return fmt.Errorf("%s requires bond %q to set system_mac; configure the same ESID and system MAC on every PE", field, bond.ID)
+		}
+		if _, ok := interfaces[bond.Interface]; !ok {
+			return fmt.Errorf("%s bond %q has no managed interface", field, bond.ID)
+		}
+		attachedToVNI := false
+		for _, device := range l2.VXLANDevices {
+			for _, bridge := range l2.Bridges {
+				if bridge.ID != networkBridge(l2.Networks, device.Network) {
+					continue
+				}
+				for _, port := range bridge.Ports {
+					if port.Interface == bond.Interface && (port.UntaggedNetwork == device.Network || containsNetwork(port.TaggedNetworks, device.Network)) {
+						attachedToVNI = true
+					}
+				}
+			}
+		}
+		if !attachedToVNI {
+			return fmt.Errorf("%s bond %q must be attached to a bridge network with a managed VXLAN device", field, bond.ID)
+		}
+	}
+	return nil
+}
+
+func networkBridge(networks []layer2.Network, id string) string {
+	for _, network := range networks {
+		if network.ID == id {
+			return network.Bridge
+		}
+	}
+	return ""
+}
+
+func containsNetwork(networks []string, id string) bool {
+	for _, network := range networks {
+		if network == id {
+			return true
+		}
+	}
+	return false
 }
 
 func validateLayer2DHCPBindings(cfg *layer2.Config, dhcpEnabled bool) error {

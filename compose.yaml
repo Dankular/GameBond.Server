@@ -5,6 +5,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    environment:
+      # Optional best-effort RFC 5424 UDP export to a trusted collector.
+      GAMEBOND_SYSLOG_ADDR: ${GAMEBOND_SYSLOG_ADDR:-}
     # GB03 authenticates process restarts before accepting a new sender domain.
     restart: "no"
     # Separate bridge network namespace. Never use network_mode: host here.
@@ -53,6 +56,14 @@ services:
       - type: volume
         source: inspection-ca
         target: /var/lib/gamebond-inspection
+      - type: volume
+        source: lab-data
+        target: /var/lib/gamebond-labs
+      # Mount this same local volume into every edge container in a segment.
+      # The broker owns a mode-0600 Unix socket here; it never leaves the host.
+      - type: volume
+        source: segment-fabric
+        target: /run/gamebond-segment
     pids_limit: 64
     mem_limit: 1g
     stop_grace_period: 10s
@@ -79,3 +90,8 @@ networks:
     driver: bridge
 volumes:
   inspection-ca:
+  lab-data:
+  segment-fabric:
+    # Stable across Compose project names so separately deployed session
+    # containers can mount the same local broker socket volume.
+    name: ${GAMEBOND_SEGMENT_VOLUME:-gamebond-segment}

@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 var deviceMAC = net.HardwareAddr{0x02, 0, 0, 0, 0, 0x99}
@@ -48,6 +49,101 @@ func newTestGateway(t *testing.T, mutate func(*Config)) (*Gateway, chan []byte) 
 	}
 	t.Cleanup(g.Close)
 	return g, out
+}
+
+func TestUnsolicitedRouterAdvertisementCarriesAutonomousPrefixLifetime(t *testing.T) {
+	g := &Gateway{cfg: Config{
+		IPv6Address: netip.MustParsePrefix("2001:db8:78::1/64"),
+		MAC:         net.HardwareAddr{0x02, 0x47, 0x42, 0, 0, 1},
+	}}
+	frame := g.unsolicitedRouterAdvertisement()
+	if len(frame) < 14+40+48 || frame[12] != 0x86 || frame[13] != 0xdd || frame[0] != 0x33 || frame[1] != 0x33 || frame[2] != 0 || frame[3] != 0 || frame[4] != 0 || frame[5] != 1 {
+		t.Fatalf("unsolicited RA Ethernet framing is invalid: %x", frame)
+	}
+	ip := frame[14:]
+	if ip[6] != 58 || ip[7] != 255 || netip.AddrFrom16([16]byte(ip[8:24])) != netip.MustParseAddr("fe80::47:42ff:fe00:1") || netip.AddrFrom16([16]byte(ip[24:40])) != netip.MustParseAddr("ff02::1") {
+		t.Fatalf("unsolicited RA IPv6 header is invalid: %x", ip[:40])
+	}
+	ra := ip[40:]
+	if ra[0] != 134 || ra[1] != 0 || icmpv6Checksum(ip[8:24], ip[24:40], ra) != 0 {
+		t.Fatalf("unsolicited RA ICMPv6 message is invalid: %x", ra)
+	}
+	pio := ra[16:48]
+	if pio[0] != 3 || pio[1] != 4 || pio[2] != 64 || pio[3]&0x40 == 0 || binary.BigEndian.Uint32(pio[4:8]) != 86400 || binary.BigEndian.Uint32(pio[8:12]) != 14400 || netip.AddrFrom16([16]byte(pio[16:32])) != netip.MustParseAddr("2001:db8:78::") {
+		t.Fatalf("unsolicited RA Prefix Information is invalid: %x", pio)
+	}
+}
+
+func TestPeriodicRouterAdvertisementSendsAndStops(t *testing.T) {
+	out := make(chan []byte, 1)
+	g := &Gateway{cfg: Config{
+		IPv6Address: netip.MustParsePrefix("2001:db8:78::1/64"),
+		MAC:         net.HardwareAddr{0x02, 0x47, 0x42, 0, 0, 1},
+		Out:         func(frame []byte) { out <- append([]byte(nil), frame...) },
+	}}
+	stop := make(chan struct{})
+	g.done.Add(1)
+	go g.periodicRouterAdvertisements(stop)
+	select {
+	case frame := <-out:
+		if len(frame) < 14+40+48 || frame[14+40] != 134 {
+			t.Fatalf("periodic output was not a Router Advertisement: %x", frame)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("periodic Router Advertisement was not sent")
+	}
+	close(stop)
+	done := make(chan struct{})
+	go func() { g.done.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("periodic Router Advertisement did not stop")
+	}
+}
+
+func TestGatewayCloseWithdrawsRouterAndSLAACLifetimes(t *testing.T) {
+	g, out := newTestGateway(t, func(cfg *Config) {
+		cfg.IPv6Address = netip.MustParsePrefix("2001:db8:78::1/64")
+		cfg.DNS6 = []netip.Addr{netip.MustParseAddr("2001:db8:78::53")}
+	})
+	g.Inbound(routerSolicitationFrame())
+	select {
+	case frame := <-out:
+		if frame[14+40] != 134 || binary.BigEndian.Uint16(frame[14+40+6:14+40+8]) == 0 {
+			t.Fatalf("Router Solicitation did not receive a live RA: %x", frame)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Router Solicitation did not receive a live RA")
+	}
+	g.Close()
+	select {
+	case frame := <-out:
+		ip, ra := frame[14:], frame[14+40:]
+		if ra[0] != 134 || binary.BigEndian.Uint16(ra[6:8]) != 0 || binary.BigEndian.Uint32(ra[20:24]) != 0 || binary.BigEndian.Uint32(ra[24:28]) != 0 || binary.BigEndian.Uint32(ra[48+4:48+8]) != 0 || icmpv6Checksum(ip[8:24], ip[24:40], ra) != 0 {
+			t.Fatalf("gateway shutdown did not withdraw router, PIO, and RDNSS lifetimes: %x", frame)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway shutdown did not send an RA withdrawal")
+	}
+}
+
+func routerSolicitationFrame() []byte {
+	source := netip.MustParseAddr("fe80::99").As16()
+	destination := netip.MustParseAddr("ff02::2").As16()
+	frame := make([]byte, header.EthernetMinimumSize+40+8)
+	header.Ethernet(frame).Encode(&header.EthernetFields{
+		SrcAddr: tcpip.LinkAddress(deviceMAC), DstAddr: tcpip.LinkAddress([]byte{0x33, 0x33, 0, 0, 0, 2}), Type: header.IPv6ProtocolNumber,
+	})
+	ip := frame[header.EthernetMinimumSize:]
+	ip[0], ip[6], ip[7] = 0x60, 58, 255
+	binary.BigEndian.PutUint16(ip[4:6], 8)
+	copy(ip[8:24], source[:])
+	copy(ip[24:40], destination[:])
+	rs := ip[40:]
+	rs[0] = 133
+	binary.BigEndian.PutUint16(rs[2:4], icmpv6Checksum(ip[8:24], ip[24:40], rs))
+	return frame
 }
 
 // dhcpFrame builds a client DHCP packet inside Ethernet, IPv4 and UDP, as a device puts it on the wire.
@@ -162,6 +258,232 @@ func TestDHCPOfferAckAndFixedHost(t *testing.T) {
 		t.Fatal("answered a request meant for another server")
 	case <-time.After(300 * time.Millisecond):
 	}
+}
+
+func TestDHCPBindingRetainsAuthenticatedIngressSession(t *testing.T) {
+	g, out := newTestGateway(t, nil)
+	client := net.HardwareAddr{0x02, 0, 0, 0, 0, 0x73}
+	identity := "session-00010203"
+	g.InboundFrom(dhcpFrame(client, dhcpDiscover, 91, netip.Addr{}, netip.Addr{}), identity)
+	_, offered, _ := awaitDHCP(t, out)
+	g.InboundFrom(dhcpFrame(client, dhcpRequest, 91, offered, netip.MustParseAddr("10.78.0.1")), identity)
+	if typ, _, _ := awaitDHCP(t, out); typ != dhcpAck {
+		t.Fatalf("expected ACK, got %d", typ)
+	}
+	bindings := g.DHCPBindings()
+	if len(bindings) != 1 || bindings[0].IP != offered || bindings[0].SessionPort != identity || bindings[0].MAC != client.String() {
+		t.Fatalf("DHCP binding did not retain authenticated ingress identity: %+v", bindings)
+	}
+}
+
+func TestDHCPv4RelayAddsCircuitIdentityAndRestoresClientReply(t *testing.T) {
+	client := net.HardwareAddr{2, 9, 8, 7, 6, 5}
+	requestFrame := dhcpFrame(client, dhcpDiscover, 0x10203040, netip.Addr{}, netip.Addr{})
+	request := requestFrame[14+20+8:]
+	giaddr := netip.MustParseAddr("10.78.0.1")
+	forward, ok := makeDHCPv4RelayForward(request, giaddr, "session-a")
+	if !ok || forward[3] != 1 || !bytes.Equal(forward[24:28], giaddr.AsSlice()) {
+		t.Fatalf("relay-forward did not set hop count/giaddr: ok=%v packet=%x", ok, forward)
+	}
+	if !dhcpRelayOptionPresent(forward, "session-a") {
+		t.Fatalf("relay-forward did not include authenticated circuit ID: %x", forward)
+	}
+
+	reply := append([]byte(nil), forward...)
+	reply[0] = 2
+	for off := dhcpFixedSize + 4; off < len(reply); {
+		if reply[off] == 255 {
+			break
+		}
+		if reply[off] == 53 {
+			reply[off+2] = dhcpOffer
+			break
+		}
+		off += 1
+		if reply[off-1] != 0 {
+			off += 1 + int(reply[off])
+		}
+	}
+	out, ok := parseDHCPv4RelayReply(reply, giaddr, "session-a")
+	if !ok || out[3] != 0 || !bytes.Equal(out[24:28], []byte{0, 0, 0, 0}) || dhcpRelayOptionPresent(out, "session-a") {
+		t.Fatalf("relay-reply was not restored for the client: ok=%v packet=%x", ok, out)
+	}
+	if _, ok := parseDHCPv4RelayReply(reply, giaddr, "session-b"); ok {
+		t.Fatal("relay-reply circuit ID from another session was accepted")
+	}
+	if _, ok := makeDHCPv4RelayForward(request, giaddr, ""); ok {
+		t.Fatal("empty circuit ID accepted")
+	}
+	clientWithOption82 := append([]byte(nil), request...)
+	clientWithOption82 = append(clientWithOption82[:len(clientWithOption82)-1], 82, 1, 1, 0, 255)
+	if _, ok := makeDHCPv4RelayForward(clientWithOption82, giaddr, "session-a"); ok {
+		t.Fatal("client-supplied relay-agent option accepted")
+	}
+}
+
+func TestDHCPv4RelayExchangesFramesWithOnLinkServer(t *testing.T) {
+	clientOut := make(chan []byte, 16)
+	toUpstream := make(chan []byte, 64)
+	var upstreamLink *channel.Endpoint
+	g, err := New(Config{
+		Address:    netip.MustParsePrefix("10.78.0.1/24"),
+		DHCPRelay4: netip.MustParseAddrPort("10.78.0.2:67"),
+		Out: func(frame []byte) {
+			copyFrame := append([]byte(nil), frame...)
+			if isDHCPv4ClientReplyFrame(copyFrame) {
+				clientOut <- copyFrame
+				return
+			}
+			toUpstream <- copyFrame
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(g.Close)
+
+	upstreamLink = channel.New(512, 1380, tcpip.LinkAddress([]byte{2, 0, 0, 0, 0, 2}))
+	serverStack := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, arp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
+	})
+	if err := serverStack.CreateNIC(1, ethernet.New(upstreamLink)); err != nil {
+		t.Fatal(err)
+	}
+	if err := serverStack.AddProtocolAddress(1, tcpip.ProtocolAddress{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: tcpip.AddressWithPrefix{
+		Address: tcpip.AddrFrom4([4]byte{10, 78, 0, 2}), PrefixLen: 24,
+	}}, stack.AddressProperties{}); err != nil {
+		t.Fatal(err)
+	}
+	serverStack.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
+	var wq waiter.Queue
+	ep, terr := serverStack.NewEndpoint(udp.ProtocolNumber, ipv4.ProtocolNumber, &wq)
+	if terr != nil {
+		t.Fatal(terr)
+	}
+	ep.SocketOptions().SetReuseAddress(true)
+	if terr := ep.Bind(tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFrom4([4]byte{10, 78, 0, 2}), Port: 67}); terr != nil {
+		t.Fatal(terr)
+	}
+	serverConn := gonet.NewUDPConn(&wq, ep)
+	serverCtx, stopServer := context.WithCancel(context.Background())
+	t.Cleanup(func() { stopServer(); serverConn.Close(); serverStack.Close(); upstreamLink.Close() })
+	go func() {
+		for {
+			pkt := upstreamLink.ReadContext(serverCtx)
+			if pkt == nil {
+				return
+			}
+			view := pkt.ToView()
+			g.Inbound(append([]byte(nil), view.AsSlice()...))
+			view.Release()
+			pkt.DecRef()
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case frame := <-toUpstream:
+				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(frame)})
+				upstreamLink.InjectInbound(0, pkt)
+				pkt.DecRef()
+			case <-serverCtx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, _, err := serverConn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			relayRequest := append([]byte(nil), buf[:n]...)
+			if !dhcpRelayOptionPresent(relayRequest, "session-relay") || !bytes.Equal(relayRequest[24:28], []byte{10, 78, 0, 1}) {
+				continue
+			}
+			reply := append([]byte(nil), relayRequest...)
+			reply[0] = 2
+			copy(reply[16:20], []byte{10, 78, 0, 100})
+			for off := dhcpFixedSize + 4; off < len(reply); {
+				if reply[off] == 255 {
+					break
+				}
+				if reply[off] == 53 {
+					reply[off+2] = dhcpOffer
+					break
+				}
+				if reply[off] == 0 {
+					off++
+					continue
+				}
+				off += 2 + int(reply[off+1])
+			}
+			_, _ = serverConn.WriteTo(reply, &net.UDPAddr{IP: net.IPv4(10, 78, 0, 1), Port: 67})
+			return
+		}
+	}()
+
+	clientMAC := net.HardwareAddr{2, 9, 8, 7, 6, 5}
+	g.InboundFrom(dhcpFrame(clientMAC, dhcpDiscover, 0x10203040, netip.Addr{}, netip.Addr{}), "session-relay")
+	typ, offered, _ := awaitDHCP(t, clientOut)
+	if typ != dhcpOffer || offered != netip.MustParseAddr("10.78.0.100") {
+		t.Fatalf("relay response = type %d, address %s", typ, offered)
+	}
+}
+
+func TestDHCPv4RelayConfigRejectsAmbiguousPoolAndUnroutableServer(t *testing.T) {
+	base := Config{Address: netip.MustParsePrefix("10.78.0.1/24"), DHCPRelay4: netip.MustParseAddrPort("192.0.2.53:67"), Out: func([]byte) {}}
+	if _, err := New(base); err == nil {
+		t.Fatal("off-subnet DHCP relay without a next hop was accepted")
+	}
+	base.DHCPRelayGateway4 = netip.MustParseAddr("10.78.0.254")
+	base.DHCPStart, base.DHCPEnd = netip.MustParseAddr("10.78.0.100"), netip.MustParseAddr("10.78.0.110")
+	if _, err := New(base); err == nil {
+		t.Fatal("DHCP relay and local pool were both accepted")
+	}
+	base.DHCPRelay4 = netip.AddrPort{}
+	base.DHCPStart, base.DHCPEnd = netip.Addr{}, netip.Addr{}
+	if _, err := New(base); err == nil {
+		t.Fatal("relay next hop without a DHCP relay target was accepted")
+	}
+	for _, nextHop := range []string{"10.78.0.0", "10.78.0.255", "10.79.0.254", "10.78.0.1"} {
+		bad := Config{Address: netip.MustParsePrefix("10.78.0.1/24"), DHCPRelay4: netip.MustParseAddrPort("192.0.2.53:67"), DHCPRelayGateway4: netip.MustParseAddr(nextHop), Out: func([]byte) {}}
+		if _, err := New(bad); err == nil {
+			t.Errorf("invalid relay next hop %s was accepted", nextHop)
+		}
+	}
+}
+
+func isDHCPv4ClientReplyFrame(frame []byte) bool {
+	if len(frame) < 14+20+8 || binary.BigEndian.Uint16(frame[12:14]) != 0x0800 {
+		return false
+	}
+	ip := frame[14:]
+	ihl := int(ip[0]&0x0f) * 4
+	if ip[0]>>4 != 4 || ip[9] != byte(udp.ProtocolNumber) || ihl < 20 || len(ip) < ihl+8 {
+		return false
+	}
+	return binary.BigEndian.Uint16(ip[ihl:ihl+2]) == 67 && binary.BigEndian.Uint16(ip[ihl+2:ihl+4]) == 68
+}
+
+func dhcpRelayOptionPresent(payload []byte, circuitID string) bool {
+	end, ok := dhcpOptionEnd(payload)
+	if !ok {
+		return false
+	}
+	for off := dhcpFixedSize + 4; off < end; {
+		if payload[off] == 0 {
+			off++
+			continue
+		}
+		if payload[off] == 82 && dhcpRelayCircuitIDMatches(payload[off+2:off+2+int(payload[off+1])], circuitID) {
+			return true
+		}
+		off += 2 + int(payload[off+1])
+	}
+	return false
 }
 
 // device is a second gVisor stack on the far side of the bond: what a PS5 would be.

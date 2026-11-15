@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/Dankular/GameBond.Server/gateway/layer2"
 )
 
 const (
@@ -24,16 +26,20 @@ const (
 )
 
 type DynamicRoutingSnapshot struct {
-	Enabled       bool   `json:"enabled"`
-	ZebraActive   bool   `json:"zebra_active"`
-	OSPFActive    bool   `json:"ospf_active"`
-	BGPActive     bool   `json:"bgp_active"`
-	OSPFNeighbors string `json:"ospf_neighbors,omitempty"`
-	BGPSummary    string `json:"bgp_summary,omitempty"`
-	Error         string `json:"error,omitempty"`
+	Enabled            bool   `json:"enabled"`
+	EVPNEnabled        bool   `json:"evpn_enabled"`
+	EVPNDataPlaneReady bool   `json:"evpn_data_plane_ready"`
+	EVPNDataPlaneState string `json:"evpn_data_plane_state"`
+	ZebraActive        bool   `json:"zebra_active"`
+	OSPFActive         bool   `json:"ospf_active"`
+	BGPActive          bool   `json:"bgp_active"`
+	OSPFNeighbors      string `json:"ospf_neighbors,omitempty"`
+	BGPSummary         string `json:"bgp_summary,omitempty"`
+	EVPNSummary        string `json:"evpn_summary,omitempty"`
+	Error              string `json:"error,omitempty"`
 }
 
-func renderFRRConfigs(cfg DynamicRoutingConfig, interfaces []Interface) (map[string][]byte, error) {
+func renderFRRConfigs(cfg DynamicRoutingConfig, interfaces []Interface, l2 *layer2.Config) (map[string][]byte, error) {
 	if !cfg.Enabled {
 		return map[string][]byte{}, nil
 	}
@@ -45,7 +51,33 @@ func renderFRRConfigs(cfg DynamicRoutingConfig, interfaces []Interface) (map[str
 		byID[iface.ID] = iface.Name
 	}
 	base := "! GameBond managed FRR configuration v1\nfrr defaults traditional\nhostname gamebond\n"
-	configs := map[string][]byte{"zebra": []byte(base + "")}
+	var zebra strings.Builder
+	zebra.WriteString(base)
+	if len(cfg.BGP.EVPN.EthernetSegments) > 0 {
+		if l2 == nil {
+			return nil, fmt.Errorf("EVPN multihoming requires managed Layer 2 bonds")
+		}
+		bondByID := make(map[string]layer2.Bond, len(l2.Bonds))
+		l2InterfaceName := make(map[string]string, len(l2.Interfaces))
+		for _, bond := range l2.Bonds {
+			bondByID[bond.ID] = bond
+		}
+		for _, iface := range l2.Interfaces {
+			l2InterfaceName[iface.ID] = iface.Name
+		}
+		for _, segment := range cfg.BGP.EVPN.EthernetSegments {
+			bond, ok := bondByID[segment.BondID]
+			if !ok || bond.SystemMAC == "" || l2InterfaceName[bond.Interface] == "" {
+				return nil, fmt.Errorf("EVPN Ethernet Segment %q must reference a managed LACP bond with system_mac", segment.BondID)
+			}
+			fmt.Fprintf(&zebra, "interface %s\n evpn mh es-id %d\n evpn mh es-sys-mac %s\n", l2InterfaceName[bond.Interface], segment.ESID, bond.SystemMAC)
+			if segment.DFPreference != 0 {
+				fmt.Fprintf(&zebra, " evpn mh es-df-pref %d\n", segment.DFPreference)
+			}
+			zebra.WriteString("!\n")
+		}
+	}
+	configs := map[string][]byte{"zebra": []byte(zebra.String())}
 	if cfg.OSPF.Enabled {
 		var b strings.Builder
 		b.WriteString(base)
@@ -102,6 +134,17 @@ func renderFRRConfigs(cfg DynamicRoutingConfig, interfaces []Interface) (map[str
 				}
 			}
 			b.WriteString(" exit-address-family\n")
+		}
+		if cfg.BGP.EVPN.Enabled {
+			peerByID := make(map[string]string, len(cfg.BGP.Neighbors))
+			for _, peer := range cfg.BGP.Neighbors {
+				peerByID[peer.ID] = peer.Address
+			}
+			b.WriteString(" address-family l2vpn evpn\n")
+			for _, id := range cfg.BGP.EVPN.Neighbors {
+				fmt.Fprintf(&b, "  neighbor %s activate\n", peerByID[id])
+			}
+			b.WriteString("  advertise-all-vni\n exit-address-family\n")
 		}
 		// Prefix lists are global configuration and default to deny when empty.
 		b.WriteString("exit\n")
@@ -198,14 +241,14 @@ func validateFRRHost(ctx context.Context, runner Runner, cfg Config) error {
 			return fmt.Errorf("OSPF interface %s has no IPv4 address", byID[item.InterfaceID])
 		}
 	}
-	if _, err := renderFRRConfigs(cfg.DynamicRouting, cfg.Interfaces); err != nil {
+	if _, err := renderFRRConfigs(cfg.DynamicRouting, cfg.Interfaces, cfg.Layer2); err != nil {
 		return err
 	}
 	return nil
 }
 
 func writeFRRConfigs(cfg Config) error {
-	configs, err := renderFRRConfigs(cfg.DynamicRouting, cfg.Interfaces)
+	configs, err := renderFRRConfigs(cfg.DynamicRouting, cfg.Interfaces, cfg.Layer2)
 	if err != nil {
 		return err
 	}
@@ -302,8 +345,14 @@ func applyDynamicRoutingTransition(ctx context.Context, runner Runner, cfg Confi
 	return nil
 }
 
-func snapshotDynamicRouting(ctx context.Context, runner Runner, cfg DynamicRoutingConfig) DynamicRoutingSnapshot {
-	out := DynamicRoutingSnapshot{Enabled: cfg.Enabled}
+func snapshotDynamicRouting(ctx context.Context, runner Runner, cfg DynamicRoutingConfig, managedVXLANConfigured bool) DynamicRoutingSnapshot {
+	out := DynamicRoutingSnapshot{Enabled: cfg.Enabled, EVPNEnabled: cfg.BGP.EVPN.Enabled, EVPNDataPlaneReady: false, EVPNDataPlaneState: "disabled"}
+	if cfg.BGP.EVPN.Enabled {
+		out.EVPNDataPlaneState = "unmanaged"
+		if managedVXLANConfigured {
+			out.EVPNDataPlaneState = "configured"
+		}
+	}
 	if !cfg.Enabled {
 		return out
 	}
@@ -328,6 +377,13 @@ func snapshotDynamicRouting(ctx context.Context, runner Runner, cfg DynamicRouti
 		} else if out.Error == "" {
 			out.Error = err.Error()
 		}
+		if cfg.BGP.EVPN.Enabled {
+			if result, err := runner.Run(ctx, "vtysh", "-N", "gamebond", "-c", "show bgp l2vpn evpn summary json"); err == nil {
+				out.EVPNSummary = strings.TrimSpace(string(result.Stdout))
+			} else if out.Error == "" {
+				out.Error = err.Error()
+			}
+		}
 	}
 	return out
 }
@@ -341,7 +397,7 @@ func verifyDynamicRouting(ctx context.Context, runner Runner, cfg DynamicRouting
 		}
 		return nil
 	}
-	status := snapshotDynamicRouting(ctx, runner, cfg)
+	status := snapshotDynamicRouting(ctx, runner, cfg, false)
 	if status.Error != "" {
 		return fmt.Errorf("inspect GameBond FRR: %s", status.Error)
 	}

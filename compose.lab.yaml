@@ -1,0 +1,53 @@
+# Opt-in only: the Docker Engine socket grants host-level control. Build and
+# configure runsc on the host before starting this override.
+services:
+  server:
+    environment:
+      GAMEBOND_LAB_DOCKER_SOCKET: /var/run/docker.sock
+      GAMEBOND_LAB_RUNTIME: runsc
+      GAMEBOND_LAB_NODE_IMAGE: gamebond-lab-node:0.1
+      GAMEBOND_LAB_SHAPER_SOCKET: /run/gamebond-lab/shaper.sock
+    depends_on:
+      - labd
+    volumes:
+      - lab-shaper:/run/gamebond-lab
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: false
+        bind:
+          create_host_path: false
+
+  labd:
+    build:
+      context: .
+      dockerfile: Dockerfile.labd
+    restart: unless-stopped
+    environment:
+      GAMEBOND_LAB_DOCKER_SOCKET: /var/run/docker.sock
+      GAMEBOND_LAB_SHAPER_SOCKET: /run/gamebond-lab/shaper.sock
+      GAMEBOND_LAB_NETNS_DIR: /var/run/docker/netns
+    volumes:
+      - lab-shaper:/run/gamebond-lab
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /var/run/docker/netns
+        target: /var/run/docker/netns
+        read_only: true
+        bind:
+          create_host_path: false
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  lab-shaper:
