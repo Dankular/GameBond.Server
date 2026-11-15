@@ -625,6 +625,19 @@ func (p *Portal) apiGet(w http.ResponseWriter, r *http.Request, path string) {
 		p.send(w, 200, out, "application/json; charset=utf-8")
 		return
 	}
+	if path == "/api/gateway/config" {
+		if p.gateway == nil {
+			p.json(w, 200, map[string]any{"available": false})
+			return
+		}
+		out, err := p.gateway.Request(r.Context(), http.MethodGet, "/v1/config", nil)
+		if err != nil {
+			p.json(w, 200, map[string]any{"available": false, "error": err.Error()})
+			return
+		}
+		p.send(w, 200, out, "application/json; charset=utf-8")
+		return
+	}
 	if path == "/api/gateway/layer2/profiles" {
 		if p.gateway == nil {
 			p.json(w, 200, map[string]any{"available": false})

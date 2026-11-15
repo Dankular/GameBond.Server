@@ -2,7 +2,7 @@
 const NAV = [
   ["Home", "home", [["overview", "Overview"], ["uplinks", "Uplinks"]]],
   ["Devices", "devices", [["devices", "Connected Devices"]]],
-  ["Network", "network", [["interfaces", "Interfaces"], ["routes", "Routing"], ["queues", "QoS & Queues"]]],
+  ["Network", "network", [["interfaces", "Interfaces"], ["routes", "Routing"], ["server-network", "Server network"], ["queues", "QoS & Queues"]]],
   ["Security", "security", [["firewall", "Firewall (NAT)"]]],
   ["Insights", "insights", [["bandwidth", "Realtime Graphs"], ["log", "System Log"]]],
   ["Labs", "labs", [["labs", "Topology Designer"]]],
@@ -28,6 +28,18 @@ const grid = (head, rows, cls) => h("table", {}, h("tr", {}, head.map((c) => h("
 const pct = (v, label) => h("div", { class: "bar" }, h("i", { style: "" }), h("span", {}, label));
 function bar(frac, label) { const b = pct(); b.firstChild.style.width = Math.max(0, Math.min(1, frac)) * 100 + "%"; b.lastChild.textContent = label; return b; }
 const err = (e) => h("p", { class: "bad" }, "Unavailable: " + (e.error || e));
+const serverNetworkFeatureOrder = [
+  ["stp", "STP"], ["rstp", "RSTP"], ["loop_protection", "Loop protection"], ["redundancy", "Redundancy coordination"],
+  ["lacp_port_aggregation", "LACP aggregation"], ["mc_lag", "MC-LAG"], ["bridge_vlan", "VLAN filtering"], ["virtual_network_override", "Virtual network overrides"],
+  ["jumbo_frames", "Jumbo frames"], ["port_isolation", "Port isolation"], ["mac_port_restriction", "MAC port restriction"], ["mac_address_blocking", "MAC address blocking"],
+  ["mac_acl_device_isolation", "MAC ACL / device isolation"], ["ip_acl_network_isolation", "IP ACL / network isolation"], ["routed_network_isolation", "Routed network isolation"],
+  ["igmp_snooping", "IGMP snooping"], ["igmp_vlan_snooping", "Per-VLAN IGMP snooping"], ["igmp_advanced", "IGMP querier / fast leave / router port"],
+  ["dhcp_snooping_guarding", "DHCP snooping / source guard"], ["dhcp_lease_binding_guard", "DHCP lease binding guard"], ["8021x_control", "802.1X control"],
+  ["voice_vlan", "Voice VLAN"], ["lldp_med", "LLDP-MED"], ["egress_rate_limit", "Egress rate limit"], ["flow_control", "Ethernet flow control"],
+  ["qos_dscp", "QoS (DSCP)"], ["storm_control", "Storm control"], ["multicast_broadcast_rate_limit", "Multicast / broadcast rate limits"],
+  ["port_mirroring", "Port mirroring"], ["vxlan_bridge_tap", "VXLAN bridge / EVPN data plane"], ["vrrp_gateway_failover", "VRRP gateway failover"],
+];
+const prettyJSON = (value) => h("pre", { class: "network-json" }, JSON.stringify(value ?? {}, null, 2));
 
 function renderNav(current) {
   const nav = $("nav"); nav.replaceChildren();
@@ -149,6 +161,39 @@ const pages = {
     return [h("h2", {}, "Lab topology designer"), h("p", {class:"muted"}, status.available ? "Single host lab runtime is connected. Nodes use the configured sandbox runtime." : "Runtime is unavailable. Saved topologies can be edited; applying requires a configured lab backend."), membersPanel, changePassword, h("div",{class:"row"},name,id,select), buttons, canvas, props, consolePanel, h("h3",{},"Topology JSON"), json, msg, h("h3",{},"Live status / result"),output];
   },
   async interfaces() { const r = (await api("interfaces")).data; return [h("h2", {}, "Interfaces"), r.error ? err(r) : grid(["Name", "State", "MTU", "Addresses", "RX", "TX"], r.data.map((i) => [i.name, i.state, i.mtu, i.addresses.join(", "), fmtBytes(i.rx_bytes), fmtBytes(i.tx_bytes)]))]; },
+  async "server-network"() {
+    const [responseResult, serverResult] = await Promise.all([api("gateway/status"), api("status")]);
+    const response = responseResult.data, server = serverResult.data;
+    if (response.available === false) return [h("h2", {}, "Server network"), h("p", { class: "muted" }, "Read-only view of the Linux server gateway. " + (response.error || "Gateway status is unavailable."))];
+    const config = (await api("gateway/config")).data, runtime = response.runtime || {}, layer2 = runtime.layer2 || {}, featureMap = layer2.features || {};
+    const ordered = serverNetworkFeatureOrder.filter(([key]) => featureMap[key]).map(([key, label]) => [label, featureMap[key]]);
+    const known = new Set(serverNetworkFeatureOrder.map(([key]) => key));
+    Object.keys(featureMap).filter((key) => !known.has(key)).sort().forEach((key) => ordered.push([key.replaceAll("_", " "), featureMap[key]]));
+    const state = (feature) => feature?.state || "unknown";
+    const capabilityRows = ordered.map(([label, feature]) => [label, state(feature), feature.reason || "—"]);
+    const configured = config.available === false ? null : config;
+    const sections = [
+      ["WAN, routing and availability", ["wans", "routing", "dynamic_routing", "vrrp", "redundancy", "interfaces"]],
+      ["Layer 2 switching and port controls", ["layer2", "bridges"]],
+      ["Forwarding, services and security", ["nat", "dhcp", "igmp_proxy", "mdns", "radius"]],
+      ["Traffic management and visibility", ["qos", "telemetry", "features"]],
+    ];
+    const configDetails = configured ? sections.map(([title, keys]) => {
+      const values = Object.fromEntries(keys.filter((key) => configured[key] !== undefined).map((key) => [key, configured[key]]));
+      return h("details", {}, h("summary", {}, title + " · configured"), prettyJSON(values));
+    }) : [h("p", { class: "muted" }, config.error || "Configured settings are unavailable.")];
+    const runtimeDetails = [
+      ["WAN quality and outages", runtime.quality], ["Routing and policy", runtime.routing], ["Dynamic routing and EVPN", runtime.dynamic_routing],
+      ["VRRP and redundancy", { vrrp: runtime.vrrp, redundancy: runtime.redundancy }], ["Bridges and VLAN state", { bridges: runtime.bridges, layer2: layer2.bridge_vlans, overrides: layer2.virtual_network_overrides }],
+      ["L2 guards and port controls", { dhcp_guard: layer2.dhcp_guard, port_auth: runtime.port_auth, mac_port_restrictions: layer2.mac_port_restrictions, mac_address_blocks: layer2.mac_address_blocks, mac_acls: layer2.mac_acls, ip_acls: layer2.ip_acls }],
+      ["Multicast and discovery", { igmp_proxy: runtime.igmp_proxy, multicast_database: layer2.multicast_database, multicast_router_ports: layer2.multicast_router_ports, lldp_med: runtime.lldp_med }],
+      ["Services and traffic", { nat: runtime.nat, dhcp: runtime.dhcp, qos: runtime.qos, egress_rate_limits: layer2.egress_rate_limits, storm_control: layer2.storm_control, multicast_broadcast_rate_limits: layer2.multicast_broadcast_rate_limits, port_mirrors: layer2.port_mirrors }],
+    ];
+    return [h("h2", {}, "Server network"), h("p", { class: "muted" }, "Read-only status for the Linux server gateway. Capability means the host/provider can support a feature; configured settings show desired state; runtime shows observed state."),
+      h("h3", {}, "Host and provider capabilities"), layer2.error ? err(layer2.error) : grid(["Capability", "Host support", "Reason"], capabilityRows),
+      h("h3", {}, "Configured settings"), h("details", {}, h("summary", {}, "Tunnel-side L2 · configured"), prettyJSON(server.config?.layer2 || {})), ...configDetails,
+      h("h3", {}, "Observed runtime status"), ...runtimeDetails.map(([title, value]) => h("details", {}, h("summary", {}, title), prettyJSON(value)))];
+  },
   async devices() {
     const s = (await api("status")).data, ips = s.config.lan_tunnel_ips;
     return [h("h2", {}, "Connected Devices"), h("p", { class: "muted" }, "Addresses the server accepts and NATs besides the client. Per-device counters are not collected by the server."),
@@ -224,7 +269,7 @@ async function route() {
   };
   await draw();
   if (!active()) return;
-  const live = ["overview", "uplinks", "queues", "devices"].includes(id); $("refresh").hidden = !live;
+  const live = ["overview", "uplinks", "queues", "devices", "server-network"].includes(id); $("refresh").hidden = !live;
   if (live) timer = setInterval(draw, 5000);
 }
 
