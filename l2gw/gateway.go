@@ -178,6 +178,7 @@ func New(cfg Config) (*Gateway, error) {
 	sack := tcpip.TCPSACKEnabled(true)
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
 
+	g.installFirewall()
 	g.installForwarders()
 	ctx, cancel := context.WithCancel(context.Background())
 	g.cancel = cancel

@@ -595,3 +595,50 @@ func TestDNSAndTapHooksCoverBridgedDevices(t *testing.T) {
 		t.Fatalf("tap saw up=%d down=%d", up.Load(), down.Load())
 	}
 }
+
+// The firewall is the netstack's filter table: port and network rules refuse a new connection, and the device
+// is told at once (ICMP) instead of being left to time out.
+func TestNetstackFirewallRulesRefuseFast(t *testing.T) {
+	g, out := newTestGateway(t, func(c *Config) { c.Dial = fakeInternet(t) })
+	dev := newDevice(t, g, out, "10.78.0.20")
+	hosts := []Host{{MAC: deviceMAC, IP: netip.MustParseAddr("10.78.0.20"), Name: "ps5"}}
+	try := func() (time.Duration, error) {
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		c, err := gonet.DialContextTCP(ctx, dev.s, internet, ipv4.ProtocolNumber)
+		if err == nil {
+			c.Close()
+		}
+		return time.Since(start), err
+	}
+	cases := []struct {
+		name string
+		rule DeviceRule
+		deny bool
+	}{
+		{"no rule", DeviceRule{}, false},
+		{"other port blocked", DeviceRule{BlockPorts: []uint16{8}}, false},
+		{"port blocked", DeviceRule{BlockPorts: []uint16{7}}, true},
+		{"network blocked", DeviceRule{BlockNets: []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}}, true},
+		{"other network blocked", DeviceRule{BlockNets: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")}}, false},
+	}
+	for i, tc := range cases {
+		if err := g.SetPolicy(Policy{Version: int64(i + 1), Hosts: hosts, Devices: []DevicePolicy{{MAC: deviceMAC, Rule: tc.rule}}}); err != nil {
+			t.Fatal(err)
+		}
+		took, err := try()
+		if tc.deny && err == nil {
+			t.Fatalf("%s: connection was allowed", tc.name)
+		}
+		if !tc.deny && err != nil {
+			t.Fatalf("%s: connection refused: %v", tc.name, err)
+		}
+		if tc.deny && took > 1500*time.Millisecond {
+			t.Fatalf("%s: refusal took %v, the device should be told at once", tc.name, took)
+		}
+	}
+	if g.Stats().Blocked == 0 {
+		t.Fatal("refusals were not counted")
+	}
+}

@@ -134,6 +134,7 @@ func (g *Gateway) SetPolicy(p Policy) error {
 		return err
 	}
 	g.policy.Store(compile(p))
+	g.installFirewall()
 	return nil
 }
 
@@ -167,25 +168,6 @@ func (g *Gateway) decide(src netip.Addr, dst netip.AddrPort) (func(), verdict) {
 			ctr.denied.Add(1)
 		}
 		return nil, v
-	}
-	switch {
-	case rule.Deny:
-		return deny(denyDevice)
-	case !rule.AllowPrivate && !g.allowed(dst.Addr()):
-		return deny(denyDest)
-	}
-	if rule.AllowPrivate && !g.cfg.AllowPrivate && blockedHard(dst.Addr()) {
-		return deny(denyDest)
-	}
-	for _, p := range rule.BlockPorts {
-		if p == dst.Port() {
-			return deny(denyPort)
-		}
-	}
-	for _, n := range rule.BlockNets {
-		if n.Contains(dst.Addr()) {
-			return deny(denyDest)
-		}
 	}
 	if ctr == nil {
 		return func() {}, allow
