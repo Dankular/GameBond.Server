@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"math/rand"
 	"net"
 	"net/netip"
 	"sync"
@@ -640,5 +641,48 @@ func TestNetstackFirewallRulesRefuseFast(t *testing.T) {
 	}
 	if g.Stats().Blocked == 0 {
 		t.Fatal("refusals were not counted")
+	}
+}
+
+// The firewall tables turn on connection tracking for every packet; this measures what that costs a bulk
+// transfer against the stack's default accept-all tables, so a regression in single-flow speed shows up here.
+func TestFirewallThroughputOverhead(t *testing.T) {
+	run := func(withFirewall bool) float64 {
+		g, out := newTestGateway(t, func(c *Config) {
+			c.Dial = fakeInternet(t)
+			c.DNSFilter = &DNSHook{Handle: func(netip.Addr, []byte, bool) []byte { return nil }}
+		})
+		dev := newDevice(t, g, out, "10.78.0.20")
+		if !withFirewall {
+			dt := stack.DefaultTables(g.stack.Clock(), rand.New(rand.NewSource(1)))
+			g.stack.IPTables().ForceReplaceTable(stack.FilterID, dt.GetTable(stack.FilterID, false), false)
+			g.stack.IPTables().ForceReplaceTable(stack.NATID, dt.GetTable(stack.NATID, false), false)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		c, err := gonet.DialContextTCP(ctx, dev.s, internet, ipv4.ProtocolNumber)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		const total = 24 << 20
+		start := time.Now()
+		go func() {
+			buf := make([]byte, 64<<10)
+			for sent := 0; sent < total; sent += len(buf) {
+				if _, err := c.Write(buf); err != nil {
+					return
+				}
+			}
+		}()
+		n, _ := io.CopyN(io.Discard, c, total)
+		return float64(n) / (1 << 20) / time.Since(start).Seconds()
+	}
+	base, fw := run(false), run(true)
+	base2, fw2 := run(false), run(true)
+	base, fw = (base+base2)/2, (fw+fw2)/2
+	t.Logf("accept-all tables %.0f MB/s, firewall tables %.0f MB/s (%.0f%%)", base, fw, 100*fw/base)
+	if fw < base*0.5 {
+		t.Fatalf("firewall tables cost more than half the throughput: %.0f vs %.0f MB/s", fw, base)
 	}
 }

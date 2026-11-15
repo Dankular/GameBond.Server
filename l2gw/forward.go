@@ -52,10 +52,6 @@ func (g *Gateway) installForwarders() {
 		}
 		g.tcpFlows.Add(1)
 		g.tcpTotal.Add(1)
-		if g.dnsOn() && dst.Port() == 53 {
-			go func() { defer release(); g.dnsTCP(r) }()
-			return
-		}
 		go func() { defer release(); g.tcpFlow(r, dst) }()
 	})
 	g.stack.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
@@ -71,10 +67,6 @@ func (g *Gateway) installForwarders() {
 			return
 		}
 		g.udpTotal.Add(1)
-		if g.dnsOn() && dst.Port() == 53 {
-			go g.dnsUDP(r, release)
-			return
-		}
 		go g.udpFlow(r, dst, release)
 	})
 	g.stack.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)

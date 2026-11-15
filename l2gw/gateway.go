@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -112,6 +113,7 @@ type Gateway struct {
 	policy              atomic.Pointer[compiledPolicy]
 	devs                devices
 	nbMu                sync.Mutex
+	dnsClosers          []io.Closer
 	udpMu               sync.Mutex
 	udpMaps             map[netip.AddrPort]*udpMapping
 	neighbours          map[netip.Addr][6]byte
@@ -184,6 +186,10 @@ func New(cfg Config) (*Gateway, error) {
 	g.cancel = cancel
 	g.done.Add(1)
 	go g.pumpOut(ctx)
+	if err := g.startDNSFilter(); err != nil {
+		g.Close()
+		return nil, err
+	}
 	if err := g.startDHCP(ctx); err != nil {
 		g.Close()
 		return nil, err
@@ -291,6 +297,9 @@ func (g *Gateway) Close() {
 		return
 	}
 	g.cancel()
+	for _, c := range g.dnsClosers {
+		c.Close()
+	}
 	g.stack.Close()
 	g.link.Close()
 	g.done.Wait()

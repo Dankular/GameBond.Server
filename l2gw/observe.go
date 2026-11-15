@@ -2,14 +2,15 @@ package l2gw
 
 import (
 	"encoding/binary"
+	"io"
+	"net"
 	"net/netip"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
-	"gvisor.dev/gvisor/pkg/waiter"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 )
 
 // tap hands an IPv4 frame's packet to the observer, the same view the tunnel path gives the IDS and the
@@ -26,56 +27,85 @@ func (g *Gateway) dnsOn() bool {
 	return h != nil && h.Handle != nil && (h.On == nil || h.On())
 }
 
-// dnsUDP answers a device's DNS datagrams through the filtering resolver. The reply leaves from the
-// resolver address the device asked, so a device with its own resolver configured is none the wiser.
-func (g *Gateway) dnsUDP(r *udp.ForwarderRequest, release func()) {
-	defer release()
-	id := r.ID()
-	client := addrOf(id.RemoteAddress)
-	var wq waiter.Queue
-	ep, terr := r.CreateEndpoint(&wq)
-	if terr != nil {
-		return
+// startDNSFilter listens on the gateway's own address, port 53, for the DNS the NAT table redirects here.
+// Queries are answered by the filtering resolver; when it is off nothing is redirected, and a device that asks
+// the gateway directly gets no answer rather than an unfiltered one.
+func (g *Gateway) startDNSFilter() error {
+	if g.cfg.DNSFilter == nil || g.cfg.DNSFilter.Handle == nil {
+		return nil
 	}
-	c := gonet.NewUDPConn(&wq, ep)
-	defer c.Close()
-	g.udpFlows.Add(1)
-	defer g.udpFlows.Add(-1)
+	la := tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom4(g.cfg.Address.Addr().As4()), Port: 53}
+	pc, err := gonet.DialUDP(g.stack, &la, nil, ipv4.ProtocolNumber)
+	if err != nil {
+		return err
+	}
+	ln, err := gonet.ListenTCP(g.stack, la, ipv4.ProtocolNumber)
+	if err != nil {
+		pc.Close()
+		return err
+	}
+	g.dnsClosers = append(g.dnsClosers, pc, ln)
+	go g.dnsUDPLoop(pc)
+	go g.dnsAccept(ln)
+	return nil
+}
+
+func clientOf(a net.Addr) (netip.Addr, bool) {
+	switch v := a.(type) {
+	case *net.UDPAddr:
+		ap := v.AddrPort()
+		return ap.Addr().Unmap(), ap.Addr().IsValid()
+	case *net.TCPAddr:
+		ap := v.AddrPort()
+		return ap.Addr().Unmap(), ap.Addr().IsValid()
+	}
+	return netip.Addr{}, false
+}
+
+func (g *Gateway) dnsUDPLoop(pc *gonet.UDPConn) {
 	buf := make([]byte, 4096)
 	for {
-		c.SetReadDeadline(time.Now().Add(10 * time.Second))
-		n, err := c.Read(buf)
+		n, from, err := pc.ReadFrom(buf)
 		if err != nil {
 			return
 		}
+		client, ok := clientOf(from)
+		if !ok || !g.dnsOn() {
+			continue
+		}
+		g.udpTotal.Add(1)
 		if resp := g.cfg.DNSFilter.Handle(client, append([]byte(nil), buf[:n]...), false); resp != nil {
-			c.Write(resp)
+			pc.WriteTo(resp, from)
 		}
 	}
 }
 
+func (g *Gateway) dnsAccept(ln *gonet.TCPListener) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go g.dnsTCP(c)
+	}
+}
+
 // dnsTCP is the stream form: two-byte length, then the message.
-func (g *Gateway) dnsTCP(r *tcp.ForwarderRequest) {
-	defer g.tcpFlows.Add(-1)
-	id := r.ID()
-	client := addrOf(id.RemoteAddress)
-	var wq waiter.Queue
-	ep, terr := r.CreateEndpoint(&wq)
-	if terr != nil {
-		r.Complete(true)
+func (g *Gateway) dnsTCP(c net.Conn) {
+	defer c.Close()
+	client, ok := clientOf(c.RemoteAddr())
+	if !ok || !g.dnsOn() {
 		return
 	}
-	r.Complete(false)
-	c := gonet.NewTCPConn(&wq, ep)
-	defer c.Close()
+	g.tcpTotal.Add(1)
 	var hdr [2]byte
 	for {
 		c.SetReadDeadline(time.Now().Add(10 * time.Second))
-		if _, err := readFull(c, hdr[:]); err != nil {
+		if _, err := io.ReadFull(c, hdr[:]); err != nil {
 			return
 		}
 		msg := make([]byte, binary.BigEndian.Uint16(hdr[:]))
-		if _, err := readFull(c, msg); err != nil {
+		if _, err := io.ReadFull(c, msg); err != nil {
 			return
 		}
 		resp := g.cfg.DNSFilter.Handle(client, msg, true)
@@ -90,17 +120,3 @@ func (g *Gateway) dnsTCP(r *tcp.ForwarderRequest) {
 		}
 	}
 }
-
-func readFull(c *gonet.TCPConn, b []byte) (int, error) {
-	n := 0
-	for n < len(b) {
-		k, err := c.Read(b[n:])
-		n += k
-		if err != nil {
-			return n, err
-		}
-	}
-	return n, nil
-}
-
-var _ = netip.Addr{}

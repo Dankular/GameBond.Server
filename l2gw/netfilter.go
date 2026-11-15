@@ -192,7 +192,47 @@ func (g *Gateway) firewallTable(c *compiledPolicy) stack.Table {
 	}
 }
 
-// installFirewall loads the compiled table into the stack.
+// dnsRedirect matches DNS (TCP and UDP port 53) while the DNS filter is on.
+type dnsRedirect struct {
+	g *Gateway
+	p portMatcher
+}
+
+func (m dnsRedirect) Match(h stack.Hook, pkt *stack.PacketBuffer, in, out string) (bool, bool) {
+	if !m.g.dnsOn() {
+		return false, false
+	}
+	return m.p.Match(h, pkt, in, out)
+}
+
+// natTable redirects every device's DNS to the gateway's own resolver port, whatever resolver the device was
+// given. Conntrack reverses the rewrite on the way back, so the answer still comes from the address the device
+// asked.
+func (g *Gateway) natTable() stack.Table {
+	accept := func() stack.Rule {
+		return stack.Rule{Filter: stack.EmptyFilter4(), Target: &stack.AcceptTarget{NetworkProtocol: header.IPv4ProtocolNumber}}
+	}
+	rules := []stack.Rule{
+		{Filter: stack.EmptyFilter4(), Matchers: []stack.Matcher{dnsRedirect{g: g, p: portMatcher{ports: []uint16{53}}}},
+			Target: &stack.RedirectTarget{Port: 53, NetworkProtocol: header.IPv4ProtocolNumber}},
+		accept(), // Prerouting policy
+		accept(), // Input
+		accept(), // Output
+		accept(), // Postrouting
+		{Filter: stack.EmptyFilter4(), Target: &stack.ErrorTarget{NetworkProtocol: header.IPv4ProtocolNumber}},
+	}
+	return stack.Table{
+		Rules:         rules,
+		BuiltinChains: [stack.NumHooks]int{stack.Prerouting: 0, stack.Input: 2, stack.Forward: stack.HookUnset, stack.Output: 3, stack.Postrouting: 4},
+		Underflows:    [stack.NumHooks]int{stack.Prerouting: 1, stack.Input: 2, stack.Forward: stack.HookUnset, stack.Output: 3, stack.Postrouting: 4},
+	}
+}
+
+// installFirewall loads the filter and NAT tables into the stack.
 func (g *Gateway) installFirewall() {
-	g.stack.IPTables().ForceReplaceTable(stack.FilterID, g.firewallTable(g.policy.Load()), false)
+	it := g.stack.IPTables()
+	it.ForceReplaceTable(stack.FilterID, g.firewallTable(g.policy.Load()), false)
+	if g.cfg.DNSFilter != nil {
+		it.ForceReplaceTable(stack.NATID, g.natTable(), false)
+	}
 }
