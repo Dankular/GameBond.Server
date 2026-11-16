@@ -3,8 +3,8 @@
 services:
   server:
     ports:
-      - "51820-51822:51820-51822/udp"
-      - "51823:51823/tcp"
+      - "0.0.0.0:51820:51820/udp"
+      - "0.0.0.0:51821:51821/udp"
     tmpfs:
       - /run/gamebond-backbone:rw,noexec,nosuid,size=4m,mode=0700
       - /run/frr:rw,noexec,nosuid,size=2m,mode=0755

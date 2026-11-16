@@ -1,6 +1,6 @@
 # Live three-exit backbone rollout
 
-**Status:** staged topology; node keys and activation are pending
+**Status:** topology and per-node configs are prepared; the live mesh is not activated
 
 ## Nodes
 
@@ -69,15 +69,17 @@ imported or exported. Import/export prefixes are set per neighbor as follows:
 
 Each WireGuard peer's `allowed_ips` must include its BGP peer `/32` and the
 prefixes imported from that neighbor. The deployed Compose files do not yet
-publish the backbone ports or mount the key directory. Apply
-`compose.backbone.legacy.yaml` to each release and allow UDP 51820-51822 and
-TCP 51823 only from the other two exit addresses in each host firewall. TCP
-51823 carries authenticated session recovery state over the private WG links.
+publish the backbone ports or mount the key directory. The overlay publishes
+only UDP 51820-51821 for WireGuard; TCP 51823 remains container-only because
+session recovery connects across the private WireGuard interfaces. Restrict the
+published UDP ports to the other two exit addresses in each host firewall.
 
-This first configuration brings up encrypted links and BGP reachability only.
-It does not enable gVisor failover or route client traffic over another exit.
-That requires a separately measured transit profile and explicit NAT/source
-identity design.
+This configuration brings up the encrypted mesh, exchanges only the dedicated
+overlay routes, and enables authenticated GameBond session/recovery-state sync
+over the peer links. It does not route client traffic through another exit or
+migrate gVisor TCP proxy streams, UDP mappings, NAT state, or public egress
+identity. Those behaviors require a separately measured transit profile and
+explicit source-identity design.
 
 ## DHCP authority across exits
 
@@ -99,8 +101,19 @@ The current backbone runtime starts with the GameBond server process. SIGHUP
 reloads Layer 2 host and device-policy settings only; it does not start or
 reconfigure WireGuard/FRR. Enabling the mesh on a running node therefore
 requires a process/container restart with the updated config and secret mount.
-The active `sw01` gateway had 50 live flows at the time this plan was written,
-so its restart is deferred until the operator selects a maintenance window.
+The per-node JSON in `tools/backbone/` matches the staged node keys; the public
+keys were re-derived from the private key files on each exit. The deployment
+script accepts `-EnableBackbone` to merge that config, apply the Compose overlay,
+validate Compose, restart one exit at a time, and restore the prior config if a
+node fails its health check.
+
+On 2026-11-16, a live check found no WireGuard interfaces, inactive
+`gamebond-router.service`, no listeners on 51820–51823, and no
+`exit_backbone` config on IONOS, Apps, or sw01. The client was carrying traffic
+on Apps at that check. The first activation therefore restarts the active exit
+before it has replicated any state; this can briefly interrupt the tunnel and
+cannot be described as lossless. The mesh remains inactive until that restart
+is authorized.
 
 BGP convergence does not transfer gVisor TCP endpoints, proxy sockets, UDP
 mappings, NAT state, or a public source address. The current gateway is a split

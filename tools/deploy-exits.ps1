@@ -1,6 +1,7 @@
 param(
     [string]$ImageTag,
-    [string]$SshKeyPath = (Join-Path $env:USERPROFILE 'Desktop\privkey.ppk')
+    [string]$SshKeyPath = (Join-Path $env:USERPROFILE 'Desktop\privkey.ppk'),
+    [switch]$EnableBackbone
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,6 +22,9 @@ $Nodes = @(
         WorkDir = '/opt/gamebond/releases/exit-64b7d7a'
         Service = 'server'
         Container = 'gamebond-exit-server-1'
+        ConfigPath = '/opt/gamebond/releases/exit-64b7d7a/configs/server.json'
+        BackboneConfig = 'tools/backbone/ionos.json'
+        BackbonePeerIPs = @('138.199.201.16', '195.154.119.136')
         HostKey = ''
     },
     [pscustomobject]@{
@@ -30,6 +34,9 @@ $Nodes = @(
         WorkDir = '/opt/gamebond/releases/native-live'
         Service = 'server'
         Container = 'gamebond-native-1'
+        ConfigPath = '/opt/gamebond/releases/native-live/configs/local-server.json'
+        BackboneConfig = 'tools/backbone/apps.json'
+        BackbonePeerIPs = @('194.164.124.139', '195.154.119.136')
         HostKey = $AppsHostKey
     },
     [pscustomobject]@{
@@ -39,6 +46,9 @@ $Nodes = @(
         WorkDir = '/opt/gamebond/releases/native-live'
         Service = 'server'
         Container = 'gamebond-native-1'
+        ConfigPath = '/opt/gamebond/releases/native-live/configs/local-server.json'
+        BackboneConfig = 'tools/backbone/sw01.json'
+        BackbonePeerIPs = @('194.164.124.139', '138.199.201.16')
         HostKey = ''
     }
 )
@@ -107,13 +117,27 @@ function Copy-FromNode {
 $RemoteDeployCode = @'
 import json, os, pathlib, shutil, stat, subprocess, sys, tempfile, time
 
-name, project, work, service, container, auth_file, image = sys.argv[1:]
+name, project, work, service, container, auth_file, image, config_path, backbone_file, overlay_file, firewall_file, unit_file = sys.argv[1:]
 compose_file = os.path.join(work, "compose.yaml")
 env_file = os.path.join(work, "deploy.env")
 compose = ["docker", "compose", "--project-name", project, "--env-file", env_file, "-f", compose_file]
+overlay_target = os.path.join(work, "compose.backbone.legacy.yaml")
+backbone_enabled = bool(config_path)
+if backbone_enabled:
+    compose += ["-f", overlay_target]
 auth_dir = tempfile.mkdtemp(prefix="gb-registry-")
 old_env = None
 changed_env = False
+old_config = None
+old_overlay = None
+overlay_existed = False
+changed_backbone = False
+firewall_active = False
+old_firewall_script = None
+old_firewall_unit = None
+firewall_script_existed = False
+firewall_unit_existed = False
+changed_firewall = False
 
 def run(args, **kwargs):
     kwargs.setdefault("stdout", subprocess.PIPE)
@@ -123,15 +147,15 @@ def run(args, **kwargs):
         print(completed.stdout, end="")
     return completed
 
-def write_atomic(path, data, old_stat):
+def write_atomic(path, data, old_stat=None, default_mode=0o644):
     fd, temp_path = tempfile.mkstemp(prefix=".gb-deploy-", dir=os.path.dirname(path))
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(temp_path, stat.S_IMODE(old_stat.st_mode))
-        os.chown(temp_path, old_stat.st_uid, old_stat.st_gid)
+        os.chmod(temp_path, stat.S_IMODE(old_stat.st_mode) if old_stat else default_mode)
+        os.chown(temp_path, old_stat.st_uid if old_stat else 0, old_stat.st_gid if old_stat else 0)
         os.replace(temp_path, path)
     except Exception:
         try:
@@ -148,6 +172,11 @@ def set_image_value(contents, image):
     lines[matches[0]] = "GAMEBOND_IMAGE=" + image
     return ("\n".join(lines) + "\n").encode("utf-8")
 
+def set_backbone_value(contents, backbone):
+    config = json.loads(contents)
+    config["exit_backbone"] = backbone
+    return (json.dumps(config, indent=2) + "\n").encode("utf-8")
+
 try:
     details = json.loads(subprocess.check_output(["docker", "inspect", container], text=True))[0]
     labels = details["Config"].get("Labels") or {}
@@ -158,7 +187,15 @@ try:
 
     current_health = (details["State"].get("Health") or {}).get("Status", details["State"].get("Status", "unknown"))
     current_env = pathlib.Path(env_file).read_text(encoding="utf-8")
-    if details["Config"].get("Image") == image and current_health == "healthy" and "GAMEBOND_IMAGE=" + image in current_env.splitlines():
+    already_configured = not backbone_enabled
+    if backbone_enabled:
+        current_config = json.loads(pathlib.Path(config_path).read_text(encoding="utf-8"))
+        requested_backbone = json.loads(pathlib.Path(backbone_file).read_text(encoding="utf-8"))
+        ports = details.get("NetworkSettings", {}).get("Ports") or {}
+        expected_ports = all(ports.get(port) for port in ("51820/udp", "51821/udp"))
+        firewall_active = subprocess.run(["systemctl", "is-active", "--quiet", "gamebond-backbone-firewall.service"]).returncode == 0
+        already_configured = current_config.get("exit_backbone") == requested_backbone and os.path.isfile(overlay_target) and expected_ports and firewall_active
+    if details["Config"].get("Image") == image and current_health == "healthy" and "GAMEBOND_IMAGE=" + image in current_env.splitlines() and already_configured:
         print(json.dumps({"host": name, "image": image, "image_id": details["Image"], "health": current_health, "skipped": True}))
         sys.exit(0)
 
@@ -169,9 +206,40 @@ try:
     pull_env["DOCKER_CONFIG"] = auth_dir
     run(["docker", "pull", image], env=pull_env)
 
-    run(compose + ["config", "--quiet"])
     old_env = pathlib.Path(env_file).read_bytes()
     env_stat = os.stat(env_file)
+
+    if backbone_enabled:
+        old_config = pathlib.Path(config_path).read_bytes()
+        config_stat = os.stat(config_path)
+        requested_backbone = json.loads(pathlib.Path(backbone_file).read_text(encoding="utf-8"))
+        write_atomic(config_path, set_backbone_value(old_config, requested_backbone), config_stat)
+        changed_backbone = True
+        overlay_existed = os.path.exists(overlay_target)
+        overlay_stat = os.stat(overlay_target) if overlay_existed else None
+        if overlay_existed:
+            old_overlay = pathlib.Path(overlay_target).read_bytes()
+        write_atomic(overlay_target, pathlib.Path(overlay_file).read_bytes(), overlay_stat, 0o644)
+
+        firewall_target = "/usr/local/sbin/gamebond-backbone-firewall"
+        unit_target = "/etc/systemd/system/gamebond-backbone-firewall.service"
+        os.makedirs(os.path.dirname(firewall_target), exist_ok=True)
+        os.makedirs(os.path.dirname(unit_target), exist_ok=True)
+        firewall_script_existed = os.path.exists(firewall_target)
+        firewall_unit_existed = os.path.exists(unit_target)
+        if firewall_script_existed:
+            old_firewall_script = pathlib.Path(firewall_target).read_bytes()
+        if firewall_unit_existed:
+            old_firewall_unit = pathlib.Path(unit_target).read_bytes()
+        shutil.copyfile(firewall_file, firewall_target)
+        os.chmod(firewall_target, 0o755)
+        shutil.copyfile(unit_file, unit_target)
+        os.chmod(unit_target, 0o644)
+        changed_firewall = True
+        run(["systemctl", "daemon-reload"])
+        run(["systemctl", "enable", "--now", "gamebond-backbone-firewall.service"])
+
+    run(compose + ["config", "--quiet"])
     new_env = set_image_value(old_env, image)
     write_atomic(env_file, new_env, env_stat)
     changed_env = True
@@ -199,20 +267,48 @@ try:
         raise RuntimeError("running container image does not match requested image")
     print(json.dumps({"host": name, "image": image, "image_id": current["Image"], "health": health}))
 except Exception:
-    if changed_env and old_env is not None:
+    if (changed_env and old_env is not None) or (changed_backbone and old_config is not None) or changed_firewall:
         try:
-            env_stat = os.stat(env_file)
-            write_atomic(env_file, old_env, env_stat)
-            subprocess.run(compose + ["up", "-d", "--no-deps", "--force-recreate", service], cwd=work,
+            if changed_env and old_env is not None:
+                write_atomic(env_file, old_env, os.stat(env_file))
+            rollback_compose = compose
+            if changed_backbone and old_config is not None:
+                write_atomic(config_path, old_config, os.stat(config_path))
+                if overlay_existed:
+                    write_atomic(overlay_target, old_overlay, os.stat(overlay_target))
+                else:
+                    os.unlink(overlay_target)
+                    rollback_compose = compose[:-2]
+            if changed_firewall:
+                if not firewall_active:
+                    subprocess.run(["systemctl", "disable", "--now", "gamebond-backbone-firewall.service"], check=False,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["/usr/local/sbin/gamebond-backbone-firewall", "--remove"], check=False,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if firewall_script_existed:
+                    write_atomic("/usr/local/sbin/gamebond-backbone-firewall", old_firewall_script, default_mode=0o755)
+                else:
+                    pathlib.Path("/usr/local/sbin/gamebond-backbone-firewall").unlink(missing_ok=True)
+                if firewall_unit_existed:
+                    write_atomic("/etc/systemd/system/gamebond-backbone-firewall.service", old_firewall_unit, default_mode=0o644)
+                else:
+                    pathlib.Path("/etc/systemd/system/gamebond-backbone-firewall.service").unlink(missing_ok=True)
+                subprocess.run(["systemctl", "daemon-reload"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if firewall_active:
+                    subprocess.run(["systemctl", "restart", "gamebond-backbone-firewall.service"], check=False,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(rollback_compose + ["up", "-d", "--no-deps", "--force-recreate", service], cwd=work,
                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
     raise
 finally:
-    try:
-        os.unlink(auth_file)
-    except OSError:
-        pass
+    for path in (auth_file, backbone_file, overlay_file, firewall_file, unit_file):
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
     shutil.rmtree(auth_dir, ignore_errors=True)
 '@
 
@@ -227,8 +323,35 @@ try {
         $remoteAuth = "/tmp/gb-registry-$nonce.json"
         Copy-ToNode $node $AuthLocal $remoteAuth
 
+        $remoteConfig = ''
+        $remoteOverlay = ''
+        $remoteConfigPath = ''
+        $remoteFirewall = ''
+        $remoteFirewallUnit = ''
+        if ($EnableBackbone) {
+            $localConfig = Join-Path $PSScriptRoot $node.BackboneConfig
+            $localOverlay = Join-Path $PSScriptRoot '..\compose.backbone.legacy.yaml'
+            $localFirewallTemplate = Join-Path $PSScriptRoot 'backbone\firewall-apply.sh'
+            $localFirewallUnit = Join-Path $PSScriptRoot 'backbone\firewall.service'
+            if (-not (Test-Path -LiteralPath $localConfig) -or -not (Test-Path -LiteralPath $localOverlay) -or -not (Test-Path -LiteralPath $localFirewallTemplate) -or -not (Test-Path -LiteralPath $localFirewallUnit)) {
+                throw "Backbone configuration files are missing for $($node.Name)."
+            }
+            $remoteConfig = "/tmp/gb-backbone-$nonce.json"
+            $remoteOverlay = "/tmp/gb-backbone-overlay-$nonce.yaml"
+            $remoteFirewall = "/tmp/gb-backbone-firewall-$nonce.sh"
+            $remoteFirewallUnit = "/tmp/gb-backbone-firewall-$nonce.service"
+            $remoteConfigPath = $node.ConfigPath
+            $localFirewall = Join-Path $TempRoot "firewall-$($node.Name).sh"
+            $firewallText = (Get-Content -Raw -LiteralPath $localFirewallTemplate).Replace('__PEER_IPS__', ($node.BackbonePeerIPs -join ' ')).Replace("`r`n", "`n").Replace("`r", "`n")
+            [System.IO.File]::WriteAllText($localFirewall, $firewallText, [System.Text.UTF8Encoding]::new($false))
+            Copy-ToNode $node $localConfig $remoteConfig
+            Copy-ToNode $node $localOverlay $remoteOverlay
+            Copy-ToNode $node $localFirewall $remoteFirewall
+            Copy-ToNode $node $localFirewallUnit $remoteFirewallUnit
+        }
+
         $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($RemoteDeployCode))
-        $remoteCommand = "printf '%s' '$payload' | base64 -d | python3 - '$($node.Name)' '$($node.Project)' '$($node.WorkDir)' '$($node.Service)' '$($node.Container)' '$remoteAuth' '$Image'"
+        $remoteCommand = "printf '%s' '$payload' | base64 -d | python3 - '$($node.Name)' '$($node.Project)' '$($node.WorkDir)' '$($node.Service)' '$($node.Container)' '$remoteAuth' '$Image' '$remoteConfigPath' '$remoteConfig' '$remoteOverlay' '$remoteFirewall' '$remoteFirewallUnit'"
         $output = Invoke-Plink $node $remoteCommand
         $summaryLine = @($output -split "`r?`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
         if (-not $summaryLine) { throw "$($node.Name) deploy did not return a summary: $output" }
@@ -246,7 +369,10 @@ try {
 }
 finally {
     if (Test-Path -LiteralPath $AuthLocal) { Remove-Item -LiteralPath $AuthLocal -Force }
-    if ((Test-Path -LiteralPath $TempRoot) -and -not (Get-ChildItem -LiteralPath $TempRoot -Force | Select-Object -First 1)) {
-        Remove-Item -LiteralPath $TempRoot -Force
+    if (Test-Path -LiteralPath $TempRoot) {
+        Get-ChildItem -LiteralPath $TempRoot -File -Force | Remove-Item -Force
+        if (-not (Get-ChildItem -LiteralPath $TempRoot -Force | Select-Object -First 1)) {
+            Remove-Item -LiteralPath $TempRoot -Force
+        }
     }
 }

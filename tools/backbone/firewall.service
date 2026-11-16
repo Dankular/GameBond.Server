@@ -1,0 +1,14 @@
+[Unit]
+Description=Restrict GameBond WireGuard ports to exit peers
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gamebond-backbone-firewall
+ExecStop=/usr/local/sbin/gamebond-backbone-firewall --remove
+
+[Install]
+WantedBy=multi-user.target

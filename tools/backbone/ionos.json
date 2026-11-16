@@ -1,0 +1,37 @@
+{
+  "router_id": "10.79.255.1",
+  "local_as": 4200019401,
+  "recovery_hold_down_ms": 3000,
+  "peers": [
+    {
+      "id": "apps",
+      "interface": "gb-hz0",
+      "address": "10.79.0.1/30",
+      "peer_address": "10.79.0.2",
+      "listen_port": 51820,
+      "private_key_file": "/run/secrets/gamebond-backbone/gb-hz0.key",
+      "public_key": "AKBGWhvywSPQuzxZFDfhYWKsAsxtCZz64NZgeuRFTR4=",
+      "endpoint": "138.199.201.16:51820",
+      "allowed_ips": ["10.79.0.2/32", "10.79.0.8/30"],
+      "persistent_keepalive_seconds": 25,
+      "remote_as": 4200013801,
+      "import_prefixes": ["10.79.0.8/30"],
+      "export_prefixes": ["10.79.0.0/30", "10.79.0.4/30"]
+    },
+    {
+      "id": "sw01",
+      "interface": "gb-sw0",
+      "address": "10.79.0.5/30",
+      "peer_address": "10.79.0.6",
+      "listen_port": 51821,
+      "private_key_file": "/run/secrets/gamebond-backbone/gb-sw0.key",
+      "public_key": "gtrZy9Q/hpQcB3FzgOSNq/0zYLku7fh7PhucK/737Dc=",
+      "endpoint": "195.154.119.136:51820",
+      "allowed_ips": ["10.79.0.6/32", "10.79.0.8/30"],
+      "persistent_keepalive_seconds": 25,
+      "remote_as": 4200019501,
+      "import_prefixes": ["10.79.0.8/30"],
+      "export_prefixes": ["10.79.0.0/30", "10.79.0.4/30"]
+    }
+  ]
+}
