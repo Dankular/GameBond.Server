@@ -418,9 +418,6 @@ func run(ctx context.Context, c Config, options bond.SessionOptions, address net
 		if !d.Endpoint.Addr().Is4() {
 			return bond.ErrFrame
 		}
-		if err := unix.SetsockoptInt(sock, unix.IPPROTO_IP, unix.IP_TOS, int(d.TrafficClass)); err != nil {
-			return err
-		}
 		return unix.Sendto(sock, d.Frame, unix.MSG_DONTWAIT, &unix.SockaddrInet4{Port: int(d.Endpoint.Port()), Addr: d.Endpoint.Addr().As4()})
 	}
 	inject := func(packet []byte) error {
