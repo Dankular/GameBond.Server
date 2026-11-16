@@ -235,8 +235,10 @@ try:
         ports = details.get("NetworkSettings", {}).get("Ports") or {}
         expected_ports = all(ports.get(port) for port in ("51820/udp", "51821/udp"))
         firewall_active = subprocess.run(["systemctl", "is-active", "--quiet", "gamebond-backbone-firewall.service"]).returncode == 0
+        overlay_matches = os.path.isfile(overlay_target) and pathlib.Path(overlay_target).read_bytes() == pathlib.Path(overlay_file).read_bytes()
+        firewall_matches = os.path.isfile("/usr/local/sbin/gamebond-backbone-firewall") and pathlib.Path("/usr/local/sbin/gamebond-backbone-firewall").read_bytes() == pathlib.Path(firewall_file).read_bytes()
         old_backbone_active = current_config.get("exit_backbone") is not None or expected_ports or firewall_active
-        already_configured = current_config.get("exit_backbone") == requested_backbone and os.path.isfile(overlay_target) and expected_ports and firewall_active
+        already_configured = current_config.get("exit_backbone") == requested_backbone and overlay_matches and firewall_matches and expected_ports and firewall_active
     if details["Config"].get("Image") == image and current_health == "healthy" and "GAMEBOND_IMAGE=" + image in current_env.splitlines() and already_configured:
         print(json.dumps({"host": name, "image": image, "image_id": details["Image"], "health": current_health, "skipped": True}))
         sys.exit(0)
@@ -280,6 +282,7 @@ try:
         changed_firewall = True
         run(["systemctl", "daemon-reload"])
         run(["systemctl", "enable", "--now", "gamebond-backbone-firewall.service"])
+        run(["systemctl", "restart", "gamebond-backbone-firewall.service"])
 
     run(compose + ["config", "--quiet"])
     new_env = set_image_value(old_env, image)
@@ -393,7 +396,7 @@ try {
             $remoteConfigPath = $node.ConfigPath
             $localFirewall = Join-Path $TempRoot "firewall-$($node.Name).sh"
             $localFirewallUnitPrepared = Join-Path $TempRoot "firewall-$($node.Name).service"
-            $firewallText = (Get-Content -Raw -LiteralPath $localFirewallTemplate).Replace('__PEER_IPS__', ($node.BackbonePeerIPs -join ' ')).Replace("`r`n", "`n").Replace("`r", "`n")
+            $firewallText = (Get-Content -Raw -LiteralPath $localFirewallTemplate).Replace('__PEER_IPS__', ($node.BackbonePeerIPs -join ' ')).Replace('__LOCAL_PUBLIC_IP__', $node.Host).Replace("`r`n", "`n").Replace("`r", "`n")
             $unitText = (Get-Content -Raw -LiteralPath $localFirewallUnit).Replace("`r`n", "`n").Replace("`r", "`n")
             [System.IO.File]::WriteAllText($localFirewall, $firewallText, [System.Text.UTF8Encoding]::new($false))
             [System.IO.File]::WriteAllText($localFirewallUnitPrepared, $unitText, [System.Text.UTF8Encoding]::new($false))

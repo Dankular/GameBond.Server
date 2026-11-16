@@ -2,6 +2,14 @@
 # WireGuard/FRR backbone mount and UDP ports. Apply with the release's compose.yaml.
 services:
   server:
+    # FRR's privilege initialization uses capset; gVisor exposes this capability
+    # to the sandbox when explicitly granted alongside the existing NET_ADMIN.
+    cap_add:
+      - NET_ADMIN
+      - NET_BIND_SERVICE
+      - NET_RAW
+      - SYS_ADMIN
+      - SETPCAP
     ports:
       - "0.0.0.0:51820:51820/udp"
       - "0.0.0.0:51821:51821/udp"
