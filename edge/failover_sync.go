@@ -5,6 +5,7 @@ package edge
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -35,8 +36,10 @@ type failoverStateSync struct {
 	listener  net.Listener
 	key       []byte
 	session   [16]byte
+	epoch     [16]byte
 	peers     map[netip.Addr]chan []byte
 	active    map[netip.Addr]bool
+	lastState map[netip.Addr]peerStateRevision
 	incoming  chan bond.SessionFailoverState
 	mu        sync.Mutex
 	closed    bool
@@ -46,6 +49,11 @@ type failoverStateSync struct {
 	applied   atomic.Uint64
 	rejected  atomic.Uint64
 	coalesced atomic.Uint64
+}
+
+type peerStateRevision struct {
+	epoch    [16]byte
+	revision uint64
 }
 
 func startFailoverStateSync(parent context.Context, cfg *backbone.Config, key, session []byte) (*failoverStateSync, error) {
@@ -59,9 +67,15 @@ func startFailoverStateSync(parent context.Context, cfg *backbone.Config, key, s
 	ctx, cancel := context.WithCancel(parent)
 	s := &failoverStateSync{
 		ctx: ctx, cancel: cancel, listener: listener, key: append([]byte(nil), key...),
-		peers: make(map[netip.Addr]chan []byte, len(cfg.Peers)), active: make(map[netip.Addr]bool, len(cfg.Peers)), incoming: make(chan bond.SessionFailoverState, 8),
+		peers: make(map[netip.Addr]chan []byte, len(cfg.Peers)), active: make(map[netip.Addr]bool, len(cfg.Peers)),
+		lastState: make(map[netip.Addr]peerStateRevision, len(cfg.Peers)), incoming: make(chan bond.SessionFailoverState, 8),
 	}
 	copy(s.session[:], session)
+	if _, err := rand.Read(s.epoch[:]); err != nil {
+		listener.Close()
+		cancel()
+		return nil, fmt.Errorf("create failover state epoch: %w", err)
+	}
 	for _, peer := range cfg.Peers {
 		addr, parseErr := netip.ParseAddr(peer.PeerAddress)
 		if parseErr != nil || !addr.Is4() {
@@ -80,6 +94,7 @@ func startFailoverStateSync(parent context.Context, cfg *backbone.Config, key, s
 func (s *failoverStateSync) Incoming() <-chan bond.SessionFailoverState { return s.incoming }
 
 func (s *failoverStateSync) Publish(state bond.SessionFailoverState) error {
+	state.Epoch = s.epoch
 	payload, err := json.Marshal(state)
 	if err != nil {
 		s.rejected.Add(1)
@@ -211,6 +226,7 @@ func (s *failoverStateSync) receiveLoop(conn net.Conn, addr netip.Addr) {
 		delete(s.active, addr)
 		s.mu.Unlock()
 	}()
+	var streamEpoch [16]byte
 	header := make([]byte, 44)
 	for s.ctx.Err() == nil {
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -240,6 +256,27 @@ func (s *failoverStateSync) receiveLoop(conn net.Conn, addr netip.Addr) {
 			s.rejected.Add(1)
 			return
 		}
+		if state.Epoch == ([16]byte{}) || state.Revision == 0 {
+			s.rejected.Add(1)
+			return
+		}
+		if streamEpoch == ([16]byte{}) {
+			streamEpoch = state.Epoch
+		} else if streamEpoch != state.Epoch {
+			// A process epoch cannot change on an established TCP stream. A new
+			// process must reconnect before its reset revision is accepted.
+			s.rejected.Add(1)
+			return
+		}
+		s.mu.Lock()
+		previous, seen := s.lastState[addr]
+		if seen && previous.epoch == state.Epoch && state.Revision <= previous.revision {
+			s.mu.Unlock()
+			s.rejected.Add(1)
+			continue
+		}
+		s.lastState[addr] = peerStateRevision{epoch: state.Epoch, revision: state.Revision}
+		s.mu.Unlock()
 		s.received.Add(1)
 		select {
 		case s.incoming <- state:

@@ -562,10 +562,9 @@ func run(ctx context.Context, c Config, options bond.SessionOptions, address net
 					// handshake is ready; a later active snapshot will retry.
 					// Once this exit has handled local user data, it is the new
 					// authority and must not be rolled back by a delayed old-exit copy.
-					if lastDataAt.IsZero() && state.Revision > stateRevision && engine.RestoreFailoverState(state) == nil {
+					if lastDataAt.IsZero() && engine.RestoreFailoverState(state) == nil {
 						lastData, lastDataAt = state.Stats, time.Time{}
 						stateReplicated = true
-						stateRevision = state.Revision
 						stateSync.Applied()
 					} else {
 						stateSync.Rejected()
