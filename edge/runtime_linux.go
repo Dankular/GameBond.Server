@@ -360,6 +360,14 @@ func run(ctx context.Context, c Config, options bond.SessionOptions, address net
 	if err != nil {
 		return err
 	}
+	var stateSync *failoverStateSync
+	if c.ExitBackbone != nil {
+		stateSync, err = startFailoverStateSync(ctx, c.ExitBackbone, key, session)
+		if err != nil {
+			return fmt.Errorf("start private exit failover state sync: %w", err)
+		}
+		defer stateSync.Close()
+	}
 	sock, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return err
@@ -454,6 +462,11 @@ func run(ctx context.Context, c Config, options bond.SessionOptions, address net
 	buffer := make([]byte, 65536)
 	events := make([]unix.EpollEvent, 4)
 	next := time.Now()
+	nextStateSync := next
+	var lastData bond.SessionStats
+	var lastDataAt time.Time
+	stateReplicated := false
+	var stateRevision uint64
 	reportAt := next.Add(time.Second)
 	for ctx.Err() == nil {
 		now := time.Now()
@@ -541,6 +554,44 @@ func run(ctx context.Context, c Config, options bond.SessionOptions, address net
 		if err != nil {
 			return err
 		}
+		if stateSync != nil {
+			for {
+				select {
+				case state := <-stateSync.Incoming():
+					// A warmed exit can receive snapshots before its own client
+					// handshake is ready; a later active snapshot will retry.
+					// Once this exit has handled local user data, it is the new
+					// authority and must not be rolled back by a delayed old-exit copy.
+					if lastDataAt.IsZero() && state.Revision > stateRevision && engine.RestoreFailoverState(state) == nil {
+						lastData, lastDataAt = state.Stats, time.Time{}
+						stateReplicated = true
+						stateRevision = state.Revision
+						stateSync.Applied()
+					} else {
+						stateSync.Rejected()
+					}
+				default:
+					goto stateSyncDrained
+				}
+			}
+		stateSyncDrained:
+			packets := engine.PacketStats()
+			if packets.InboundPackets != lastData.InboundPackets || packets.OutboundPackets != lastData.OutboundPackets || packets.L2Frames != lastData.L2Frames {
+				if stateReplicated {
+					engine.ActivateFailoverState()
+					stateReplicated = false
+				}
+				lastData, lastDataAt = packets, now
+			}
+			if !lastDataAt.IsZero() && now.Sub(lastDataAt) <= 250*time.Millisecond && !now.Before(nextStateSync) {
+				stateRevision++
+				state, snapshotErr := engine.SnapshotFailoverState(now, stateRevision)
+				if snapshotErr == nil {
+					_ = stateSync.Publish(state)
+				}
+				nextStateSync = now.Add(100 * time.Millisecond)
+			}
+		}
 		if !now.Before(reportAt) {
 			if l2 != nil {
 				l2.emitMulticastQueries(engine, now)
@@ -548,6 +599,9 @@ func run(ctx context.Context, c Config, options bond.SessionOptions, address net
 			}
 			stats := engine.Stats(now)
 			stats["observed_at"] = now.UTC().Format(time.RFC3339Nano)
+			if stateSync != nil {
+				stats["failover_state_sync"] = stateSync.Stats()
+			}
 			if l2 != nil {
 				stats["l2"] = l2.Stats(now)
 			}

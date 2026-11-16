@@ -20,7 +20,7 @@ require (
 )
 
 require (
-	github.com/Dankular/GameBond.Core v0.1.39
+	github.com/Dankular/GameBond.Core v0.1.43-0.20261116063124-f7c9ab99bfd4
 	golang.org/x/net v0.62.0
 	gvisor.dev/gvisor v0.0.0-20250503011706-39ed1f5ac29c
 )
