@@ -4,6 +4,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Docker Compose and PuTTY write routine progress to stderr. PowerShell 7 can
+# promote native stderr lines to terminating errors when this preference is on.
+$PSNativeCommandUseErrorActionPreference = $false
 
 $PlinkPath = 'C:\Program Files (x86)\PuTTY\plink.exe'
 $PscpPath = 'C:\Program Files (x86)\PuTTY\pscp.exe'
@@ -113,7 +116,12 @@ old_env = None
 changed_env = False
 
 def run(args, **kwargs):
-    return subprocess.run(args, check=True, **kwargs)
+    kwargs.setdefault("stdout", subprocess.PIPE)
+    kwargs.setdefault("stderr", subprocess.STDOUT)
+    completed = subprocess.run(args, check=True, text=True, **kwargs)
+    if completed.stdout:
+        print(completed.stdout, end="")
+    return completed
 
 def write_atomic(path, data, old_stat):
     fd, temp_path = tempfile.mkstemp(prefix=".gb-deploy-", dir=os.path.dirname(path))
@@ -147,6 +155,12 @@ try:
         raise RuntimeError("live container Compose labels do not match the configured target")
     if labels.get("com.docker.compose.project.working_dir") != work:
         raise RuntimeError("live container Compose work directory does not match the configured target")
+
+    current_health = (details["State"].get("Health") or {}).get("Status", details["State"].get("Status", "unknown"))
+    current_env = pathlib.Path(env_file).read_text(encoding="utf-8")
+    if details["Config"].get("Image") == image and current_health == "healthy" and "GAMEBOND_IMAGE=" + image in current_env.splitlines():
+        print(json.dumps({"host": name, "image": image, "image_id": details["Image"], "health": current_health, "skipped": True}))
+        sys.exit(0)
 
     os.chmod(auth_file, 0o600)
     shutil.copyfile(auth_file, os.path.join(auth_dir, "config.json"))
