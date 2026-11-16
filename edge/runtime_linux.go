@@ -342,9 +342,8 @@ func refreshDHCPSourceGuardBindings(fabric *SegmentFabric, gateways []*l2Edge) e
 
 func run(ctx context.Context, c Config, options bond.SessionOptions, address netip.AddrPort, session, key []byte, output io.Writer, fabric *SegmentFabric, observers ...func(map[string]any)) error {
 	options.Version = buildinfo.Commit
-	// This runtime enables IP_RECVTOS below and observes the outer ECN field on
-	// every received UDP datagram, so it can advertise RFC 6040 decapsulation.
-	options.ECN = true
+	// ECN decapsulation is unavailable in the published Core dependency yet.
+	// Keep it unnegotiated until the Core release containing UDPWithOuterECN lands.
 	// The update probe drops this file just before it replaces the container, so clients can
 	// tell a planned restart from an outage.
 	options.State = func() string {
@@ -370,9 +369,6 @@ func run(ctx context.Context, c Config, options bond.SessionOptions, address net
 		return err
 	}
 	if err = unix.SetsockoptInt(sock, unix.SOL_SOCKET, unix.SO_RCVBUF, 4*1024*1024); err != nil {
-		return err
-	}
-	if err = unix.SetsockoptInt(sock, unix.IPPROTO_IP, unix.IP_RECVTOS, 1); err != nil {
 		return err
 	}
 	if err = configurePathMTUDiscoverySocket(sock, options.PathMTUDiscovery); err != nil {
@@ -459,7 +455,6 @@ func run(ctx context.Context, c Config, options bond.SessionOptions, address net
 		return err
 	}
 	buffer := make([]byte, 65536)
-	oob := make([]byte, 128)
 	events := make([]unix.EpollEvent, 4)
 	next := time.Now()
 	reportAt := next.Add(time.Second)
@@ -483,7 +478,7 @@ func run(ctx context.Context, c Config, options bond.SessionOptions, address net
 			fd := int(event.Fd)
 			for batch := 0; batch < 64; batch++ {
 				if fd == sock {
-					size, oobSize, _, from, err := unix.Recvmsg(sock, buffer, oob, unix.MSG_DONTWAIT)
+					size, from, err := unix.Recvfrom(sock, buffer, unix.MSG_DONTWAIT)
 					if err == unix.EAGAIN {
 						break
 					}
@@ -500,26 +495,7 @@ func run(ctx context.Context, c Config, options bond.SessionOptions, address net
 					if !ok {
 						continue
 					}
-					endpoint := netip.AddrPortFrom(netip.AddrFrom4(peer.Addr), uint16(peer.Port))
-					hasECN := false
-					var outerECN byte
-					if oobSize > 0 {
-						if messages, parseErr := unix.ParseSocketControlMessage(oob[:oobSize]); parseErr == nil {
-							for _, message := range messages {
-								if message.Header.Level == unix.IPPROTO_IP && message.Header.Type == unix.IP_TOS && len(message.Data) > 0 {
-									outerECN = message.Data[0] & 3
-									hasECN = true
-									break
-								}
-							}
-						}
-					}
-					if hasECN {
-						err = engine.UDPWithOuterECN(buffer[:size], endpoint, time.Now(), write, outerECN)
-					} else {
-						err = engine.UDP(buffer[:size], endpoint, time.Now(), write)
-					}
-					if err != nil {
+					if err = engine.UDP(buffer[:size], netip.AddrPortFrom(netip.AddrFrom4(peer.Addr), uint16(peer.Port)), time.Now(), write); err != nil {
 						return err
 					}
 				} else if l2 != nil && l2.gw != nil && fd == l2.fd {
