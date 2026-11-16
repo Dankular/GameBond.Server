@@ -23,7 +23,7 @@ $Nodes = @(
         Service = 'server'
         Container = 'gamebond-exit-server-1'
         ConfigPath = '/opt/gamebond/releases/exit-64b7d7a/configs/server.json'
-        BackboneConfig = 'tools/backbone/ionos.json'
+        BackboneConfig = 'backbone/ionos.json'
         BackbonePeerIPs = @('138.199.201.16', '195.154.119.136')
         HostKey = ''
     },
@@ -35,7 +35,7 @@ $Nodes = @(
         Service = 'server'
         Container = 'gamebond-native-1'
         ConfigPath = '/opt/gamebond/releases/native-live/configs/local-server.json'
-        BackboneConfig = 'tools/backbone/apps.json'
+        BackboneConfig = 'backbone/apps.json'
         BackbonePeerIPs = @('194.164.124.139', '195.154.119.136')
         HostKey = $AppsHostKey
     },
@@ -47,7 +47,7 @@ $Nodes = @(
         Service = 'server'
         Container = 'gamebond-native-1'
         ConfigPath = '/opt/gamebond/releases/native-live/configs/local-server.json'
-        BackboneConfig = 'tools/backbone/sw01.json'
+        BackboneConfig = 'backbone/sw01.json'
         BackbonePeerIPs = @('194.164.124.139', '138.199.201.16')
         HostKey = ''
     }
@@ -69,6 +69,22 @@ if ($ImageTag -notmatch '^[0-9a-f]{40}$') {
 }
 $Image = "$ImageName`:$ImageTag"
 
+if ($EnableBackbone) {
+    $localOverlay = Join-Path $PSScriptRoot '..\compose.backbone.legacy.yaml'
+    $localFirewallTemplate = Join-Path $PSScriptRoot 'backbone\firewall-apply.sh'
+    $localFirewallUnit = Join-Path $PSScriptRoot 'backbone\firewall.service'
+    if (-not (Test-Path -LiteralPath $localOverlay) -or -not (Test-Path -LiteralPath $localFirewallTemplate) -or -not (Test-Path -LiteralPath $localFirewallUnit)) {
+        throw 'Backbone overlay or firewall files are missing.'
+    }
+    foreach ($node in $Nodes) {
+        $localConfig = Join-Path $PSScriptRoot $node.BackboneConfig
+        if (-not (Test-Path -LiteralPath $localConfig)) {
+            throw "Backbone configuration file is missing for $($node.Name): $localConfig"
+        }
+        $null = Get-Content -Raw -LiteralPath $localConfig | ConvertFrom-Json
+    }
+}
+
 $TempRoot = Join-Path ([IO.Path]::GetTempPath()) "gamebond-deploy-$([guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Path $TempRoot | Out-Null
 $AuthLocal = Join-Path $TempRoot 'registry-config.json'
@@ -81,8 +97,16 @@ function Invoke-Plink {
     if ($Node.HostKey) { $plinkArgs += @('-hostkey', $Node.HostKey) }
     $plinkArgs += "root@$($Node.Host)"
     $plinkArgs += $RemoteCommand
-    $output = & $PlinkPath @plinkArgs 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & $PlinkPath @plinkArgs 2>&1
+        $nativeExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    if ($nativeExitCode -ne 0) {
         throw "$($Node.Name) SSH command failed: $($output -join ' ')"
     }
     return ($output -join "`n").Trim()
@@ -95,8 +119,16 @@ function Copy-ToNode {
     if ($Node.HostKey) { $pscpArgs += @('-hostkey', $Node.HostKey) }
     $pscpArgs += $LocalPath
     $pscpArgs += "root@$($Node.Host):$RemotePath"
-    $output = & $PscpPath @pscpArgs 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & $PscpPath @pscpArgs 2>&1
+        $nativeExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    if ($nativeExitCode -ne 0) {
         throw "$($Node.Name) file staging failed: $($output -join ' ')"
     }
 }
@@ -108,8 +140,16 @@ function Copy-FromNode {
     if ($Node.HostKey) { $pscpArgs += @('-hostkey', $Node.HostKey) }
     $pscpArgs += "root@$($Node.Host):$RemotePath"
     $pscpArgs += $LocalPath
-    $output = & $PscpPath @pscpArgs 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & $PscpPath @pscpArgs 2>&1
+        $nativeExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    if ($nativeExitCode -ne 0) {
         throw "$($Node.Name) file retrieval failed: $($output -join ' ')"
     }
 }
@@ -132,6 +172,7 @@ old_config = None
 old_overlay = None
 overlay_existed = False
 changed_backbone = False
+old_backbone_active = False
 firewall_active = False
 old_firewall_script = None
 old_firewall_unit = None
@@ -194,6 +235,7 @@ try:
         ports = details.get("NetworkSettings", {}).get("Ports") or {}
         expected_ports = all(ports.get(port) for port in ("51820/udp", "51821/udp"))
         firewall_active = subprocess.run(["systemctl", "is-active", "--quiet", "gamebond-backbone-firewall.service"]).returncode == 0
+        old_backbone_active = current_config.get("exit_backbone") is not None or expected_ports or firewall_active
         already_configured = current_config.get("exit_backbone") == requested_backbone and os.path.isfile(overlay_target) and expected_ports and firewall_active
     if details["Config"].get("Image") == image and current_health == "healthy" and "GAMEBOND_IMAGE=" + image in current_env.splitlines() and already_configured:
         print(json.dumps({"host": name, "image": image, "image_id": details["Image"], "health": current_health, "skipped": True}))
@@ -266,7 +308,18 @@ try:
     if current["Config"]["Image"] != image:
         raise RuntimeError("running container image does not match requested image")
     print(json.dumps({"host": name, "image": image, "image_id": current["Image"], "health": health}))
-except Exception:
+except Exception as error:
+    print("DEPLOY_ERROR: " + repr(error))
+    failed_id = locals().get("container_id")
+    if failed_id:
+        try:
+            failed_logs = subprocess.run(["docker", "logs", "--tail", "40", failed_id], stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True, check=False).stdout
+            for line in failed_logs.splitlines():
+                if any(word in line.lower() for word in ("error", "failed", "backbone", "wireguard", "bgp", "frr")):
+                    print("CONTAINER_LOG: " + line[:1800])
+        except Exception as log_error:
+            print("CONTAINER_LOG_ERROR: " + repr(log_error))
     if (changed_env and old_env is not None) or (changed_backbone and old_config is not None) or changed_firewall:
         try:
             if changed_env and old_env is not None:
@@ -274,10 +327,13 @@ except Exception:
             rollback_compose = compose
             if changed_backbone and old_config is not None:
                 write_atomic(config_path, old_config, os.stat(config_path))
-                if overlay_existed:
+                if overlay_existed and old_backbone_active:
                     write_atomic(overlay_target, old_overlay, os.stat(overlay_target))
                 else:
-                    os.unlink(overlay_target)
+                    try:
+                        os.unlink(overlay_target)
+                    except FileNotFoundError:
+                        pass
                     rollback_compose = compose[:-2]
             if changed_firewall:
                 if not firewall_active:
@@ -330,24 +386,21 @@ try {
         $remoteFirewallUnit = ''
         if ($EnableBackbone) {
             $localConfig = Join-Path $PSScriptRoot $node.BackboneConfig
-            $localOverlay = Join-Path $PSScriptRoot '..\compose.backbone.legacy.yaml'
-            $localFirewallTemplate = Join-Path $PSScriptRoot 'backbone\firewall-apply.sh'
-            $localFirewallUnit = Join-Path $PSScriptRoot 'backbone\firewall.service'
-            if (-not (Test-Path -LiteralPath $localConfig) -or -not (Test-Path -LiteralPath $localOverlay) -or -not (Test-Path -LiteralPath $localFirewallTemplate) -or -not (Test-Path -LiteralPath $localFirewallUnit)) {
-                throw "Backbone configuration files are missing for $($node.Name)."
-            }
             $remoteConfig = "/tmp/gb-backbone-$nonce.json"
             $remoteOverlay = "/tmp/gb-backbone-overlay-$nonce.yaml"
             $remoteFirewall = "/tmp/gb-backbone-firewall-$nonce.sh"
             $remoteFirewallUnit = "/tmp/gb-backbone-firewall-$nonce.service"
             $remoteConfigPath = $node.ConfigPath
             $localFirewall = Join-Path $TempRoot "firewall-$($node.Name).sh"
+            $localFirewallUnitPrepared = Join-Path $TempRoot "firewall-$($node.Name).service"
             $firewallText = (Get-Content -Raw -LiteralPath $localFirewallTemplate).Replace('__PEER_IPS__', ($node.BackbonePeerIPs -join ' ')).Replace("`r`n", "`n").Replace("`r", "`n")
+            $unitText = (Get-Content -Raw -LiteralPath $localFirewallUnit).Replace("`r`n", "`n").Replace("`r", "`n")
             [System.IO.File]::WriteAllText($localFirewall, $firewallText, [System.Text.UTF8Encoding]::new($false))
+            [System.IO.File]::WriteAllText($localFirewallUnitPrepared, $unitText, [System.Text.UTF8Encoding]::new($false))
             Copy-ToNode $node $localConfig $remoteConfig
             Copy-ToNode $node $localOverlay $remoteOverlay
             Copy-ToNode $node $localFirewall $remoteFirewall
-            Copy-ToNode $node $localFirewallUnit $remoteFirewallUnit
+            Copy-ToNode $node $localFirewallUnitPrepared $remoteFirewallUnit
         }
 
         $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($RemoteDeployCode))
