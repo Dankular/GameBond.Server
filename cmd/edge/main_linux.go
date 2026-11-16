@@ -98,11 +98,13 @@ func run() (runErr error) {
 			return fmt.Errorf("start exit backbone: %w", err)
 		}
 		defer backboneRuntime.Close()
-		go backboneRuntime.Monitor(ctx, func(name string, healthy bool, reason string) {
-			if err := edge.SetEgressPathHealth(name, healthy, reason); err != nil {
-				log.Printf("publish exit backbone path health for %s: %v", name, err)
-			}
-		})
+		if edge.HasDynamicEgressPaths(c.L2) {
+			go backboneRuntime.Monitor(ctx, func(name string, healthy bool, reason string) {
+				if err := edge.SetEgressPathHealth(name, healthy, reason); err != nil {
+					log.Printf("publish exit backbone path health for %s: %v", name, err)
+				}
+			})
+		}
 	} else if err := edge.StartBGPPathHealthMonitor(ctx, os.Getenv("GAMEBOND_GATEWAY_SOCKET"), c.L2); err != nil {
 		return fmt.Errorf("start BGP egress health monitor: %w", err)
 	}

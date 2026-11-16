@@ -19,6 +19,14 @@ type bgpPathBinding struct {
 	recoveryHoldDown time.Duration
 }
 
+// HasDynamicEgressPaths reports whether the Layer 2 config has BGP-backed
+// paths whose health should be published to the live gateway. A backbone may
+// also run as a warm control-plane mesh before any transit path is enabled.
+func HasDynamicEgressPaths(config *L2Config) bool {
+	bindings, err := bgpPathBindings(config)
+	return err == nil && len(bindings) > 0
+}
+
 // StartBGPPathHealthMonitor subscribes gVisor egress path health to the local
 // host gateway's FRR status API. The host gateway owns WireGuard and BGP; the
 // container receives only the per-neighbor established state it needs for flow

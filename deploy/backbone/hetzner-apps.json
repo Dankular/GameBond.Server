@@ -1,0 +1,39 @@
+{
+  "router_id": "10.79.255.2",
+  "local_as": 4200013801,
+  "keepalive_seconds": 1,
+  "hold_seconds": 3,
+  "recovery_hold_down_ms": 3000,
+  "peers": [
+    {
+      "id": "ionos",
+      "interface": "gb-ionos",
+      "address": "10.79.0.2/30",
+      "peer_address": "10.79.0.1",
+      "listen_port": 51820,
+      "private_key_file": "/run/secrets/gamebond-backbone/gb-ionos.key",
+      "public_key": "w/qLnrA/kTP4MADPPzFEd81OiljZmfqGknOwhHI2Qis=",
+      "endpoint": "194.164.124.139:51820",
+      "allowed_ips": ["10.79.0.1/32", "10.79.0.4/30"],
+      "persistent_keepalive_seconds": 25,
+      "remote_as": 4200019401,
+      "import_prefixes": ["10.79.0.4/30"],
+      "export_prefixes": ["10.79.0.0/30", "10.79.0.8/30"]
+    },
+    {
+      "id": "scaleway",
+      "interface": "gb-sw0",
+      "address": "10.79.0.9/30",
+      "peer_address": "10.79.0.10",
+      "listen_port": 51821,
+      "private_key_file": "/run/secrets/gamebond-backbone/gb-sw0.key",
+      "public_key": "xzCNly4SyjFJoPp5OzW9qp5zsm8Lc+PkRxDzbSjoxlc=",
+      "endpoint": "195.154.119.136:51821",
+      "allowed_ips": ["10.79.0.10/32", "10.79.0.4/30"],
+      "persistent_keepalive_seconds": 25,
+      "remote_as": 4200019501,
+      "import_prefixes": ["10.79.0.4/30"],
+      "export_prefixes": ["10.79.0.0/30", "10.79.0.8/30"]
+    }
+  ]
+}
