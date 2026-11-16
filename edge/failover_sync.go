@@ -24,8 +24,9 @@ import (
 )
 
 const (
-	failoverSyncPort = 51823
-	failoverSyncMax  = 16 << 20
+	failoverSyncPort   = 51823
+	failoverSyncMax    = 16 << 20
+	failoverFullResync = 2 * time.Second
 )
 
 var failoverSyncMagic = [8]byte{'G', 'B', 'F', 'S', 'Y', 'N', 'C', 1}
@@ -37,7 +38,7 @@ type failoverStateSync struct {
 	key       []byte
 	session   [16]byte
 	epoch     [16]byte
-	peers     map[netip.Addr]chan []byte
+	peers     map[netip.Addr]chan bond.SessionFailoverState
 	active    map[netip.Addr]bool
 	lastState map[netip.Addr]peerStateRevision
 	incoming  chan bond.SessionFailoverState
@@ -67,7 +68,7 @@ func startFailoverStateSync(parent context.Context, cfg *backbone.Config, key, s
 	ctx, cancel := context.WithCancel(parent)
 	s := &failoverStateSync{
 		ctx: ctx, cancel: cancel, listener: listener, key: append([]byte(nil), key...),
-		peers: make(map[netip.Addr]chan []byte, len(cfg.Peers)), active: make(map[netip.Addr]bool, len(cfg.Peers)),
+		peers: make(map[netip.Addr]chan bond.SessionFailoverState, len(cfg.Peers)), active: make(map[netip.Addr]bool, len(cfg.Peers)),
 		lastState: make(map[netip.Addr]peerStateRevision, len(cfg.Peers)), incoming: make(chan bond.SessionFailoverState, 8),
 	}
 	copy(s.session[:], session)
@@ -83,7 +84,7 @@ func startFailoverStateSync(parent context.Context, cfg *backbone.Config, key, s
 			cancel()
 			return nil, errors.New("invalid failover sync peer address")
 		}
-		out := make(chan []byte, 1)
+		out := make(chan bond.SessionFailoverState, 1)
 		s.peers[addr] = out
 		go s.peerLoop(addr, out)
 	}
@@ -94,28 +95,14 @@ func startFailoverStateSync(parent context.Context, cfg *backbone.Config, key, s
 func (s *failoverStateSync) Incoming() <-chan bond.SessionFailoverState { return s.incoming }
 
 func (s *failoverStateSync) Publish(state bond.SessionFailoverState) error {
-	state.Epoch = s.epoch
-	payload, err := json.Marshal(state)
-	if err != nil {
-		s.rejected.Add(1)
-		return fmt.Errorf("encode failover state: %w", err)
-	}
-	if len(payload) == 0 || len(payload) > failoverSyncMax {
+	if !state.Full || state.BaseRevision != 0 {
 		s.rejected.Add(1)
 		return bond.ErrRecoveryState
 	}
-	frame := make([]byte, 8+4+sha256.Size+len(payload))
-	copy(frame[:8], failoverSyncMagic[:])
-	binary.BigEndian.PutUint32(frame[8:12], uint32(len(payload)))
-	copy(frame[44:], payload)
-	mac := hmac.New(sha256.New, s.key)
-	_, _ = mac.Write(s.session[:])
-	_, _ = mac.Write(frame[:12])
-	_, _ = mac.Write(payload)
-	copy(frame[12:44], mac.Sum(nil))
+	state.Epoch = s.epoch
 	for _, out := range s.peers {
 		select {
-		case out <- frame:
+		case out <- state:
 		default:
 			s.coalesced.Add(1)
 			select {
@@ -123,13 +110,12 @@ func (s *failoverStateSync) Publish(state bond.SessionFailoverState) error {
 			default:
 			}
 			select {
-			case out <- frame:
+			case out <- state:
 			default:
 			}
 		}
 	}
 	s.sent.Add(1)
-	s.sentBytes.Add(uint64(len(payload)))
 	return nil
 }
 
@@ -149,7 +135,7 @@ func (s *failoverStateSync) Stats() map[string]any {
 	}
 }
 
-func (s *failoverStateSync) peerLoop(addr netip.Addr, updates <-chan []byte) {
+func (s *failoverStateSync) peerLoop(addr netip.Addr, updates <-chan bond.SessionFailoverState) {
 	target := net.JoinHostPort(addr.String(), strconv.Itoa(failoverSyncPort))
 	for {
 		if s.ctx.Err() != nil {
@@ -163,17 +149,42 @@ func (s *failoverStateSync) peerLoop(addr netip.Addr, updates <-chan []byte) {
 			}
 			continue
 		}
+		var baseline *bond.SessionFailoverState
+		var lastFull time.Time
 		for {
 			select {
 			case <-s.ctx.Done():
 				conn.Close()
 				return
-			case frame := <-updates:
+			case current := <-updates:
+				state := current
+				full := baseline == nil || time.Since(lastFull) >= failoverFullResync
+				if !full {
+					state = failoverStateDelta(*baseline, current)
+				}
+				frame, err := s.encodeState(state)
+				if err != nil {
+					s.rejected.Add(1)
+					if !full {
+						state = current
+						frame, err = s.encodeState(state)
+					}
+					if err != nil {
+						continue
+					}
+					full = true
+				}
 				_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
 				if err := writeAll(conn, frame); err != nil {
 					conn.Close()
 					goto reconnect
 				}
+				copyOfCurrent := current
+				baseline = &copyOfCurrent
+				if full {
+					lastFull = time.Now()
+				}
+				s.sentBytes.Add(uint64(len(frame) - 44))
 			}
 		}
 	reconnect:
@@ -181,6 +192,67 @@ func (s *failoverStateSync) peerLoop(addr netip.Addr, updates <-chan []byte) {
 			return
 		}
 	}
+}
+
+func (s *failoverStateSync) encodeState(state bond.SessionFailoverState) ([]byte, error) {
+	payload, err := json.Marshal(state)
+	if err != nil {
+		return nil, fmt.Errorf("encode failover state: %w", err)
+	}
+	if len(payload) == 0 || len(payload) > failoverSyncMax {
+		return nil, bond.ErrRecoveryState
+	}
+	frame := make([]byte, 8+4+sha256.Size+len(payload))
+	copy(frame[:8], failoverSyncMagic[:])
+	binary.BigEndian.PutUint32(frame[8:12], uint32(len(payload)))
+	copy(frame[44:], payload)
+	mac := hmac.New(sha256.New, s.key)
+	_, _ = mac.Write(s.session[:])
+	_, _ = mac.Write(frame[:12])
+	_, _ = mac.Write(payload)
+	copy(frame[12:44], mac.Sum(nil))
+	return frame, nil
+}
+
+func failoverStateDelta(previous, current bond.SessionFailoverState) bond.SessionFailoverState {
+	state := current
+	state.Full = false
+	state.BaseRevision = previous.Revision
+	state.Sender.Full = false
+	state.Sender.Flows = append([]bond.SendFlowState(nil), current.Sender.Flows...)
+	previousRepairs := make(map[bond.MissingPacket]bond.RepairEntryState, len(previous.Sender.Repairs))
+	for _, entry := range previous.Sender.Repairs {
+		previousRepairs[entry.Key] = entry
+	}
+	currentRepairs := make(map[bond.MissingPacket]struct{}, len(current.Sender.Repairs))
+	state.Sender.Repairs = nil
+	for _, entry := range current.Sender.Repairs {
+		currentRepairs[entry.Key] = struct{}{}
+		old, exists := previousRepairs[entry.Key]
+		if !exists || old.At != entry.At || old.Attempts != entry.Attempts || old.Sent != entry.Sent || old.Lost != entry.Lost || !bytesEqual(old.Payload, entry.Payload) {
+			entry.Payload = append([]byte(nil), entry.Payload...)
+			state.Sender.Repairs = append(state.Sender.Repairs, entry)
+		}
+	}
+	state.Sender.Removed = nil
+	for key := range previousRepairs {
+		if _, exists := currentRepairs[key]; !exists {
+			state.Sender.Removed = append(state.Sender.Removed, key)
+		}
+	}
+	return state
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *failoverStateSync) acceptLoop() {
@@ -280,16 +352,8 @@ func (s *failoverStateSync) receiveLoop(conn net.Conn, addr netip.Addr) {
 		s.received.Add(1)
 		select {
 		case s.incoming <- state:
-		default:
-			s.rejected.Add(1)
-			select {
-			case <-s.incoming:
-			default:
-			}
-			select {
-			case s.incoming <- state:
-			default:
-			}
+		case <-s.ctx.Done():
+			return
 		}
 	}
 }

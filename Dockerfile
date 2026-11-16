@@ -1,8 +1,7 @@
 FROM golang:1.26-bookworm AS build
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
 COPY . .
+RUN go mod edit -replace=github.com/Dankular/GameBond.Core=./.build/GameBond.Core && go mod download
 ARG GIT_COMMIT=dev
 RUN GOFLAGS=-buildvcs=false CGO_ENABLED=0 GOOS=linux go build -ldflags "-X github.com/Dankular/GameBond.Core/buildinfo.Commit=${GIT_COMMIT}" -o /out/gamebond-native-edge ./cmd/edge
 RUN GOFLAGS=-buildvcs=false CGO_ENABLED=0 GOOS=linux go build -o /out/gamebond-gatewayd ./cmd/gatewayd

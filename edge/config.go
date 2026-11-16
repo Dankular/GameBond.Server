@@ -322,8 +322,9 @@ type L2MonitorConfig struct {
 	ExitEgress    bool   `json:"exit_egress,omitempty"`
 }
 
-// L2Bridge is the addressing of the bridged segment. Each exit has its own config, so give the
-// exits disjoint DHCP ranges (and the same Address): devices then keep their gateway across a failover.
+// L2Bridge is the addressing of the bridged segment. For a segment reachable through multiple
+// exits, one shared gateway owns DHCP lease state and exits provide the L2 path to it. Do not
+// configure independent pools on those exits. DHCPRelay4 is available when the gateway is routed.
 type L2Bridge struct {
 	Address            string          `json:"address"`                       // gateway address with prefix, default 10.78.0.1/24
 	IPv6Address        string          `json:"ipv6_address,omitempty"`        // optional IPv6 gateway address/prefix for statically configured clients
@@ -371,8 +372,8 @@ type L2LLDPMEDPolicy struct {
 	DSCP            uint8  `json:"dscp,omitempty"`
 }
 
-// L2BridgeVLAN maps one tagged VLAN to an independent gateway, DHCP pool,
-// static-binding set, and device policy.
+// L2BridgeVLAN maps one tagged VLAN to its gateway address, DHCP attachment,
+// static bindings, and device policy.
 type L2BridgeVLAN struct {
 	VLANID        uint16           `json:"vlan_id"`
 	Gateway       *L2Bridge        `json:"gateway"`

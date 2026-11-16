@@ -559,10 +559,20 @@ func run(ctx context.Context, c Config, options bond.SessionOptions, address net
 				select {
 				case state := <-stateSync.Incoming():
 					// A warmed exit can receive snapshots before its own client
-					// handshake is ready; a later active snapshot will retry.
+					// handshake is ready; periodic full snapshots retry the baseline.
 					// Once this exit has handled local user data, it is the new
 					// authority and must not be rolled back by a delayed old-exit copy.
-					if lastDataAt.IsZero() && engine.RestoreFailoverState(state) == nil {
+					var restoreErr error
+					if lastDataAt.IsZero() {
+						if state.Full {
+							restoreErr = engine.RestoreFailoverState(state)
+						} else {
+							restoreErr = engine.ApplyFailoverStateDelta(state)
+						}
+					} else {
+						restoreErr = bond.ErrRecoveryState
+					}
+					if restoreErr == nil {
 						lastData, lastDataAt = state.Stats, time.Time{}
 						stateReplicated = true
 						stateSync.Applied()

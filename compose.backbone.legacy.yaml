@@ -1,0 +1,17 @@
+# Overlay for deployed exit releases whose Compose file predates the in-container
+# WireGuard/FRR backbone mount and UDP ports. Apply with the release's compose.yaml.
+services:
+  server:
+    ports:
+      - "51820-51822:51820-51822/udp"
+      - "51823:51823/tcp"
+    tmpfs:
+      - /run/gamebond-backbone:rw,noexec,nosuid,size=4m,mode=0700
+      - /run/frr:rw,noexec,nosuid,size=2m,mode=0755
+    volumes:
+      - type: bind
+        source: ./secrets/backbone
+        target: /run/secrets/gamebond-backbone
+        read_only: true
+        bind:
+          create_host_path: false

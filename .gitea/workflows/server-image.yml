@@ -19,6 +19,14 @@ jobs:
           git init -q "$W/src" && cd "$W/src"
           git -c http.version=HTTP/1.1 fetch -q --depth 1 "https://dan:${REG_TOKEN}@${HOST}/${{ gitea.repository }}.git" "$SHA"
           git checkout -q FETCH_HEAD
+          CORE_VERSION=$(awk '$1 == "github.com/Dankular/GameBond.Core" {print $2}' go.mod)
+          CORE_HASH=${CORE_VERSION##*-}
+          [[ "$CORE_HASH" =~ ^[0-9a-f]{12}$ ]]
+          mkdir -p .build/GameBond.Core
+          git init -q .build/GameBond.Core
+          git -c http.version=HTTP/1.1 -C .build/GameBond.Core fetch -q --depth 1 "https://dan:${REG_TOKEN}@${HOST}/dan/GameBond.Core.git" "refs/tags/core-${CORE_HASH}"
+          git -C .build/GameBond.Core checkout -q FETCH_HEAD
+          [[ "$(git -C .build/GameBond.Core rev-parse --short=12 HEAD)" == "$CORE_HASH" ]]
           echo "$REG_TOKEN" | docker login "$HOST" -u dan --password-stdin
           nice -n 15 docker build --memory 1g --build-arg GIT_COMMIT="$SHA" -t "$IMAGE:$SHA" .
           docker push "$IMAGE:$SHA"

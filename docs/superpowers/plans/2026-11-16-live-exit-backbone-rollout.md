@@ -68,15 +68,30 @@ imported or exported. Import/export prefixes are set per neighbor as follows:
 | Scaleway | Hetzner | `10.79.0.0/30` | `10.79.0.4/30`, `10.79.0.8/30` |
 
 Each WireGuard peer's `allowed_ips` must include its BGP peer `/32` and the
-prefixes imported from that neighbor. Host firewalls must allow UDP 51820 and
-51821 only from the other two exit addresses. The IONOS service currently
-publishes only its GameBond tunnel and admin ports, so its Compose release must
-also publish the backbone UDP ports before its peers can connect.
+prefixes imported from that neighbor. The deployed Compose files do not yet
+publish the backbone ports or mount the key directory. Apply
+`compose.backbone.legacy.yaml` to each release and allow UDP 51820-51822 and
+TCP 51823 only from the other two exit addresses in each host firewall. TCP
+51823 carries authenticated session recovery state over the private WG links.
 
 This first configuration brings up encrypted links and BGP reachability only.
 It does not enable gVisor failover or route client traffic over another exit.
 That requires a separately measured transit profile and explicit NAT/source
 identity design.
+
+## DHCP authority across exits
+
+DHCP lease state belongs to one gateway service, not to each exit. Exits provide
+the L2 path to that authority, whichever exit currently carries the client
+session. Do not configure independent lease pools on the exits or copy lease
+databases during failover. DHCP state is deliberately excluded from GameBond
+packet-recovery snapshots.
+
+The current three nodes each run an exit container, but none runs the separate
+`gamebond-gatewayd`/Kea service. Their exit-side L2 gateways have local DHCP
+support, so that is not yet the required single-authority deployment. The
+gateway owner and its service address must be established before replacing the
+working DHCP path; the active-exit transport must reach that same gateway.
 
 ## Activation and continuity
 
