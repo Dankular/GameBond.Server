@@ -342,6 +342,8 @@ func refreshDHCPSourceGuardBindings(fabric *SegmentFabric, gateways []*l2Edge) e
 
 func run(ctx context.Context, c Config, options bond.SessionOptions, address netip.AddrPort, session, key []byte, output io.Writer, fabric *SegmentFabric, observers ...func(map[string]any)) error {
 	options.Version = buildinfo.Commit
+	// ECN decapsulation is unavailable in the published Core dependency yet.
+	// Keep it unnegotiated until the Core release containing UDPWithOuterECN lands.
 	// The update probe drops this file just before it replaces the container, so clients can
 	// tell a planned restart from an outage.
 	options.State = func() string {
@@ -367,6 +369,9 @@ func run(ctx context.Context, c Config, options bond.SessionOptions, address net
 		return err
 	}
 	if err = unix.SetsockoptInt(sock, unix.SOL_SOCKET, unix.SO_RCVBUF, 4*1024*1024); err != nil {
+		return err
+	}
+	if err = configurePathMTUDiscoverySocket(sock, options.PathMTUDiscovery); err != nil {
 		return err
 	}
 	forceErr := unix.SetsockoptInt(sock, unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, 4*1024*1024)
@@ -559,6 +564,15 @@ func run(ctx context.Context, c Config, options bond.SessionOptions, address net
 		return err
 	}
 	return nil
+}
+
+// configurePathMTUDiscoverySocket prevents IPv4 fragmentation on the outer
+// UDP path so authenticated DPLPMTUD probes confirm an unfragmented packet size.
+func configurePathMTUDiscoverySocket(fd int, enabled bool) error {
+	if !enabled {
+		return nil
+	}
+	return unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_DO)
 }
 
 // transientSocketError reports receive errors that say nothing about the socket's health
