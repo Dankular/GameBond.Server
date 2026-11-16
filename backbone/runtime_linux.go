@@ -62,7 +62,7 @@ func Start(ctx context.Context, cfg Config) (*Runtime, error) {
 		_ = r.Close()
 		return nil, err
 	}
-	if err := r.startDaemon("zebra", "/usr/lib/frr/zebra", "-f", filepath.Join(runtimeDir, "zebra.conf"), "-i", filepath.Join(runtimeDir, "zebra.pid"), "-z", filepath.Join(runtimeDir, "zserv.api"), "-A", "127.0.0.1", "-u", "root", "-g", "root"); err != nil {
+	if err := r.startDaemon("zebra", "/usr/lib/frr/zebra", "-f", filepath.Join(runtimeDir, "zebra.conf"), "-i", filepath.Join(runtimeDir, "zebra.pid"), "-z", filepath.Join(runtimeDir, "zserv.api"), "-A", "127.0.0.1", "-u", "root", "-g", "frrvty"); err != nil {
 		_ = r.Close()
 		return nil, err
 	}
@@ -71,7 +71,7 @@ func Start(ctx context.Context, cfg Config) (*Runtime, error) {
 		_ = r.Close()
 		return nil, err
 	}
-	if err := r.startDaemon("bgpd", "/usr/lib/frr/bgpd", "-f", filepath.Join(runtimeDir, "bgpd.conf"), "-i", filepath.Join(runtimeDir, "bgpd.pid"), "-z", filepath.Join(runtimeDir, "zserv.api"), "-A", "127.0.0.1", "-u", "root", "-g", "root"); err != nil {
+	if err := r.startDaemon("bgpd", "/usr/lib/frr/bgpd", "-f", filepath.Join(runtimeDir, "bgpd.conf"), "-i", filepath.Join(runtimeDir, "bgpd.pid"), "-z", filepath.Join(runtimeDir, "zserv.api"), "-A", "127.0.0.1", "-u", "root", "-g", "frrvty"); err != nil {
 		_ = r.Close()
 		return nil, err
 	}

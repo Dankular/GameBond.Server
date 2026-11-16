@@ -8,6 +8,7 @@ services:
     tmpfs:
       - /run/gamebond-backbone:rw,noexec,nosuid,size=4m,mode=0700
       - /run/frr:rw,noexec,nosuid,size=2m,mode=0755
+      - /var/tmp/frr:rw,noexec,nosuid,size=2m,mode=0770,uid=0,gid=102
     volumes:
       - type: bind
         source: ./secrets/backbone
