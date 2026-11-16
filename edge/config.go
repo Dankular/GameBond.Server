@@ -17,6 +17,7 @@ import (
 
 	"github.com/Dankular/GameBond.Core/bond"
 	"github.com/Dankular/GameBond.Server/adminportal"
+	"github.com/Dankular/GameBond.Server/backbone"
 	"github.com/Dankular/GameBond.Server/l2gw"
 	"github.com/Dankular/GameBond.Server/security"
 )
@@ -55,6 +56,7 @@ type Config struct {
 	ParityRowsMin   int                         `json:"parity_rows_min"`
 	ParityRowsMax   int                         `json:"parity_rows_max"`
 	L2              *L2Config                   `json:"l2"`
+	ExitBackbone    *backbone.Config            `json:"exit_backbone,omitempty"`
 }
 
 // L2Config turns on Ethernet carriage: a TAP port beside the TUN. Frames cross the bond like IP
@@ -323,23 +325,25 @@ type L2MonitorConfig struct {
 // L2Bridge is the addressing of the bridged segment. Each exit has its own config, so give the
 // exits disjoint DHCP ranges (and the same Address): devices then keep their gateway across a failover.
 type L2Bridge struct {
-	Address           string          `json:"address"`                       // gateway address with prefix, default 10.78.0.1/24
-	IPv6Address       string          `json:"ipv6_address,omitempty"`        // optional IPv6 gateway address/prefix for statically configured clients
-	PrivateVLAN       uint16          `json:"private_vlan,omitempty"`        // PVLAN group for which this gateway is the promiscuous primary-VLAN port
-	DHCPStart         string          `json:"dhcp_start,omitempty"`          // first leased address
-	DHCPEnd           string          `json:"dhcp_end,omitempty"`            // last leased address
-	DHCPRelay4        string          `json:"dhcp_relay4,omitempty"`         // upstream DHCPv4 server as IPv4:port
-	DHCPRelayGateway4 string          `json:"dhcp_relay_gateway4,omitempty"` // on-link router for an off-subnet relay server
-	DHCPRelay6        string          `json:"dhcp_relay6,omitempty"`         // upstream DHCPv6 server as [IPv6]:port
-	DHCPRelayLink6    string          `json:"dhcp_relay_link_address,omitempty"`
-	DHCPv6PDPool      string          `json:"dhcpv6_pd_pool,omitempty"`
-	DHCPv6PDBits      uint8           `json:"dhcpv6_pd_prefix_bits,omitempty"`
-	EgressPaths       []l2gw.ECMPPath `json:"ecmp_paths,omitempty"`
-	Lease             string          `json:"lease"`            // lease time such as 12h, default 12h
-	DNS               []string        `json:"dns"`              // resolvers handed out, default 1.1.1.1 and 9.9.9.9
-	DNS6              []string        `json:"dns6,omitempty"`   // IPv6 resolvers advertised by RA's RDNSS option
-	Hosts             []L2Host        `json:"hosts"`            // fixed leases by MAC
-	Hosts6            []L2Host6       `json:"hosts6,omitempty"` // fixed DHCPv6 IA_NA leases by client DUID and IAID
+	Address            string          `json:"address"`                       // gateway address with prefix, default 10.78.0.1/24
+	IPv6Address        string          `json:"ipv6_address,omitempty"`        // optional IPv6 gateway address/prefix for statically configured clients
+	PrivateVLAN        uint16          `json:"private_vlan,omitempty"`        // PVLAN group for which this gateway is the promiscuous primary-VLAN port
+	DHCPStart          string          `json:"dhcp_start,omitempty"`          // first leased address
+	DHCPEnd            string          `json:"dhcp_end,omitempty"`            // last leased address
+	DHCPRelay4         string          `json:"dhcp_relay4,omitempty"`         // upstream DHCPv4 server as IPv4:port
+	DHCPRelayGateway4  string          `json:"dhcp_relay_gateway4,omitempty"` // on-link router for an off-subnet relay server
+	DHCPRelay6         string          `json:"dhcp_relay6,omitempty"`         // upstream DHCPv6 server as [IPv6]:port
+	DHCPRelayLink6     string          `json:"dhcp_relay_link_address,omitempty"`
+	DHCPv6PDPool       string          `json:"dhcpv6_pd_pool,omitempty"`
+	DHCPv6PDBits       uint8           `json:"dhcpv6_pd_prefix_bits,omitempty"`
+	EgressPolicy       string          `json:"egress_policy,omitempty"` // local, failover, or weighted path selection
+	RecoveryHoldDownMS int             `json:"recovery_hold_down_ms,omitempty"`
+	EgressPaths        []l2gw.ECMPPath `json:"ecmp_paths,omitempty"`
+	Lease              string          `json:"lease"`            // lease time such as 12h, default 12h
+	DNS                []string        `json:"dns"`              // resolvers handed out, default 1.1.1.1 and 9.9.9.9
+	DNS6               []string        `json:"dns6,omitempty"`   // IPv6 resolvers advertised by RA's RDNSS option
+	Hosts              []L2Host        `json:"hosts"`            // fixed leases by MAC
+	Hosts6             []L2Host6       `json:"hosts6,omitempty"` // fixed DHCPv6 IA_NA leases by client DUID and IAID
 	// Policy is the live rule set: per-device limits applied to the next flow. It can be reloaded
 	// (SIGHUP) without restarting the exit; hosts above are reloaded with it.
 	Policy        *L2Policy        `json:"policy"`
@@ -475,6 +479,28 @@ var (
 )
 
 func (b *L2Bridge) validate() error {
+	if b.RecoveryHoldDownMS < 0 || b.RecoveryHoldDownMS > 60000 {
+		return fmt.Errorf("l2.bridge.recovery_hold_down_ms must be 0..60000")
+	}
+	if b.RecoveryHoldDownMS != 0 && b.EgressPolicy != "failover" && b.EgressPolicy != "weighted" {
+		return fmt.Errorf("l2.bridge.recovery_hold_down_ms requires a dynamic egress_policy")
+	}
+	if b.EgressPolicy != "" && b.EgressPolicy != "local" && b.EgressPolicy != "failover" && b.EgressPolicy != "weighted" {
+		return fmt.Errorf("l2.bridge.egress_policy must be local, failover, or weighted")
+	}
+	if b.EgressPolicy == "local" && len(b.EgressPaths) > 0 {
+		return fmt.Errorf("l2.bridge.egress_policy local cannot be combined with ecmp_paths")
+	}
+	if (b.EgressPolicy == "failover" || b.EgressPolicy == "weighted") && len(b.EgressPaths) == 0 {
+		return fmt.Errorf("l2.bridge.egress_policy %q requires ecmp_paths", b.EgressPolicy)
+	}
+	if b.EgressPolicy == "failover" || b.EgressPolicy == "weighted" {
+		for i, path := range b.EgressPaths {
+			if path.BGPNeighborAddress == "" {
+				return fmt.Errorf("l2.bridge.ecmp_paths[%d].bgp_neighbor_address is required for dynamic egress selection", i)
+			}
+		}
+	}
 	if err := l2gw.ValidateECMPPaths(b.EgressPaths); err != nil {
 		return fmt.Errorf("l2.bridge.ecmp_paths: %w", err)
 	}
@@ -482,7 +508,7 @@ func (b *L2Bridge) validate() error {
 		if len(b.EgressPaths) > 0 {
 			return fmt.Errorf("l2.bridge.ecmp_paths must be configured on each l2.bridge.vlans gateway entry")
 		}
-		if b.Address != "" || b.IPv6Address != "" || b.PrivateVLAN != 0 || b.DHCPStart != "" || b.DHCPEnd != "" || b.DHCPRelay4 != "" || b.DHCPRelayGateway4 != "" || b.DHCPRelay6 != "" || b.DHCPRelayLink6 != "" || b.DHCPv6PDPool != "" || b.DHCPv6PDBits != 0 || b.Lease != "" || len(b.DNS) != 0 || len(b.DNS6) != 0 || len(b.Hosts) != 0 || len(b.Hosts6) != 0 || b.Policy != nil || b.LLDPMEDPolicy != nil {
+		if b.Address != "" || b.IPv6Address != "" || b.PrivateVLAN != 0 || b.DHCPStart != "" || b.DHCPEnd != "" || b.DHCPRelay4 != "" || b.DHCPRelayGateway4 != "" || b.DHCPRelay6 != "" || b.DHCPRelayLink6 != "" || b.DHCPv6PDPool != "" || b.DHCPv6PDBits != 0 || b.EgressPolicy != "" || b.RecoveryHoldDownMS != 0 || len(b.EgressPaths) != 0 || b.Lease != "" || len(b.DNS) != 0 || len(b.DNS6) != 0 || len(b.Hosts) != 0 || len(b.Hosts6) != 0 || b.Policy != nil || b.LLDPMEDPolicy != nil {
 			return fmt.Errorf("l2.bridge cannot combine top-level gateway settings with vlans")
 		}
 		if len(b.VLANs) > 64 {
@@ -1032,6 +1058,14 @@ func DecodeConfig(data []byte) (Config, bond.SessionOptions, netip.AddrPort, []b
 	if err := c.L2.validate(); err != nil {
 		return fail(err)
 	}
+	if c.ExitBackbone != nil {
+		if err := c.ExitBackbone.Validate(); err != nil {
+			return fail(err)
+		}
+		if err := validateBackbonePaths(c.L2, c.ExitBackbone); err != nil {
+			return fail(err)
+		}
+	}
 	if c.L2 != nil && c.L2.Enabled {
 		options.L2, options.L2FrameMTU = true, c.L2.FrameMTU
 	}
@@ -1100,4 +1134,35 @@ func DecodeConfig(data []byte) (Config, bond.SessionOptions, netip.AddrPort, []b
 		}
 	}
 	return c, options, netip.AddrPortFrom(netip.MustParseAddr(address), uint16(port)), session, nil
+}
+
+func validateBackbonePaths(l2 *L2Config, cfg *backbone.Config) error {
+	peers := make(map[string]backbone.Peer, len(cfg.Peers))
+	for _, peer := range cfg.Peers {
+		peers[peer.ID] = peer
+	}
+	if l2 == nil || l2.Bridge == nil {
+		return nil
+	}
+	bridges := []*L2Bridge{l2.Bridge}
+	if len(l2.Bridge.VLANs) > 0 {
+		bridges = bridges[:0]
+		for _, vlan := range l2.Bridge.VLANs {
+			if vlan.Gateway != nil {
+				bridges = append(bridges, vlan.Gateway)
+			}
+		}
+	}
+	for _, bridge := range bridges {
+		for _, path := range bridge.EgressPaths {
+			if path.BGPNeighborAddress == "" {
+				continue
+			}
+			peer, ok := peers[path.Name]
+			if !ok || peer.PeerAddress != path.BGPNeighborAddress || peer.Interface != path.Interface {
+				return fmt.Errorf("egress path %q must match an exit_backbone peer ID, interface, and peer_address", path.Name)
+			}
+		}
+	}
+	return nil
 }

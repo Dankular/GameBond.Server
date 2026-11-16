@@ -82,7 +82,13 @@ func (g *Gateway) installForwarders() {
 // instead of a connection that then dies, and only then accepts the device's connection.
 func (g *Gateway) tcpFlow(r *tcp.ForwarderRequest, dst netip.AddrPort, flowKey []byte) {
 	defer g.tcpFlows.Add(-1)
-	out, _, err := DialWithECMP(g.cfg.Dial, "tcp", dst.String(), g.cfg.DialTimeout, g.cfg.ECMPPaths, flowKey)
+	paths, err := g.egressPaths(flowKey)
+	if err != nil {
+		g.dialFailed.Add(1)
+		r.Complete(true)
+		return
+	}
+	out, _, err := DialWithECMP(g.cfg.Dial, "tcp", dst.String(), g.cfg.DialTimeout, paths, flowKey)
 	if err != nil {
 		g.dialFailed.Add(1)
 		r.Complete(true)

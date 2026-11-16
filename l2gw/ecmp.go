@@ -14,10 +14,11 @@ import (
 // usable route through Interface; Gateway binds each flow to the selected
 // interface and keeps the selection stable for that flow.
 type ECMPPath struct {
-	Name      string `json:"name"`
-	Interface string `json:"interface"`
-	Mark      uint32 `json:"mark,omitempty"` // host ip rule/fwmark selector; requires preconfigured policy routing
-	Weight    uint16 `json:"weight,omitempty"`
+	Name               string `json:"name"`
+	Interface          string `json:"interface"`
+	Mark               uint32 `json:"mark,omitempty"` // host ip rule/fwmark selector; requires preconfigured policy routing
+	Weight             uint16 `json:"weight,omitempty"`
+	BGPNeighborAddress string `json:"bgp_neighbor_address,omitempty"` // peer in the host gateway's dynamic-routing status
 }
 
 // ECMPFlowKey encodes a stable direction-specific tuple for weighted path
@@ -44,6 +45,12 @@ func ValidateECMPPaths(paths []ECMPPath) error {
 		}
 		if path.Weight > 1000 {
 			return fmt.Errorf("l2gw: ECMP path %q weight must be 1..1000", path.Name)
+		}
+		if path.BGPNeighborAddress != "" {
+			addr, err := netip.ParseAddr(path.BGPNeighborAddress)
+			if err != nil || addr.IsUnspecified() || addr.IsMulticast() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.String() != path.BGPNeighborAddress {
+				return fmt.Errorf("l2gw: ECMP path %q bgp_neighbor_address must be a canonical unicast address", path.Name)
+			}
 		}
 		selector := fmt.Sprintf("%s/%d", path.Interface, path.Mark)
 		if names[path.Name] || routeSelectors[selector] {

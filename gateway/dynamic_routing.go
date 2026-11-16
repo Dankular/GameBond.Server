@@ -58,6 +58,8 @@ type BGPNeighbor struct {
 	Address                 string   `json:"address"`
 	RemoteAS                uint32   `json:"remote_as"`
 	UpdateSourceInterfaceID string   `json:"update_source_interface_id,omitempty"`
+	KeepaliveSeconds        uint16   `json:"keepalive_seconds,omitempty"`
+	HoldSeconds             uint16   `json:"hold_seconds,omitempty"`
 	Import                  []string `json:"import_prefixes"`
 	Export                  []string `json:"export_prefixes"`
 }
@@ -129,6 +131,9 @@ func (c DynamicRoutingConfig) Validate(interfaces []Interface) error {
 			addresses[addr] = true
 			if peer.RemoteAS == 0 || peer.RemoteAS > 4294967295 {
 				return fmt.Errorf("%s.remote_as must be a 32-bit ASN greater than zero", field)
+			}
+			if (peer.KeepaliveSeconds == 0) != (peer.HoldSeconds == 0) || peer.KeepaliveSeconds > 60 || peer.HoldSeconds > 3600 || peer.HoldSeconds != 0 && uint32(peer.HoldSeconds) < uint32(peer.KeepaliveSeconds)*3 {
+				return fmt.Errorf("%s.keepalive_seconds and hold_seconds must both be zero or satisfy keepalive 1..60 and hold 3x keepalive..3600", field)
 			}
 			if peer.UpdateSourceInterfaceID != "" {
 				if _, ok := byID[peer.UpdateSourceInterfaceID]; !ok {

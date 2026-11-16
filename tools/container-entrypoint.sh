@@ -50,7 +50,7 @@ plan() {
     # own tunnel address. Without any, the original lone-client /30 and single-source NAT stay.
     LAN_IPS=$(jq -r '(.lan_tunnel_ips // []) | join(" ")' "$CONFIG")
     TUNNEL_PREFIX=30
-    NAT_SOURCES='10.77.0.2/32'
+    NAT_SOURCES='10.77.0.2'
     if [[ -n "$LAN_IPS" ]]; then
         for lan_ip in $LAN_IPS; do
             [[ "$lan_ip" =~ ^10\.77\.0\.([3-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4])$ ]] || {
@@ -58,8 +58,16 @@ plan() {
             }
         done
         TUNNEL_PREFIX=24
-        NAT_SOURCES="{ 10.77.0.2, ${LAN_IPS// /, } }"
+        NAT_SOURCES="10.77.0.2, ${LAN_IPS// /, }"
     fi
+    TRANSIT_PREFIXES=$(jq -r '(.exit_backbone.transit_source_prefixes // []) | join(" ")' "$CONFIG")
+    for transit_prefix in $TRANSIT_PREFIXES; do
+        [[ "$transit_prefix" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] || {
+            echo 'exit_backbone transit_source_prefixes must contain IPv4 CIDRs' >&2; exit 1;
+        }
+        NAT_SOURCES+=", $transit_prefix"
+    done
+    [[ "$NAT_SOURCES" != *,* ]] || NAT_SOURCES="{ $NAT_SOURCES }"
 
     # Tunnel clients get the internet, not the networks behind this container: its bridge, the Docker
     # host and any private range. Traffic between tunnel addresses (client <-> LAN devices) is still

@@ -3,6 +3,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -121,6 +122,7 @@ func listenUnix(path, group string) (net.Listener, error) {
 func (s *APIServer) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/layer2/port-auth/events", s.handlePortAuthEvent)
+	mux.HandleFunc("GET /v1/dynamic-routing/bgp-neighbors", s.handleBGPNeighbors)
 	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "apply": s.Manager.Status(), "runtime": s.Runtime.Snapshot(r.Context())})
 	})
@@ -283,6 +285,29 @@ func (s *APIServer) handler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]any{"applied": true, "transaction": s.Manager.Status(), "config": s.Manager.Current()})
 	})
 	return mux
+}
+
+func (s *APIServer) handleBGPNeighbors(w http.ResponseWriter, r *http.Request) {
+	config := s.Manager.Current()
+	if !config.DynamicRouting.Enabled || !config.DynamicRouting.BGP.Enabled {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "summary": map[string]any{"peers": map[string]any{}}})
+		return
+	}
+	if s.Runner == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("host gateway command runner is unavailable"))
+		return
+	}
+	result, err := s.Runner.Run(r.Context(), "vtysh", "-N", "gamebond", "-c", "show bgp summary json")
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("read FRR BGP neighbor state: %w", err))
+		return
+	}
+	data := bytes.TrimSpace(result.Stdout)
+	if len(data) == 0 || !json.Valid(data) || data[0] != '{' {
+		writeError(w, http.StatusBadGateway, errors.New("FRR returned invalid BGP summary JSON"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": true, "summary": json.RawMessage(data)})
 }
 
 func snapshotLayer2ValidationCapabilities(ctx context.Context, current Config, desired layer2.Config, runner Runner) (layer2.Capabilities, error) {

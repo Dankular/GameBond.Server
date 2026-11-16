@@ -37,8 +37,12 @@ func (g *Gateway) listenUDP(src netip.AddrPort) (net.PacketConn, error) {
 	if src.Addr().Is6() && !src.Addr().Is4In6() {
 		network, local = "udp6", "[::]:0"
 	}
-	if len(g.cfg.ECMPPaths) > 0 {
-		path, err := SelectECMPPath(g.cfg.ECMPPaths, []byte(src.String()))
+	paths, err := g.egressPaths([]byte("udp\x00" + src.String()))
+	if err != nil {
+		return nil, err
+	}
+	if len(paths) > 0 {
+		path, err := SelectECMPPath(paths, []byte(src.String()))
 		if err != nil {
 			return nil, err
 		}

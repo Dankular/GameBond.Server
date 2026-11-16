@@ -27,6 +27,7 @@ import (
 	"github.com/Dankular/GameBond.Core/hwmon"
 	"github.com/Dankular/GameBond.Core/stream"
 	"github.com/Dankular/GameBond.Server/adminportal"
+	"github.com/Dankular/GameBond.Server/backbone"
 	"github.com/Dankular/GameBond.Server/edge"
 	"github.com/Dankular/GameBond.Server/l2gw"
 	"github.com/Dankular/GameBond.Server/lab"
@@ -91,6 +92,20 @@ func run() (runErr error) {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+	if c.ExitBackbone != nil {
+		backboneRuntime, err := backbone.Start(ctx, *c.ExitBackbone)
+		if err != nil {
+			return fmt.Errorf("start exit backbone: %w", err)
+		}
+		defer backboneRuntime.Close()
+		go backboneRuntime.Monitor(ctx, func(name string, healthy bool, reason string) {
+			if err := edge.SetEgressPathHealth(name, healthy, reason); err != nil {
+				log.Printf("publish exit backbone path health for %s: %v", name, err)
+			}
+		})
+	} else if err := edge.StartBGPPathHealthMonitor(ctx, os.Getenv("GAMEBOND_GATEWAY_SOCKET"), c.L2); err != nil {
+		return fmt.Errorf("start BGP egress health monitor: %w", err)
+	}
 	if syslogExporter != nil {
 		fmt.Fprintf(os.Stdout, "{\"status\":\"syslog\",\"collector\":%q}\n", syslogCollector)
 	}

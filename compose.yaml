@@ -15,6 +15,8 @@ services:
       - tunnel
     ports:
       - "4433:4433/udp"
+      # Private exit backbone peers. Restrict these host firewall openings to the peer addresses.
+      - "${GAMEBOND_BACKBONE_UDP_PUBLISH:-51820-51822}:51820-51822/udp"
       # Admin portal (HTTPS). Only used when the config has an "admin" block listening on 0.0.0.0:8443.
       # Bind a specific host address (e.g. "127.0.0.1:8443:8443/tcp") to keep it off the public interface.
       - "${GAMEBOND_ADMIN_PUBLISH:-8443}:8443/tcp"
@@ -33,6 +35,8 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+      - /run/gamebond-backbone:rw,noexec,nosuid,size=4m,mode=0700
+      - /run/frr:rw,noexec,nosuid,size=2m,mode=0755
     volumes:
       - type: bind
         source: ${GAMEBOND_ADMIN_TLS_DIR:-./secrets/admin}
@@ -53,6 +57,12 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - type: bind
+        source: ${GAMEBOND_BACKBONE_KEYS_DIR:-./secrets/backbone}
+        target: /run/secrets/gamebond-backbone
+        read_only: true
+        bind:
+          create_host_path: true
       - type: volume
         source: inspection-ca
         target: /var/lib/gamebond-inspection

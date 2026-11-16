@@ -77,6 +77,9 @@ type Config struct {
 	// ECMPPaths selects a stable host egress member per TCP flow and UDP device endpoint.
 	// Linux requires usable routes on each interface or policy routes for each fwmark.
 	ECMPPaths []ECMPPath
+	// EgressSelector is optional and receives path health from the routing control plane.
+	// When set it takes precedence over static weighted ECMPPaths for new flows.
+	EgressSelector EgressPathSelector
 	// Listen opens the public UDP socket of a device mapping; nil uses the operating system.
 	Listen func() (net.PacketConn, error)
 	// RestrictedUDP drops datagrams from addresses the device has not sent to first. Off by default:
@@ -650,6 +653,23 @@ func (g *Gateway) foreignARPRequest(f []byte) bool {
 
 // ActiveFlows is the number of TCP and UDP flows alive now: an exit may update when it is zero.
 func (g *Gateway) ActiveFlows() int { return int(g.tcpFlows.Load() + g.udpFlows.Load()) }
+
+// SetEgressPathHealth updates one path from the routing control plane. Existing TCP and UDP
+// sockets are not migrated; the new health state applies to mappings opened after this call.
+func (g *Gateway) SetEgressPathHealth(name string, healthy bool, reason string) error {
+	if g.cfg.EgressSelector == nil {
+		return errors.New("l2gw: dynamic egress path selection is not configured")
+	}
+	return g.cfg.EgressSelector.SetHealth(name, healthy, reason)
+}
+
+// EgressPathHealth reports the selector's current view, or an empty slice when static routing is used.
+func (g *Gateway) EgressPathHealth() []EgressPathHealth {
+	if g.cfg.EgressSelector == nil {
+		return nil
+	}
+	return g.cfg.EgressSelector.Snapshot()
+}
 
 // SetDraining makes the gateway refuse new flows (TCP gets a reset, UDP is dropped) while existing
 // ones continue, so devices move their next connections to the other exit.

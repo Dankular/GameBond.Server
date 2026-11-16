@@ -201,6 +201,13 @@ func openGateway(c *L2Config, fabric *SegmentFabric) (*l2Edge, error) {
 	// stack. Strip that overhead before setting the gateway's IP MTU.
 	cfg := l2gw.Config{Address: pfx, MTU: gatewayStackMTU(c)}
 	cfg.ECMPPaths = append([]l2gw.ECMPPath(nil), b.EgressPaths...)
+	if b.EgressPolicy == "failover" || b.EgressPolicy == "weighted" {
+		selector, selectorErr := l2gw.NewEgressPathSelector(l2gw.EgressPathPolicy(b.EgressPolicy), cfg.ECMPPaths)
+		if selectorErr != nil {
+			return nil, selectorErr
+		}
+		cfg.EgressSelector = selector
+	}
 	if b.LLDPMEDPolicy != nil {
 		cfg.LLDPMEDPolicy = &l2gw.LLDPMEDNetworkPolicy{
 			ApplicationType: b.LLDPMEDPolicy.ApplicationType, VLANID: b.LLDPMEDPolicy.VLANID,
@@ -421,6 +428,45 @@ func (e *l2Edge) enqueueFabric(port *SegmentPort, frame SegmentFrame) {
 // activeL2 is the running gateway edge, so a config reload can reach it.
 var activeL2 atomic.Pointer[l2Edge]
 var activeSegmentL2 atomic.Pointer[[]*l2Edge]
+
+// SetEgressPathHealth publishes BGP/BFD health into every active gVisor gateway
+// on this process. It is intentionally a small seam so routing control stays
+// outside l2gw while flow selection remains inside the gateway.
+func SetEgressPathHealth(name string, healthy bool, reason string) error {
+	var gateways []*l2Edge
+	if segment := activeSegmentL2.Load(); segment != nil {
+		gateways = append(gateways, (*segment)...)
+	} else if active := activeL2.Load(); active != nil {
+		gateways = append(gateways, active)
+	}
+	if len(gateways) == 0 {
+		return errors.New("gVisor gateway is not active")
+	}
+	var first error
+	matched := false
+	for _, edge := range gateways {
+		if edge.gw == nil {
+			continue
+		}
+		if err := edge.gw.SetEgressPathHealth(name, healthy, reason); err != nil {
+			if errors.Is(err, l2gw.ErrUnknownEgressPath) {
+				continue
+			}
+			if first == nil {
+				first = err
+			}
+		} else {
+			matched = true
+		}
+	}
+	if first != nil {
+		return first
+	}
+	if matched {
+		return nil
+	}
+	return fmt.Errorf("no active gVisor gateway has egress path %q", name)
+}
 
 // policyFor turns the config section into the gateway's rule set.
 func policyFor(b *L2Bridge) (l2gw.Policy, error) {
@@ -854,6 +900,7 @@ func (e *l2Edge) Stats(now time.Time) map[string]any {
 			"dhcp_bindings": e.gw.DHCPBindings(),
 			"frames_in":     g.FramesIn, "frames_out": g.FramesOut,
 			"stack": g.Stack, "policy_version": e.gw.PolicyVersion(), "draining": e.gw.Draining(), "devices": e.gw.DeviceStats(), "udp_mappings": e.gw.UDPMappings(),
+			"egress_paths": e.gw.EgressPathHealth(),
 		}, "active_flows": e.gw.ActiveFlows()}
 	}
 	st2 := map[string]any{

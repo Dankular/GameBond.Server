@@ -100,6 +100,9 @@ func renderFRRConfigs(cfg DynamicRoutingConfig, interfaces []Interface, l2 *laye
 			if peer.UpdateSourceInterfaceID != "" {
 				fmt.Fprintf(&b, " neighbor %s update-source %s\n", peer.Address, byID[peer.UpdateSourceInterfaceID])
 			}
+			if peer.KeepaliveSeconds != 0 {
+				fmt.Fprintf(&b, " neighbor %s timers %d %d\n", peer.Address, peer.KeepaliveSeconds, peer.HoldSeconds)
+			}
 		}
 		families := map[bool][]BGPNeighbor{true: {}, false: {}}
 		for _, peer := range cfg.BGP.Neighbors {
@@ -173,6 +176,13 @@ func renderFRRConfigs(cfg DynamicRoutingConfig, interfaces []Interface, l2 *laye
 		configs["bgpd"] = []byte(b.String())
 	}
 	return configs, nil
+}
+
+// RenderFRRConfigs exposes GameBond's validated FRR renderer to the isolated
+// exit-backbone runtime. It returns daemon configs without writing host files
+// or starting processes.
+func RenderFRRConfigs(cfg DynamicRoutingConfig, interfaces []Interface) (map[string][]byte, error) {
+	return renderFRRConfigs(cfg, interfaces, nil)
 }
 
 func validateFRRHost(ctx context.Context, runner Runner, cfg Config) error {

@@ -37,6 +37,7 @@ func (c *GatewayClient) Request(ctx context.Context, method, endpoint string, co
 		return nil, errors.New("gateway socket is not configured")
 	}
 	if !(method == http.MethodGet && endpoint == "/v1/status") &&
+		!(method == http.MethodGet && endpoint == "/v1/dynamic-routing/bgp-neighbors") &&
 		!(method == http.MethodGet && endpoint == "/v1/layer2/profiles") &&
 		!(method == http.MethodPost && endpoint == "/v1/config/validate") &&
 		!(method == http.MethodPost && endpoint == "/v1/config/plan") &&
